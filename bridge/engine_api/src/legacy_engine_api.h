@@ -61,6 +61,9 @@ engine_result_t engine_legacy_media_read_frame_rgba(
 engine_result_t engine_legacy_get_godot_native_frame_texture(
     engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
     uint32_t* out_height, uint64_t* out_frame_serial);
+engine_result_t engine_legacy_get_gpu_frame_texture(
+    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
+    uint32_t* out_height, uint64_t* out_frame_serial);
 #endif
 engine_result_t engine_legacy_get_host_native_window(engine_handle_t handle,
                                                      void** out_window_handle);

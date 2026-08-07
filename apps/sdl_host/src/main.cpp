@@ -1,6 +1,7 @@
 // AetherKiri SDL3 host: minimal rendering/playback layer that drives the
 // engine through the C ABI (bridge/engine_api). Owns the window, input
-// forwarding, and the CPU-readback presentation path.
+// forwarding, and the presentation path (CPU readback or zero-copy GPU
+// frame via the SDL_Renderer GPU bridge).
 
 #include <SDL3/SDL.h>
 
@@ -17,6 +18,19 @@
 #include "engine_api.h"
 #include "engine_options.h"
 #include "host_input.h"
+#include "gpu/gpu_bridge.h"
+
+#include <imgui.h>
+#include <imgui_impl_sdl3.h>
+#include <imgui_impl_sdlrenderer3.h>
+
+#include "ui/ui_state.h"
+
+// UI state shared with the ui_* modules (declared at file scope so their
+// extern declarations link; visible to everything below).
+UiState g_ui_state;
+OverlayStats g_overlay_stats;
+FileDialogRequest g_file_dialog;
 
 namespace {
 
@@ -39,6 +53,12 @@ struct HostState {
     uint32_t frame_stride = 0;
     std::vector<uint8_t> frame_pixels;
     bool frame_ready = false;
+
+    // Zero-copy GPU presentation (render_backend = gpu_bridge/sdl3_gpu):
+    // the engine publishes an SDL_Texture* via the GPU bridge and the host
+    // presents it directly instead of CPU readback + texture upload.
+    bool use_gpu_present = false;
+    uint64_t gpu_frame_texture = 0;
 
     uint64_t last_ticks = 0;
     double fps = 0.0;
@@ -93,6 +113,29 @@ void SavePpm(const std::string &path, const uint8_t *rgba,
     fclose(file);
     fprintf(stderr, "screenshot saved: %s (%ux%u)\n", path.c_str(), width,
             height);
+}
+
+// Reads the published GPU frame back into a PPM. The engine does not keep a
+// CPU copy of GPU-published frames, so the host locks the SDL texture
+// directly (pixel memory is R,G,B,A on little-endian, same as SavePpm).
+void SaveGpuFramePpm(HostState &state, const std::string &path) {
+    auto *tex = reinterpret_cast<SDL_Texture *>(
+        static_cast<uintptr_t>(state.gpu_frame_texture));
+    if(tex == nullptr) {
+        fprintf(stderr, "screenshot failed: no GPU frame available\n");
+        return;
+    }
+    void *pixels = nullptr;
+    int pitch = 0;
+    if(!SDL_LockTexture(tex, nullptr, &pixels, &pitch)) {
+        fprintf(stderr, "screenshot failed: SDL_LockTexture: %s\n",
+                SDL_GetError());
+        return;
+    }
+    SavePpm(path, static_cast<const uint8_t *>(pixels),
+            static_cast<uint32_t>(tex->w), static_cast<uint32_t>(tex->h),
+            static_cast<uint32_t>(pitch));
+    SDL_UnlockTexture(tex);
 }
 
 const char *StartupStateName(uint32_t state) {
@@ -158,10 +201,21 @@ bool CreatePresentation(HostState &state) {
     }
     SDL_SetTextureScaleMode(state.screen, SDL_SCALEMODE_NEAREST);
     SDL_SetTextureBlendMode(state.screen, SDL_BLENDMODE_NONE);
+
+    // Register the SDL_Renderer GPU bridge so the engine can publish frames
+    // as SDL_Texture* for zero-copy presentation (render_backend gpu_bridge).
+    aetherkiri::GpuBridgeSetRenderer(state.renderer);
+    engine_register_godot_gpu_bridge(aetherkiri::GpuBridgeCallbacks());
+    engine_register_godot_gpu_batch_bridge(
+        aetherkiri::GpuBridgeBatchCallbacks());
     return true;
 }
 
 void DestroyPresentation(HostState &state) {
+    engine_register_godot_gpu_bridge(nullptr);
+    engine_register_godot_gpu_batch_bridge(nullptr);
+    aetherkiri::GpuBridgeSetRenderer(nullptr);
+    aetherkiri::GpuBridgeFlushReleasedTextures();
     if(state.screen != nullptr) {
         SDL_DestroyTexture(state.screen);
         state.screen = nullptr;
@@ -173,17 +227,28 @@ void DestroyPresentation(HostState &state) {
 }
 
 // Presents the latest engine frame to the window (stretched).
-void PresentFrame(HostState &state) {
+// Clears the renderer and draws the game texture (ImGui is layered on top
+// before the final SDL_RenderPresent in the host loop).
+void PresentGameTexture(HostState &state) {
     if(state.renderer == nullptr)
         return;
     SDL_SetRenderDrawColor(state.renderer, 0, 0, 0, 255);
     SDL_RenderClear(state.renderer);
-    if(state.screen == nullptr || !state.frame_ready)
+    if(!state.frame_ready)
+        return;
+    SDL_Texture *frame = nullptr;
+    if(state.use_gpu_present) {
+        // Zero-copy: the engine's GPU bridge publishes SDL_Texture* handles.
+        frame = reinterpret_cast<SDL_Texture *>(
+            static_cast<uintptr_t>(state.gpu_frame_texture));
+    } else {
+        frame = state.screen;
+    }
+    if(frame == nullptr)
         return;
     SDL_FRect dst{0.0f, 0.0f, static_cast<float>(state.window_width),
                   static_cast<float>(state.window_height)};
-    SDL_RenderTexture(state.renderer, state.screen, nullptr, &dst);
-    SDL_RenderPresent(state.renderer);
+    SDL_RenderTexture(state.renderer, frame, nullptr, &dst);
 }
 
 // Copies the engine frame into the streaming texture.
@@ -281,6 +346,104 @@ void TickEngine(HostState &state) {
         engine_read_frame_rgba(state.engine, state.frame_pixels.data(),
                                frame_bytes) == ENGINE_RESULT_OK;
     const auto readback_end = std::chrono::steady_clock::now();
+    if(state.use_gpu_present) {
+        // Zero-copy path: grab the engine's published GPU frame handle and
+        // present it directly; no readback, no texture upload.
+        uint64_t gpu_texture = 0;
+        uint32_t gpu_w = 0;
+        uint32_t gpu_h = 0;
+        uint64_t gpu_serial = 0;
+        const engine_result_t gpu_result =
+            engine_get_gpu_frame_texture(state.engine, &gpu_texture, &gpu_w,
+                                         &gpu_h, &gpu_serial);
+        static int gpu_err_log = 0;
+        if(gpu_result != ENGINE_RESULT_OK && (gpu_err_log++ % 300) == 0) {
+            fprintf(stderr, "[host] gpu frame fetch failed: result=%d err='%s'\n",
+                    static_cast<int>(gpu_result),
+                    engine_get_last_error(state.engine));
+        }
+        if(gpu_result == ENGINE_RESULT_OK && gpu_texture != 0) {
+            state.gpu_frame_texture = gpu_texture;
+            state.frame_ready = true;
+        } else {
+            state.gpu_frame_texture = 0;
+            state.frame_ready = false;
+        }
+        if(!state.screenshot_path.empty()) {
+            ++state.frame_count_since_start;
+            if(state.frame_count_since_start >= state.screenshot_after_frames) {
+                SaveGpuFramePpm(state, state.screenshot_path);
+                state.screenshot_path.clear();
+                state.exit_requested = true;
+            }
+        }
+        // Reuse the readback timing slot for the GPU frame fetch so the
+        // overlay/benchmark/slow-frame machinery keeps working unchanged.
+        const auto gpu_end = std::chrono::steady_clock::now();
+        const auto us = [](const auto &a, const auto &b) {
+            return std::chrono::duration<double, std::micro>(b - a).count();
+        };
+        const double tick_us = us(tick_start, tick_end);
+        const double fetch_us = us(readback_start, gpu_end);
+        const double total_us = us(tick_start, gpu_end);
+        g_overlay_stats.tick_ms = tick_us / 1000.0;
+        g_overlay_stats.readback_ms = fetch_us / 1000.0;
+        g_overlay_stats.upload_ms = 0.0;
+        g_overlay_stats.total_ms = total_us / 1000.0;
+        g_overlay_stats.stats_valid = true;
+        if(state.benchmark_seconds > 0) {
+            state.benchmark_frames++;
+            state.benchmark_tick_us.push_back(tick_us);
+            state.benchmark_readback_us.push_back(fetch_us);
+            state.benchmark_upload_us.push_back(0.0);
+            state.benchmark_total_us.push_back(total_us);
+            constexpr size_t kMaxBenchmarkSamples = 100000;
+            if(state.benchmark_total_us.size() > kMaxBenchmarkSamples) {
+                state.benchmark_tick_us.erase(
+                    state.benchmark_tick_us.begin(),
+                    state.benchmark_tick_us.begin() + 10000);
+                state.benchmark_readback_us.erase(
+                    state.benchmark_readback_us.begin(),
+                    state.benchmark_readback_us.begin() + 10000);
+                state.benchmark_upload_us.erase(
+                    state.benchmark_upload_us.begin(),
+                    state.benchmark_upload_us.begin() + 10000);
+                state.benchmark_total_us.erase(
+                    state.benchmark_total_us.begin(),
+                    state.benchmark_total_us.begin() + 10000);
+            }
+        }
+        if(state.slow_frame_threshold_ms > 0 &&
+           total_us >= state.slow_frame_threshold_ms * 1000.0) {
+            const uint64_t slow_now = SDL_GetTicks();
+            if(state.last_slow_frame_ms == 0 ||
+               slow_now - state.last_slow_frame_ms >= 1000) {
+                fprintf(stderr,
+                        "[host] slow frame total=%.1fms tick=%.1f gpu_fetch=%.1f "
+                        "(suppressed=%u)\n",
+                        total_us / 1000.0, tick_us / 1000.0,
+                        fetch_us / 1000.0, state.suppressed_slow_frames);
+                state.suppressed_slow_frames = 0;
+            } else {
+                state.suppressed_slow_frames++;
+            }
+        }
+
+        // Frame-stop detection: same rule as the CPU path — exit when the
+        // engine's published frame serial stops advancing (script
+        // TVPTerminateAsync, e.g. win.close()).
+        const uint64_t gpu_stall_now = SDL_GetTicks();
+        if(frame_desc.frame_serial != state.last_frame_serial) {
+            state.last_frame_serial = frame_desc.frame_serial;
+            state.no_frame_since_ms = 0;
+        } else if(state.no_frame_since_ms == 0) {
+            state.no_frame_since_ms = gpu_stall_now;
+        } else if(gpu_stall_now - state.no_frame_since_ms >= 3000) {
+            fprintf(stderr, "[host] engine stopped producing frames; exiting\n");
+            state.exit_requested = true;
+        }
+        return;
+    }
     if(frame_read) {
         const auto upload_start = std::chrono::steady_clock::now();
         UploadEngineFrame(state);
@@ -306,6 +469,13 @@ void TickEngine(HostState &state) {
         const double readback_us = us(readback_start, readback_end);
         const double upload_us = us(upload_start, upload_end);
         const double total_us = us(tick_start, frame_end);
+
+        // Publish to the ImGui overlay.
+        g_overlay_stats.tick_ms = tick_us / 1000.0;
+        g_overlay_stats.readback_ms = readback_us / 1000.0;
+        g_overlay_stats.upload_ms = upload_us / 1000.0;
+        g_overlay_stats.total_ms = total_us / 1000.0;
+        g_overlay_stats.stats_valid = true;
 
         if(state.benchmark_seconds > 0) {
             state.benchmark_frames++;
@@ -426,6 +596,9 @@ void PollInput(HostState &state) {
                 HandleWindowEvent(state, &event);
                 break;
             case SDL_EVENT_KEY_DOWN: {
+                if(event.key.key == SDLK_F12) {
+                    g_ui_state.show_overlay = !g_ui_state.show_overlay;
+                }
                 if(event.key.key == SDLK_ESCAPE && !state.startup_complete) {
                     state.exit_requested = true;
                     return;
@@ -440,7 +613,23 @@ void PollInput(HostState &state) {
             default:
                 break;
         }
-        if(state.engine != nullptr && state.startup_complete) {
+
+        // ImGui consumes events over its panels; only forward the rest.
+        ImGui_ImplSDL3_ProcessEvent(&event);
+        ImGuiIO &io = ImGui::GetIO();
+        const bool capture_mouse =
+            (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+             event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+             event.type == SDL_EVENT_MOUSE_MOTION ||
+             event.type == SDL_EVENT_MOUSE_WHEEL) &&
+            io.WantCaptureMouse;
+        const bool capture_key =
+            (event.type == SDL_EVENT_KEY_DOWN ||
+             event.type == SDL_EVENT_KEY_UP ||
+             event.type == SDL_EVENT_TEXT_INPUT) &&
+            io.WantCaptureKeyboard;
+        if(state.engine != nullptr && state.startup_complete &&
+           !capture_mouse && !capture_key) {
             const float scale_x =
                 static_cast<float>(state.surface_width) /
                 static_cast<float>(state.window_width);
@@ -467,9 +656,9 @@ void DrainStartupLogs(HostState &state) {
 void DrainRuntimeLogs(HostState &state) {
     if(state.engine == nullptr)
         return;
-    // Poll the engine's runtime log queue at a low cadence and forward new
-    // lines to stderr. The queue cursor advances inside the engine, so
-    // lines stay deduplicated across calls.
+    // Poll the engine's runtime log queue at a low cadence; forward new
+    // lines to stderr and into the overlay log buffer. The queue cursor
+    // advances inside the engine, so lines stay deduplicated across calls.
     const uint64_t now = SDL_GetTicks();
     if(state.last_log_poll_ms != 0 && now - state.last_log_poll_ms < 100)
         return;
@@ -481,6 +670,12 @@ void DrainRuntimeLogs(HostState &state) {
                                     &written) == ENGINE_RESULT_OK &&
           written > 0) {
         fwrite(buffer, 1, written, stderr);
+        g_overlay_stats.log_buffer.append(buffer, written);
+        constexpr size_t kMaxOverlayLogs = 1 << 20;  // 1 MiB ring
+        if(g_overlay_stats.log_buffer.size() > kMaxOverlayLogs) {
+            g_overlay_stats.log_buffer.erase(0, kMaxOverlayLogs / 2);
+        }
+        written = 0;
     }
 }
 
@@ -549,6 +744,11 @@ void DrainDiagnosticEvents(HostState &state) {
                                          &written) == ENGINE_RESULT_OK &&
           written > 0) {
         fwrite(buffer, 1, written, stderr);
+        g_overlay_stats.diag_buffer.append(buffer, written);
+        constexpr size_t kMaxOverlayDiag = 512 * 1024;
+        if(g_overlay_stats.diag_buffer.size() > kMaxOverlayDiag) {
+            g_overlay_stats.diag_buffer.erase(0, kMaxOverlayDiag / 2);
+        }
         written = 0;
     }
 }
@@ -593,7 +793,9 @@ void RunStartup(HostState &state) {
     if(startup_state == ENGINE_STARTUP_STATE_FAILED) {
         fprintf(stderr, "engine startup failed\n");
         DrainStartupLogs(state);
-        state.exit_requested = true;
+        g_ui_state.game_state = GameState::Error;
+        g_ui_state.status_text = u8"游戏启动失败（详见日志）";
+        state.startup_complete = false;
     }
 }
 
@@ -611,6 +813,21 @@ void UpdateFps(HostState &state) {
         UpdateWindowTitle(state);
     }
 }
+
+// Forward declarations for ImGui integration and engine-lifecycle helpers
+// (defined later in this anonymous namespace).
+bool InitImGui(SDL_Window *window, SDL_Renderer *renderer,
+               const std::string &font_path);
+void ShutdownImGui();
+void BeginImGuiFrame();
+void EndImGuiFrame(SDL_Renderer *renderer);
+void PaintUi(UiState &state, bool game_running);
+void PollFileDialog(SDL_Window *window);
+void StopEngine(HostState &state);
+bool StartEngine(HostState &state, const std::string &base_dir,
+                 const std::vector<std::pair<std::string, std::string>>
+                     &extra_options);
+void LaunchGame(HostState &state);
 
 int RunHost(const std::string &game_path, uint32_t fps_limit,
             const std::string &screenshot_path, int screenshot_after_frames,
@@ -633,51 +850,8 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
     EnsureDirectory(crash_dir);
     setenv("AETHERKIRI_CRASH_DIR", crash_dir.c_str(), 1);
 
-    engine_create_desc_t desc;
-    memset(&desc, 0, sizeof(desc));
-    desc.struct_size = sizeof(desc);
-    desc.api_version = ENGINE_API_VERSION;
-    desc.writable_path_utf8 = base_dir.c_str();
-    desc.cache_path_utf8 = base_dir.c_str();
-
-    if(engine_create(&desc, &state.engine) != ENGINE_RESULT_OK) {
-        fprintf(stderr, "engine_create failed\n");
-        return 1;
-    }
-
-    engine_option_t option;
-    memset(&option, 0, sizeof(option));
-    option.key_utf8 = ENGINE_OPTION_RENDERER;
-    option.value_utf8 = ENGINE_RENDERER_SOFTWARE;
-    engine_set_option(state.engine, &option);
-
-    // Extra engine options from the command line (--option key=value and the
-    // convenience switches). Applied before game startup so they are visible
-    // to the whole session.
-    for(const auto &kv : extra_options) {
-        engine_option_t opt;
-        memset(&opt, 0, sizeof(opt));
-        opt.key_utf8 = kv.first.c_str();
-        opt.value_utf8 = kv.second.c_str();
-        engine_set_option(state.engine, &opt);
-    }
-
-    if(const char *trace = std::getenv("AETHERKIRI_INPUT_TRACE");
-       trace != nullptr && strcmp(trace, "1") == 0) {
-        engine_option_t input_trace;
-        memset(&input_trace, 0, sizeof(input_trace));
-        input_trace.key_utf8 = "input_trace";
-        input_trace.value_utf8 = "1";
-        engine_set_option(state.engine, &input_trace);
-    }
-
-    if(!diagnostics_profile.empty()) {
-        EnableDiagnostics(state, diagnostics_profile);
-    }
-
     if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) < 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-        engine_destroy(state.engine);
         return 1;
     }
 
@@ -687,49 +861,156 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
     if(state.window == nullptr) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         SDL_Quit();
-        engine_destroy(state.engine);
         return 1;
     }
     if(!CreatePresentation(state)) {
         SDL_DestroyWindow(state.window);
         SDL_Quit();
-        engine_destroy(state.engine);
         return 1;
     }
 
-    // The engine surface stays at the logical game resolution; the window
-    // stretches it on display.
-    engine_set_surface_size(state.engine, state.surface_width,
-                            state.surface_height);
+    if(!InitImGui(state.window, state.renderer,
+                  g_ui_state.settings.font_path)) {
+        DestroyPresentation(state);
+        SDL_DestroyWindow(state.window);
+        SDL_Quit();
+        return 1;
+    }
+
+    // Seed UI settings from CLI arguments (still honored for scripting).
+    if(!game_path.empty()) {
+        g_ui_state.settings.game_path = game_path;
+    }
+    if(fps_limit != 0)
+        g_ui_state.settings.fps_limit = fps_limit;
+    if(!diagnostics_profile.empty())
+        g_ui_state.settings.diagnostics_profile = diagnostics_profile;
+    state.slow_frame_threshold_ms = slow_frame_threshold_ms;
+
+    // Without --game the host opens in launcher mode (NoGame).
+    const bool launch_immediately = !game_path.empty();
+    if(launch_immediately) {
+        if(!StartEngine(state, base_dir, extra_options)) {
+            g_ui_state.game_state = GameState::Error;
+        } else {
+            LaunchGame(state);
+        }
+    } else {
+        g_ui_state.status_text = u8"请选择游戏后启动";
+    }
 
     SDL_StartTextInput(state.window);
 
     state.last_ticks = SDL_GetTicks();
-    const uint32_t frame_ms = fps_limit > 0 ? (1000u / fps_limit) : 0;
-
-    const engine_result_t open_result =
-        engine_open_game_async(state.engine, game_path.c_str(), nullptr);
-    if(open_result != ENGINE_RESULT_OK) {
-        fprintf(stderr, "engine_open_game_async failed: %s\n",
-                engine_get_last_error(state.engine));
-        state.exit_requested = true;
-    }
+    uint32_t frame_ms =
+        g_ui_state.settings.fps_limit > 0
+            ? (1000u / g_ui_state.settings.fps_limit)
+            : 0;
 
     while(state.running && !state.exit_requested) {
         PollInput(state);
         if(state.exit_requested)
             break;
+        PollFileDialog(state.window);
 
-        RunStartup(state);
+        // UI-driven engine actions.
+        if(g_ui_state.want_start) {
+            g_ui_state.want_start = false;
+            if(StartEngine(state, base_dir, extra_options))
+                LaunchGame(state);
+        }
+        if(g_ui_state.want_restart) {
+            g_ui_state.want_restart = false;
+            if(StartEngine(state, base_dir, extra_options))
+                LaunchGame(state);
+        }
+        if(g_ui_state.want_quit) {
+            g_ui_state.want_quit = false;
+            StopEngine(state);
+            state.screenshot_path.clear();
+            continue;
+        }
+        if(state.engine != nullptr && g_ui_state.want_pause) {
+            g_ui_state.want_pause = false;
+            engine_pause(state.engine);
+        }
+        if(state.engine != nullptr && g_ui_state.want_resume) {
+            g_ui_state.want_resume = false;
+            engine_resume(state.engine);
+        }
+        if(state.engine != nullptr && g_ui_state.want_screenshot) {
+            g_ui_state.want_screenshot = false;
+            if(!state.frame_pixels.empty()) {
+                static int shot_seq = 0;
+                const std::string path =
+                    base_dir + "/shot-" + std::to_string(++shot_seq) + ".ppm";
+                SavePpm(path, state.frame_pixels.data(),
+                        state.surface_width, state.surface_height,
+                        state.frame_stride);
+                g_ui_state.status_text = u8"截图已保存: " + path;
+            }
+        }
 
-        if(state.startup_complete)
-            TickEngine(state);
-        DrainRuntimeLogs(state);
-        DrainDiagnosticEvents(state);
-        RefreshMemoryStatsText(state);
+        const bool game_running =
+            state.engine != nullptr &&
+            (g_ui_state.game_state == GameState::Launching ||
+             g_ui_state.game_state == GameState::Running);
 
-        PresentFrame(state);
-        UpdateFps(state);
+        if(game_running) {
+            RunStartup(state);
+
+            if(state.startup_complete) {
+                g_ui_state.game_state = GameState::Running;
+                TickEngine(state);
+            }
+            DrainRuntimeLogs(state);
+            DrainDiagnosticEvents(state);
+            RefreshMemoryStatsText(state);
+        }
+
+        // Fill overlay stats from the last frame's timing.
+        if(state.startup_complete && state.engine != nullptr) {
+            g_overlay_stats.stats_valid = true;
+            g_overlay_stats.surface_w = state.surface_width;
+            g_overlay_stats.surface_h = state.surface_height;
+            engine_memory_stats_t mem;
+            memset(&mem, 0, sizeof(mem));
+            mem.struct_size = sizeof(mem);
+            if(engine_get_memory_stats(state.engine, &mem) ==
+               ENGINE_RESULT_OK) {
+                g_overlay_stats.mem_valid = true;
+                g_overlay_stats.rss_bytes = mem.process_resident_bytes;
+                g_overlay_stats.gfx_cache_bytes = mem.graphic_cache_bytes;
+                g_overlay_stats.xp3_cache_bytes =
+                    mem.xp3_segment_cache_bytes;
+                g_overlay_stats.psb_cache_bytes = mem.psb_cache_bytes;
+            }
+        } else {
+            g_overlay_stats.stats_valid = false;
+        }
+
+        // Draw the scene (game texture or launcher background), then layer
+        // ImGui on top, then present once.
+        if(game_running) {
+            PresentGameTexture(state);
+            UpdateFps(state);
+        } else {
+            SDL_SetRenderDrawColor(state.renderer, 24, 24, 32, 255);
+            SDL_RenderClear(state.renderer);
+        }
+
+        BeginImGuiFrame();
+        PaintUi(g_ui_state, game_running);
+        if(game_running && state.startup_complete) {
+            g_overlay_stats.fps = state.fps;
+        }
+        EndImGuiFrame(state.renderer);
+
+        SDL_RenderPresent(state.renderer);
+
+        // Destroy textures the engine released this frame only after the
+        // present above no longer references them.
+        aetherkiri::GpuBridgeFlushReleasedTextures();
 
         if(state.benchmark_seconds > 0 && state.benchmark_start_ms != 0 &&
            SDL_GetTicks() - state.benchmark_start_ms >=
@@ -751,15 +1032,223 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
         PrintBenchmarkSummary(state);
     }
 
+    StopEngine(state);
+    ShutdownImGui();
     DestroyPresentation(state);
     SDL_DestroyWindow(state.window);
     SDL_Quit();
-    engine_destroy(state.engine);
     return 0;
 }
 
 }  // namespace
+namespace {
 
+// ---------------------------------------------------------------------------
+// ImGui integration
+// ---------------------------------------------------------------------------
+bool InitImGui(SDL_Window *window, SDL_Renderer *renderer,
+               const std::string &font_path) {
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGui::GetIO().IniFilename = nullptr;  // no persistence for now
+    ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    // Chinese UI: load the engine's CJK font when available; fall back to
+    // the built-in ASCII font otherwise.
+    ImFont *font = nullptr;
+    if(!font_path.empty()) {
+        ImFontConfig cfg;
+        cfg.MergeMode = false;
+        cfg.GlyphRanges = nullptr;
+        static const ImWchar cjk_ranges[] = {
+            0x0020, 0x00FF,  // basic ASCII + Latin-1
+            0x3000, 0x30FF,  // CJK punctuation, kana
+            0x4E00, 0x9FFF,  // CJK unified ideographs
+            0xFF00, 0xFFEF,  // fullwidth forms
+            0,
+        };
+        cfg.GlyphRanges = cjk_ranges;
+        font = ImGui::GetIO().Fonts->AddFontFromFileTTF(
+            font_path.c_str(), 19.0f, &cfg);
+    }
+    if(font == nullptr) {
+        ImGui::GetIO().Fonts->AddFontDefault();
+        g_ui_state.status_text =
+            u8"中文界面字体缺失（NotoSansCJK-Regular.ttc），已回退英文界面";
+    }
+
+    if(!ImGui_ImplSDL3_InitForSDLRenderer(window, renderer)) {
+        fprintf(stderr, "ImGui_ImplSDL3_InitForSDLRenderer failed\n");
+        ImGui::DestroyContext();
+        return false;
+    }
+    if(!ImGui_ImplSDLRenderer3_Init(renderer)) {
+        fprintf(stderr, "ImGui_ImplSDLRenderer3_Init failed\n");
+        ImGui_ImplSDL3_Shutdown();
+        ImGui::DestroyContext();
+        return false;
+    }
+    return true;
+}
+
+void ShutdownImGui() {
+    ImGui_ImplSDLRenderer3_Shutdown();
+    ImGui_ImplSDL3_Shutdown();
+    ImGui::DestroyContext();
+}
+
+void BeginImGuiFrame() {
+    ImGui_ImplSDL3_NewFrame();
+    ImGui_ImplSDLRenderer3_NewFrame();
+    ImGui::NewFrame();
+}
+
+void EndImGuiFrame(SDL_Renderer *renderer) {
+    ImGui::Render();
+    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
+}
+
+// Paints whichever panel the state machine needs (launcher vs overlay).
+void PaintUi(UiState &state, bool game_running) {
+    if(!game_running) {
+        UiLauncherPaint(state);
+    } else if(state.show_overlay) {
+        UiOverlayPaint(state);
+    }
+    if(state.show_demo_window) {
+        ImGui::ShowDemoWindow(&state.show_demo_window);
+    }
+}
+
+// Handles the native file/folder dialogs (SDL3 async API). Polled each frame.
+void PollFileDialog(SDL_Window *window) {
+    static bool dialog_open = false;
+    if(g_file_dialog.active && !dialog_open) {
+        dialog_open = true;
+        auto callback = [](void *userdata, const char *const *files, int) {
+            auto *state = static_cast<UiState *>(userdata);
+            if(files != nullptr && files[0] != nullptr) {
+                state->settings.game_path = files[0];
+            }
+            g_file_dialog.active = false;
+        };
+        if(g_file_dialog.folder) {
+            SDL_ShowOpenFolderDialog(callback, &g_ui_state, window, nullptr,
+                                     false);
+        } else {
+            SDL_ShowOpenFileDialog(callback, &g_ui_state, window, nullptr, 0,
+                                   nullptr, false);
+        }
+    }
+    if(!g_file_dialog.active && dialog_open)
+        dialog_open = false;
+}
+
+// ---------------------------------------------------------------------------
+// Engine lifecycle helpers (UI-driven start/stop/restart)
+// ---------------------------------------------------------------------------
+void StopEngine(HostState &state) {
+    if(state.engine != nullptr) {
+        engine_destroy(state.engine);
+        state.engine = nullptr;
+    }
+    state.startup_complete = false;
+    state.frame_ready = false;
+    state.frame_pixels.clear();
+    state.gpu_frame_texture = 0;
+    state.surface_width = kDefaultSurfaceWidth;
+    state.surface_height = kDefaultSurfaceHeight;
+    state.last_frame_serial = 0;
+    state.no_frame_since_ms = 0;
+    state.screenshot_path.clear();
+    g_ui_state.game_state = GameState::NoGame;
+}
+
+bool StartEngine(HostState &state, const std::string &base_dir,
+                 const std::vector<std::pair<std::string, std::string>>
+                     &extra_options) {
+    if(state.engine != nullptr)
+        StopEngine(state);
+
+    engine_create_desc_t desc;
+    memset(&desc, 0, sizeof(desc));
+    desc.struct_size = sizeof(desc);
+    desc.api_version = ENGINE_API_VERSION;
+    desc.writable_path_utf8 = base_dir.c_str();
+    desc.cache_path_utf8 = base_dir.c_str();
+    if(engine_create(&desc, &state.engine) != ENGINE_RESULT_OK) {
+        fprintf(stderr, "engine_create failed\n");
+        g_ui_state.status_text = u8"引擎创建失败";
+        return false;
+    }
+
+    engine_option_t option;
+    memset(&option, 0, sizeof(option));
+    option.key_utf8 = ENGINE_OPTION_RENDERER;
+    const bool gpu_backend =
+        g_ui_state.settings.render_backend == "gpu_bridge" ||
+        g_ui_state.settings.render_backend == "sdl3_gpu";
+    option.value_utf8 =
+        gpu_backend ? ENGINE_RENDERER_GPU_BRIDGE : ENGINE_RENDERER_SOFTWARE;
+    engine_set_option(state.engine, &option);
+    state.use_gpu_present = gpu_backend;
+    if(gpu_backend) {
+        fprintf(stderr, "[host] render backend: gpu_bridge (zero-copy SDL "
+                        "texture presentation)\n");
+    }
+
+    for(const auto &kv : extra_options) {
+        engine_option_t opt;
+        memset(&opt, 0, sizeof(opt));
+        opt.key_utf8 = kv.first.c_str();
+        opt.value_utf8 = kv.second.c_str();
+        engine_set_option(state.engine, &opt);
+    }
+    if(const char *trace = std::getenv("AETHERKIRI_INPUT_TRACE");
+       trace != nullptr && strcmp(trace, "1") == 0) {
+        engine_option_t input_trace;
+        memset(&input_trace, 0, sizeof(input_trace));
+        input_trace.key_utf8 = "input_trace";
+        input_trace.value_utf8 = "1";
+        engine_set_option(state.engine, &input_trace);
+    }
+    if(!g_ui_state.settings.diagnostics_profile.empty()) {
+        EnableDiagnostics(state, g_ui_state.settings.diagnostics_profile);
+    }
+    engine_set_surface_size(state.engine, state.surface_width,
+                            state.surface_height);
+    return true;
+}
+
+void LaunchGame(HostState &state) {
+    if(state.engine == nullptr ||
+       g_ui_state.settings.game_path.empty())
+        return;
+    // The engine resolves game paths against its own project root; UI paths
+    // may be relative (typed or picked), so absolutize before opening.
+    std::string path = g_ui_state.settings.game_path;
+    {
+        std::error_code ec;
+        const auto absolute = std::filesystem::absolute(path, ec);
+        if(!ec)
+            path = absolute.lexically_normal().string();
+    }
+    const engine_result_t open_result = engine_open_game_async(
+        state.engine, path.c_str(), nullptr);
+    if(open_result != ENGINE_RESULT_OK) {
+        fprintf(stderr, "engine_open_game_async failed: %s\n",
+                engine_get_last_error(state.engine));
+        g_ui_state.status_text = u8"游戏启动失败: " +
+                                 std::string(engine_get_last_error(state.engine));
+        g_ui_state.game_state = GameState::Error;
+        return;
+    }
+    g_ui_state.game_state = GameState::Launching;
+    g_ui_state.status_text = u8"游戏启动中...";
+}
+
+
+}  // namespace (ui helpers)
 int main(int argc, char *argv[]) {
     std::string game_path;
     if(const char *env_path = std::getenv("AETHERKIRI_GAME_PATH");
@@ -811,6 +1300,17 @@ int main(int argc, char *argv[]) {
                                 "(expected key=value)\n",
                         kv.c_str());
             }
+        } else if(strcmp(argv[i], "--render-backend") == 0 && i + 1 < argc) {
+            const std::string backend = argv[++i];
+            if(backend == "software" || backend == "gpu_bridge" ||
+               backend == "sdl3_gpu") {
+                g_ui_state.settings.render_backend = backend;
+            } else {
+                fprintf(stderr,
+                        "ignoring unknown --render-backend '%s' "
+                        "(expected software|gpu_bridge|sdl3_gpu)\n",
+                        backend.c_str());
+            }
         } else if(strcmp(argv[i], "--trace") == 0) {
             extra_options.emplace_back("trace_log", "1");
         } else if(strcmp(argv[i], "--plugin-trace") == 0) {
@@ -837,15 +1337,13 @@ int main(int argc, char *argv[]) {
     }
 
     if(game_path.empty()) {
-        fprintf(stderr,
-                "No game path given. Pass --game <path> or set "
-                "AETHERKIRI_GAME_PATH.\n");
-        return 1;
+        // No game path: open in launcher mode (game selected via ImGui).
+        fprintf(stderr, "[host] no game path; starting in launcher mode\n");
     }
 
     // The engine resolves game paths against its own project root; pass an
     // absolute path so relative arguments survive that normalization.
-    {
+    if(!game_path.empty()) {
         std::error_code ec;
         const auto absolute = std::filesystem::absolute(game_path, ec);
         if(!ec)

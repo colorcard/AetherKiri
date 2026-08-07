@@ -3794,9 +3794,10 @@ engine_result_t engine_media_read_frame_rgba(
   return ENGINE_RESULT_OK;
 }
 
-engine_result_t engine_get_godot_native_frame_texture(
+static engine_result_t EngineGetGpuFrameTextureImpl(
     engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
-    uint32_t* out_height, uint64_t* out_frame_serial) {
+    uint32_t* out_height, uint64_t* out_frame_serial,
+    const char* api_name) {
   if (out_texture_id == nullptr || out_width == nullptr ||
       out_height == nullptr || out_frame_serial == nullptr) {
     return SetThreadErrorAndReturn(
@@ -3824,9 +3825,8 @@ engine_result_t engine_get_godot_native_frame_texture(
   if (impl->state != ToStateValue(EngineState::kOpened) &&
       impl->state != ToStateValue(EngineState::kPaused)) {
     return SetHandleErrorAndReturnLocked(
-        impl,
-        ENGINE_RESULT_INVALID_STATE,
-        "engine_open_game must succeed before engine_get_godot_native_frame_texture");
+        impl, ENGINE_RESULT_INVALID_STATE,
+        "engine_open_game must succeed before calling the GPU frame API");
   }
 
   uint64_t texture = 0;
@@ -3837,7 +3837,7 @@ engine_result_t engine_get_godot_native_frame_texture(
       texture == 0 || width == 0 || height == 0) {
     return SetHandleErrorAndReturnLocked(
         impl, ENGINE_RESULT_NOT_SUPPORTED,
-        "current frame is not backed by a Godot native GPU texture");
+        "current frame is not backed by a host GPU texture");
   }
 
   *out_texture_id = texture;
@@ -3847,6 +3847,22 @@ engine_result_t engine_get_godot_native_frame_texture(
   ClearHandleErrorLocked(impl);
   SetThreadError(nullptr);
   return ENGINE_RESULT_OK;
+}
+
+engine_result_t engine_get_godot_native_frame_texture(
+    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
+    uint32_t* out_height, uint64_t* out_frame_serial) {
+  return EngineGetGpuFrameTextureImpl(handle, out_texture_id, out_width,
+                                      out_height, out_frame_serial,
+                                      "engine_get_godot_native_frame_texture");
+}
+
+engine_result_t engine_get_gpu_frame_texture(
+    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
+    uint32_t* out_height, uint64_t* out_frame_serial) {
+  return EngineGetGpuFrameTextureImpl(handle, out_texture_id, out_width,
+                                      out_height, out_frame_serial,
+                                      "engine_get_gpu_frame_texture");
 }
 
 engine_result_t engine_get_host_native_window(engine_handle_t handle,

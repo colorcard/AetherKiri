@@ -420,10 +420,19 @@ ENGINE_API_EXPORT engine_result_t engine_media_read_frame_rgba(
     engine_frame_desc_t* out_frame_desc);
 
 /*
- * Gets the current Godot-native GPU texture id for zero-copy display.
- * The id is owned by the Godot GDExtension render bridge and can be
- * resolved to a Texture2DRD there. Returns NOT_SUPPORTED when the current
- * frame is not backed by a Godot RenderingDevice texture.
+ * Gets the current host-native GPU texture id for zero-copy display.
+ * The id is owned by the render bridge registered via
+ * engine_register_godot_gpu_bridge (Godot host: Texture2DRD / RenderingDevice
+ * texture; SDL3 host: SDL_Texture*). Returns NOT_SUPPORTED when the current
+ * frame is not backed by a host GPU texture.
+ */
+ENGINE_API_EXPORT engine_result_t engine_get_gpu_frame_texture(
+    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
+    uint32_t* out_height, uint64_t* out_frame_serial);
+
+/*
+ * Backward-compatible alias of engine_get_gpu_frame_texture for the Godot
+ * GDExtension host. New hosts should use engine_get_gpu_frame_texture.
  */
 ENGINE_API_EXPORT engine_result_t engine_get_godot_native_frame_texture(
     engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,

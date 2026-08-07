@@ -29,6 +29,8 @@
 #define engine_media_read_frame_rgba engine_legacy_media_read_frame_rgba
 #define engine_get_godot_native_frame_texture \
   engine_legacy_get_godot_native_frame_texture
+#define engine_get_gpu_frame_texture \
+  engine_legacy_get_gpu_frame_texture
 #define engine_get_host_native_window engine_legacy_get_host_native_window
 #define engine_get_host_native_view engine_legacy_get_host_native_view
 #define engine_send_input engine_legacy_send_input
