@@ -38,6 +38,86 @@ namespace {
 
     std::mutex sOrphanMutex;
     std::unordered_map<TJS::tTJSInterCodeContext*, TimePoint> sOrphanICCs;
+
+    // Minimal UTF-8 <-> UTF-16 conversion for compiler diagnostics. The tjs2
+    // module cannot depend on core/base's character set helpers, and Bison
+    // reports parse errors as std::string (UTF-8) while tjs_char is UTF-16.
+    std::u16string Utf8ToUtf16(const std::string &text) {
+        std::u16string out;
+        out.reserve(text.size());
+        for(size_t i = 0; i < text.size();) {
+            const unsigned char c = static_cast<unsigned char>(text[i]);
+            char32_t cp = 0;
+            int extra = 0;
+            if(c < 0x80) {
+                cp = c;
+            } else if((c & 0xE0) == 0xC0) {
+                cp = c & 0x1F;
+                extra = 1;
+            } else if((c & 0xF0) == 0xE0) {
+                cp = c & 0x0F;
+                extra = 2;
+            } else if((c & 0xF8) == 0xF0) {
+                cp = c & 0x07;
+                extra = 3;
+            } else {
+                ++i; // stray byte; skip
+                continue;
+            }
+            if(i + extra >= text.size() + 1 && extra > 0)
+                break;
+            for(int k = 1; k <= extra; ++k) {
+                const unsigned char cc =
+                    static_cast<unsigned char>(text[i + k]);
+                if((cc & 0xC0) != 0x80) {
+                    cp = 0xFFFD;
+                    i += k;
+                    extra = 0;
+                    break;
+                }
+                cp = (cp << 6) | (cc & 0x3F);
+            }
+            i += extra + 1;
+            if(cp > 0x10FFFF)
+                cp = 0xFFFD;
+            if(cp >= 0x10000) {
+                cp -= 0x10000;
+                out.push_back(static_cast<char16_t>(0xD800 + (cp >> 10)));
+                out.push_back(static_cast<char16_t>(0xDC00 + (cp & 0x3FF)));
+            } else {
+                out.push_back(static_cast<char16_t>(cp));
+            }
+        }
+        return out;
+    }
+
+    std::string Utf16ToUtf8(const tjs_char *text) {
+        std::string out;
+        for(const tjs_char *p = text; p && *p; ++p) {
+            char32_t cp = *p;
+            if(cp >= 0xD800 && cp <= 0xDBFF && p[1] >= 0xDC00 &&
+               p[1] <= 0xDFFF) {
+                cp = 0x10000 + ((cp - 0xD800) << 10) + (p[1] - 0xDC00);
+                ++p;
+            }
+            if(cp < 0x80) {
+                out.push_back(static_cast<char>(cp));
+            } else if(cp < 0x800) {
+                out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else if(cp < 0x10000) {
+                out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            } else {
+                out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+                out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+            }
+        }
+        return out;
+    }
 }
 
 static void RegisterOrphanICC(TJS::tTJSInterCodeContext *icc) {
@@ -102,11 +182,12 @@ namespace TJS // following is in the namespace
     }
 
     void parser::error(const std::string &msg) {
-        spdlog::get("tjs2")->critical(msg);
-        // Bison may recover from a syntax error and leave a partially built
-        // context. Mark the block as failed so SetText/Parse throws before
-        // that incomplete intermediate code can be executed.
-        _yyerror(TJSSyntaxError, ptr);
+        // Forward Bison's actual message (e.g. "syntax error" or the verbose
+        // "syntax error, unexpected X, expecting Y") so _yyerror can wrap it
+        // in the "Syntax error (%1)" template instead of reporting the raw
+        // template text. The block is marked failed below so a partially
+        // built intermediate context can never execute.
+        _yyerror(Utf8ToUtf16(msg).c_str(), ptr);
     }
 
     //---------------------------------------------------------------------------
@@ -143,6 +224,10 @@ namespace TJS // following is in the namespace
         sb->CompileErrorCount++;
         str += { fmt::format(" at line {}", 1 + sb->SrcPosToLine(errpos)) };
         sb->GetTJS()->OutputToConsole(str.c_str());
+
+        // Emit the fully-qualified error to the log channel too; the TJS
+        // console gateway output is not consumed by all hosts.
+        spdlog::get("tjs2")->critical("{}", Utf16ToUtf8(str.c_str()));
 
         return 0;
     }
