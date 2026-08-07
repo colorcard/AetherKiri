@@ -62,6 +62,18 @@ struct HostState {
     uint64_t last_diag_poll_ms = 0;
     uint64_t last_title_stats_ms = 0;
     char memory_stats_text[96] = "";
+    // Slow-frame analysis (default on, 20 ms; 0 disables).
+    uint32_t slow_frame_threshold_ms = 20;
+    uint64_t last_slow_frame_ms = 0;
+    uint32_t suppressed_slow_frames = 0;
+    // Benchmark (--benchmark <seconds>; 0 disables).
+    uint32_t benchmark_seconds = 0;
+    uint64_t benchmark_start_ms = 0;
+    uint64_t benchmark_frames = 0;
+    std::vector<double> benchmark_tick_us;
+    std::vector<double> benchmark_readback_us;
+    std::vector<double> benchmark_upload_us;
+    std::vector<double> benchmark_total_us;
 };
 
 void SavePpm(const std::string &path, const uint8_t *rgba,
@@ -217,7 +229,9 @@ void TickEngine(HostState &state) {
     const uint32_t delta_ms =
         elapsed > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(elapsed);
 
+    const auto tick_start = std::chrono::steady_clock::now();
     engine_tick(state.engine, delta_ms);
+    const auto tick_end = std::chrono::steady_clock::now();
 
     engine_frame_desc_t frame_desc;
     memset(&frame_desc, 0, sizeof(frame_desc));
@@ -262,9 +276,15 @@ void TickEngine(HostState &state) {
         state.frame_pixels.resize(frame_bytes);
         state.frame_stride = frame_desc.stride_bytes;
     }
-    if(engine_read_frame_rgba(state.engine, state.frame_pixels.data(),
-                              frame_bytes) == ENGINE_RESULT_OK) {
+    const auto readback_start = std::chrono::steady_clock::now();
+    const bool frame_read =
+        engine_read_frame_rgba(state.engine, state.frame_pixels.data(),
+                               frame_bytes) == ENGINE_RESULT_OK;
+    const auto readback_end = std::chrono::steady_clock::now();
+    if(frame_read) {
+        const auto upload_start = std::chrono::steady_clock::now();
         UploadEngineFrame(state);
+        const auto upload_end = std::chrono::steady_clock::now();
         if(!state.screenshot_path.empty()) {
             ++state.frame_count_since_start;
             if(state.frame_count_since_start >= state.screenshot_after_frames) {
@@ -273,6 +293,58 @@ void TickEngine(HostState &state) {
                         frame_desc.stride_bytes);
                 state.screenshot_path.clear();
                 state.exit_requested = true;
+            }
+        }
+
+        // Frame timing: host presentation path (engine_tick internals are
+        // already profiled engine-side).
+        const auto frame_end = std::chrono::steady_clock::now();
+        const auto us = [](const auto &a, const auto &b) {
+            return std::chrono::duration<double, std::micro>(b - a).count();
+        };
+        const double tick_us = us(tick_start, tick_end);
+        const double readback_us = us(readback_start, readback_end);
+        const double upload_us = us(upload_start, upload_end);
+        const double total_us = us(tick_start, frame_end);
+
+        if(state.benchmark_seconds > 0) {
+            state.benchmark_frames++;
+            state.benchmark_tick_us.push_back(tick_us);
+            state.benchmark_readback_us.push_back(readback_us);
+            state.benchmark_upload_us.push_back(upload_us);
+            state.benchmark_total_us.push_back(total_us);
+            constexpr size_t kMaxBenchmarkSamples = 100000;
+            if(state.benchmark_total_us.size() > kMaxBenchmarkSamples) {
+                state.benchmark_tick_us.erase(
+                    state.benchmark_tick_us.begin(),
+                    state.benchmark_tick_us.begin() + 10000);
+                state.benchmark_readback_us.erase(
+                    state.benchmark_readback_us.begin(),
+                    state.benchmark_readback_us.begin() + 10000);
+                state.benchmark_upload_us.erase(
+                    state.benchmark_upload_us.begin(),
+                    state.benchmark_upload_us.begin() + 10000);
+                state.benchmark_total_us.erase(
+                    state.benchmark_total_us.begin(),
+                    state.benchmark_total_us.begin() + 10000);
+            }
+        }
+
+        if(state.slow_frame_threshold_ms > 0 &&
+           total_us >= state.slow_frame_threshold_ms * 1000.0) {
+            const uint64_t slow_now = SDL_GetTicks();
+            if(state.last_slow_frame_ms == 0 ||
+               slow_now - state.last_slow_frame_ms >= 1000) {
+                fprintf(stderr,
+                        "[host] slow frame total=%.1fms tick=%.1f "
+                        "readback=%.1f upload=%.1f (suppressed=%u)\n",
+                        total_us / 1000.0, tick_us / 1000.0,
+                        readback_us / 1000.0, upload_us / 1000.0,
+                        static_cast<unsigned>(state.suppressed_slow_frames));
+                state.last_slow_frame_ms = slow_now;
+                state.suppressed_slow_frames = 0;
+            } else {
+                state.suppressed_slow_frames++;
             }
         }
     }
@@ -290,6 +362,50 @@ void TickEngine(HostState &state) {
         fprintf(stderr, "[host] engine stopped producing frames; exiting\n");
         state.exit_requested = true;
     }
+}
+
+// Sorted percentile helper over a copy of the sample buffer.
+double Percentile(std::vector<double> samples, double p) {
+    if(samples.empty())
+        return 0.0;
+    std::sort(samples.begin(), samples.end());
+    const size_t idx = std::min<size_t>(
+        samples.size() - 1, static_cast<size_t>(p * samples.size()));
+    return samples[idx];
+}
+
+void PrintBenchmarkSummary(HostState &state) {
+    const uint64_t now = SDL_GetTicks();
+    const double duration_s =
+        static_cast<double>(now - state.benchmark_start_ms) / 1000.0;
+    if(duration_s <= 0.0 || state.benchmark_total_us.empty()) {
+        fprintf(stderr, "benchmark: no frames collected\n");
+        return;
+    }
+    const double avg_fps =
+        static_cast<double>(state.benchmark_frames) / duration_s;
+    fprintf(stderr,
+            "benchmark: duration=%.1fs frames=%llu avg_fps=%.1f\n",
+            duration_s,
+            static_cast<unsigned long long>(state.benchmark_frames),
+            avg_fps);
+    const auto print_series = [](const char *name,
+                                 const std::vector<double> &samples) {
+        double sum = 0.0;
+        for(double v : samples)
+            sum += v;
+        fprintf(stderr,
+                "  %s_ms avg=%.2f p50=%.2f p95=%.2f p99=%.2f max=%.2f\n",
+                name, sum / samples.size() / 1000.0,
+                Percentile(samples, 0.50) / 1000.0,
+                Percentile(samples, 0.95) / 1000.0,
+                Percentile(samples, 0.99) / 1000.0,
+                *std::max_element(samples.begin(), samples.end()) / 1000.0);
+    };
+    print_series("frame_total", state.benchmark_total_us);
+    print_series("tick", state.benchmark_tick_us);
+    print_series("readback", state.benchmark_readback_us);
+    print_series("upload", state.benchmark_upload_us);
 }
 
 void HandleWindowEvent(HostState &state, const SDL_Event *event) {
@@ -469,6 +585,8 @@ void RunStartup(HostState &state) {
     DrainStartupLogs(state);
     if(startup_state == ENGINE_STARTUP_STATE_SUCCEEDED) {
         state.startup_complete = true;
+        if(state.benchmark_seconds > 0 && state.benchmark_start_ms == 0)
+            state.benchmark_start_ms = SDL_GetTicks();
         UpdateWindowTitle(state);
         return;
     }
@@ -497,11 +615,14 @@ void UpdateFps(HostState &state) {
 int RunHost(const std::string &game_path, uint32_t fps_limit,
             const std::string &screenshot_path, int screenshot_after_frames,
             const std::string &diagnostics_profile,
+            uint32_t slow_frame_threshold_ms, uint32_t benchmark_seconds,
             const std::vector<std::pair<std::string, std::string>>
                 &extra_options) {
     HostState state;
     state.screenshot_path = screenshot_path;
     state.screenshot_after_frames = screenshot_after_frames;
+    state.slow_frame_threshold_ms = slow_frame_threshold_ms;
+    state.benchmark_seconds = benchmark_seconds;
 
     const std::string base_dir = WritableBaseDir();
     EnsureDirectory(base_dir);
@@ -610,12 +731,24 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
         PresentFrame(state);
         UpdateFps(state);
 
+        if(state.benchmark_seconds > 0 && state.benchmark_start_ms != 0 &&
+           SDL_GetTicks() - state.benchmark_start_ms >=
+               static_cast<uint64_t>(state.benchmark_seconds) * 1000) {
+            PrintBenchmarkSummary(state);
+            state.exit_requested = true;
+        }
+
         if(frame_ms > 0) {
             const uint64_t frame_start = state.last_ticks;
             const uint64_t elapsed = SDL_GetTicks() - frame_start;
             if(elapsed < frame_ms)
                 SDL_Delay(static_cast<uint32_t>(frame_ms - elapsed));
         }
+    }
+
+    if(state.benchmark_seconds > 0 && state.benchmark_start_ms != 0 &&
+       !state.exit_requested) {
+        PrintBenchmarkSummary(state);
     }
 
     DestroyPresentation(state);
@@ -638,6 +771,8 @@ int main(int argc, char *argv[]) {
     std::string screenshot_path;
     int screenshot_after_frames = 0;
     std::string diagnostics_profile;
+    uint32_t slow_frame_threshold_ms = 20;
+    uint32_t benchmark_seconds = 0;
     std::vector<std::pair<std::string, std::string>> extra_options;
     for(int i = 1; i < argc; ++i) {
         if((strcmp(argv[i], "--game") == 0 || strcmp(argv[i], "-g") == 0) &&
@@ -658,6 +793,13 @@ int main(int argc, char *argv[]) {
                 diagnostics_profile = argv[++i];
             else
                 diagnostics_profile = "baseline";
+        } else if(strcmp(argv[i], "--slow-frame-threshold-ms") == 0 &&
+                  i + 1 < argc) {
+            slow_frame_threshold_ms = static_cast<uint32_t>(
+                std::max(0, atoi(argv[++i])));
+        } else if(strcmp(argv[i], "--benchmark") == 0 && i + 1 < argc) {
+            benchmark_seconds = static_cast<uint32_t>(
+                std::max(0, atoi(argv[++i])));
         } else if(strcmp(argv[i], "--option") == 0 && i + 1 < argc) {
             const std::string kv = argv[++i];
             const size_t eq = kv.find('=');
@@ -684,6 +826,8 @@ int main(int argc, char *argv[]) {
                     "Usage: aetherkiri_sdl [--game <path>] [--fps <n>]\n"
                     "  [--screenshot <path>] [--screenshot-frames <n>]\n"
                     "  [--diagnostics [profile]]  structured event stream\n"
+                    "  [--slow-frame-threshold-ms <n>]  default 20 (0=off)\n"
+                    "  [--benchmark <seconds>]  timing summary then exit\n"
                     "  [--option key=value]       any engine option\n"
                     "  [--trace] [--plugin-trace] [--export-scripts]\n"
                     "  [--no-mock] [--console-log-file]\n"
@@ -710,5 +854,5 @@ int main(int argc, char *argv[]) {
 
     return RunHost(game_path, fps_limit, screenshot_path,
                    screenshot_after_frames, diagnostics_profile,
-                   extra_options);
+                   slow_frame_threshold_ms, benchmark_seconds, extra_options);
 }
