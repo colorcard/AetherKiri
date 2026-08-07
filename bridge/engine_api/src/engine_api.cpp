@@ -79,6 +79,7 @@ void krkr_GetSurfaceDimensions(uint32_t*, uint32_t*);
 #endif
 #include "visual/ogl/angle_backend.h"
 #include "visual/impl/WindowImpl.h"
+#include "visual/WindowIntf.h"
 #include "visual/RenderManager.h"
 #include "visual/godot/GodotRenderManager.h"
 #include "visual/godot/GodotGpuBridge.h"
@@ -2322,6 +2323,13 @@ engine_result_t engine_destroy(engine_handle_t handle) {
     // UI extensions, locale) instead of silently skipping it.
     TVPEngineBootstrap::Shutdown();
     g_engine_bootstrapped = false;
+
+    // Drop the previous session's window registry (main-window pointer and
+    // window list). Otherwise TVPMainWindow keeps pointing at the old
+    // session's window: input dispatches to its stale layer tree (which is
+    // still composited every tick) while the host reads frames from the new
+    // session's draw buffer, leaving the picture frozen on the first frame.
+    TVPResetWindowRegistryForHost();
   }
 
   delete impl;

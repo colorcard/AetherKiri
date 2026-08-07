@@ -74,6 +74,20 @@ static void TVPUnregisterWindowToList(tTJSNI_Window *window) {
     }
 }
 //---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// TVPResetWindowRegistryForHost : clears the window registry between
+// engine sessions. engine_api calls this during session cleanup so the
+// next engine_open_game starts with a fresh main-window selection; without
+// it TVPMainWindow keeps pointing at the previous session's window and
+// input keeps dispatching to its stale layer tree while the host reads
+// frames from the new session's draw buffer.
+//---------------------------------------------------------------------------
+void TVPResetWindowRegistryForHost() {
+    TVPWindowVector.clear();
+    TVPMainWindow = nullptr;
+}
+//---------------------------------------------------------------------------
 tTJSNI_Window *TVPGetWindowListAt(tjs_int idx) { return TVPWindowVector[idx]; }
 //---------------------------------------------------------------------------
 tjs_int TVPGetWindowCount() { return (tjs_int)TVPWindowVector.size(); }
