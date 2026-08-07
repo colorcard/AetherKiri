@@ -54,9 +54,36 @@ if(TARGET krkr2core AND TARGET krkr2plugin)
         target_link_libraries(engine_api PRIVATE krkr2core krkr2plugin)
     else()
         # Keep static NCB registration objects from krkr2plugin alive in the
-        # final native engine_api link as well.
-        set(_KRKR2PLUGIN_LINK_ITEM "$<LINK_LIBRARY:WHOLE_ARCHIVE,krkr2plugin>")
-        target_link_libraries(engine_api PRIVATE krkr2core ${_KRKR2PLUGIN_LINK_ITEM})
+        # final native engine_api link.
+        if(LINUX)
+            # LINK_LIBRARY_OVERRIDE wraps every krkr2plugin occurrence in the
+            # transitive link graph (including the sub-plugin archives' PRIVATE
+            # back-edges), which duplicates the archive in the shared library.
+            # Drive the linker directly for exactly one whole-archive pass and
+            # re-declare krkr2plugin's public static dependencies explicitly.
+            target_link_libraries(engine_api PRIVATE krkr2core)
+            target_include_directories(engine_api PRIVATE
+                "${KRKR2PLUGIN_PATH}"
+                "${KRKR2PLUGIN_PATH}/simplebinder")
+            # LINKER:SHELL keeps the archive path raw so CMake does not treat
+            # it as a link item (which would also propagate the archive's
+            # interface and re-enter the link-feature checks).
+            set(_KRKR2PLUGIN_ARCHIVE
+                "${CMAKE_BINARY_DIR}/cpp/plugins/libkrkr2plugin.a")
+            target_link_options(engine_api PRIVATE
+                "LINKER:SHELL:-Wl,--whole-archive ${_KRKR2PLUGIN_ARCHIVE} -Wl,--no-whole-archive")
+            target_link_libraries(engine_api PRIVATE
+                psdfile
+                psbfile
+                motionplayer
+                kagparserex
+                layerExDraw
+                psdparse)
+        else()
+            target_link_libraries(engine_api PRIVATE krkr2core krkr2plugin)
+            set_property(TARGET engine_api
+                PROPERTY LINK_LIBRARY_OVERRIDE_krkr2plugin WHOLE_ARCHIVE)
+        endif()
 
         if(LINUX)
             # The runtime modules have circular static-library dependencies.
@@ -66,7 +93,6 @@ if(TARGET krkr2core AND TARGET krkr2plugin)
                 "$<LINK_GROUP:RESCAN,core_base_module,core_environ_module,core_extension_module,core_plugin_module,core_movie_module,core_sound_module,core_visual_module,core_utils_module,tvpgl_simd,tjs2>"
             )
         endif()
-        set_property(TARGET engine_api PROPERTY LINK_LIBRARY_OVERRIDE_krkr2plugin WHOLE_ARCHIVE)
     endif()
 endif()
 

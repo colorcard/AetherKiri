@@ -85,8 +85,14 @@
       "default-features": false
     },
     {
-      "name": "sdl2",
-      "default-features": false
+      "name": "sdl3",
+      "default-features": false,
+      "features": [
+        "wayland",
+        "x11",
+        "ibus",
+        "alsa"
+      ]
     },
     "spdlog",
     "highway",

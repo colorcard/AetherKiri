@@ -55,7 +55,7 @@ find_package(uchardet CONFIG REQUIRED)
 find_package(unrar CONFIG REQUIRED)
 find_package(LibArchive REQUIRED)
 find_package(LibXml2 REQUIRED)
-find_package(SDL2 CONFIG REQUIRED)
+find_package(SDL3 CONFIG REQUIRED)
 find_package(zstd CONFIG REQUIRED)
 find_package(unofficial-minizip CONFIG REQUIRED)
 
@@ -66,8 +66,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     LibXml2::LibXml2
     zstd::libzstd
 
-    $<TARGET_NAME_IF_EXISTS:SDL2::SDL2main>
-    $<IF:$<TARGET_EXISTS:SDL2::SDL2>,SDL2::SDL2,SDL2::SDL2-static>
+    $<TARGET_NAME_IF_EXISTS:SDL3::SDL3main>
+    $<IF:$<TARGET_EXISTS:SDL3::SDL3>,SDL3::SDL3,SDL3::SDL3-static>
     unofficial::minizip::minizip
 )
 

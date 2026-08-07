@@ -84,6 +84,7 @@ option(BUILD_TOOLS "build tools execute build(exclude android ios)" ON)
 option(BUILD_ENGINE_API "build engine_api bridge shared library" ON)
 option(BUILD_GODOT_EXTENSION "build Godot GDExtension host library" ON)
 option(BUILD_GPU_BRIDGE "build legacy external GPU bridge renderer" OFF)
+option(BUILD_SDL_HOST "build the SDL3 host app (desktop only)" OFF)
 option(AETHERKIRI_ENABLE_CODE_OBFUSCATION
        "obfuscate private Internal translation units in release builds" OFF)
 set(AETHERKIRI_OBFUSCATOR_PLUGIN "" CACHE FILEPATH
@@ -196,6 +197,10 @@ if(BUILD_ENGINE_API)
 endif()
 if(BUILD_GODOT_EXTENSION)
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/bridge/godot_extension)
+endif()
+
+if(BUILD_SDL_HOST AND NOT (IOS OR ANDROID OR WEB OR EMSCRIPTEN))
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/apps/sdl_host)
 endif()
 
 if(ENABLE_TESTS AND NOT (IOS OR ANDROID OR WEB OR EMSCRIPTEN))
