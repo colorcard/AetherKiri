@@ -1,0 +1,239 @@
+// AetherKiri engine self-test demo — single-page version.
+// Covers: rendering, audio, touch/pointer position, layer ordering.
+//
+// Pointer:
+//   move       green crosshair + live coordinates
+//   left click cyan crosshair
+//   right click toggle BGM
+//   bottom buttons (visible): BGM / Layer cycle / Pattern toggle
+// Keyboard:
+//   Z  cycle the top layer of the ordering test stack (bringToFront)
+//   X  toggle BGM
+//   C  toggle layer-stack visibility
+//   S  toggle the color/gradient test layer
+//   Esc  quit
+
+var SW = 640;
+var SH = 480;
+
+// ============================================================
+// 1. Main window and primary layer
+// ============================================================
+var win = new Window();
+win.setInnerSize(SW, SH);
+
+var primary = new Layer(win, null);
+win.add(primary);
+with (primary) {
+    .name = "primary";
+    .setSize(SW, SH);
+    .type = ltOpaque;
+    .visible = true;
+    .colorRect(0, 0, SW, SH, 0x383838, 255); // neutral dark gray
+}
+// grid (render test background)
+for (var gx = 0; gx < SW; gx += 40) primary.colorRect(gx, 0, 1, SH, 0x464646, 255);
+for (var gy = 0; gy < SH; gy += 40) primary.colorRect(0, gy, SW, 1, 0x464646, 255);
+primary.drawText(8, 4, "AetherKiri self-test  [Z]layer [X]bgm [C]stack [S]pattern [Esc]quit",
+                 0xffffff, 255, true);
+
+// ============================================================
+// 2. Render test layer: gray ramp, primaries, alpha, text
+// ============================================================
+var pattern = new Layer(win, primary);
+win.add(pattern);
+pattern.name = "pattern";
+pattern.setSize(SW, SH);
+pattern.type = ltTransparent;
+pattern.visible = true;
+
+// 16-step gray ramp
+for (var i = 0; i < 16; ++i) {
+    var gv = (i * 255 / 15) & 0xff;
+    pattern.colorRect(20 + i * 22, 30, 20, 26, (gv << 16) | (gv << 8) | gv, 255);
+}
+// RGB primaries
+pattern.colorRect(20, 64, 60, 26, 0xff0000, 255);
+pattern.colorRect(88, 64, 60, 26, 0x00ff00, 255);
+pattern.colorRect(156, 64, 60, 26, 0x0000ff, 255);
+// 50% alpha black rect (explicit opacity)
+pattern.colorRect(224, 64, 60, 26, 0x000000, 128);
+// text render
+pattern.drawText(20, 100, "Render: 0123456789 ABC abc 简体中文 test", 0xffffff, 255, true);
+pattern.drawText(20, 120, "Semi-opaque red text", 0xff0000, 128, true);
+pattern.drawText(20, 140, "Shadow text", 0x00ffff, 255, true, 0, 1, 0x000000, 1, 1, 1);
+
+// ============================================================
+// 3. Layer ordering test: 5 translucent color blocks
+// ============================================================
+var stackLayers = [];
+var stackColors = [0xff0000, 0x00ff00, 0x0000ff, 0xffff00, 0xff00ff];
+var stackNames = ["L0-red", "L1-green", "L2-blue", "L3-yellow", "L4-magenta"];
+for (var li = 0; li < 5; ++li) {
+    var l = new Layer(win, primary);
+    win.add(l);
+    l.name = "stack_" + li;
+    l.setSize(130, 92);
+    l.left = 40 + li * 24;
+    l.top = 175 + li * 22;
+    l.type = ltTransparent;
+    l.opacity = 180;
+    l.visible = true;
+    l.colorRect(0, 0, 130, 92, stackColors[li], 255);
+    l.drawText(4, 2, stackNames[li], 0xffffff, 255, true);
+    stackLayers[li] = l;
+}
+var stackTop = 4;
+
+// ============================================================
+// 4. Audio test
+// ============================================================
+var bgm = new WaveSoundBuffer(win);
+var bgmPlaying = false;
+var bgmLoaded = false;
+var bgmLabel = "BGM: stopped";
+
+function toggleBgm() {
+    if (bgmPlaying) {
+        bgm.stop();
+        bgmPlaying = false;
+        bgmLabel = "BGM: stopped";
+        statusLine("BGM stopped");
+        return;
+    }
+    if (!bgmLoaded) {
+        bgm.open("bgm/test_bgm.wav");
+        bgmLoaded = true;
+    }
+    bgm.play();
+    bgmPlaying = true;
+    bgmLabel = "BGM: playing";
+    statusLine("BGM playing");
+}
+
+// ============================================================
+// 5. HUD: status bar + three visible clickable buttons
+// ============================================================
+var touch = new Layer(win, primary);
+win.add(touch);
+touch.name = "touch";
+touch.setSize(SW, SH);
+touch.visible = true;
+// Layers default to HitThreshold=16: pixels with alpha<16 do not receive
+// pointer events. 0 makes the whole surface clickable so the crosshair and
+// buttons track the pointer anywhere.
+touch.hitThreshold = 0;
+
+var statusText = "";
+var layerLabel = "Layer: L4";
+var patternLabel = "Pattern: shown";
+
+var BTN_Y = 392;
+var BTN_H = 58;
+var BTN_A = 8, BTN_AW = 182;     // BGM
+var BTN_B = 210, BTN_BW = 210;   // Layer
+var BTN_C = 440, BTN_CW = 192;   // Pattern
+
+function drawButton(x, y, w, h, frameColor, label) {
+    touch.colorRect(x, y, w, h, 0x303030, 255);        // face
+    touch.colorRect(x, y, w, 1, frameColor, 255);      // borders
+    touch.colorRect(x, y + h - 1, w, 1, frameColor, 255);
+    touch.colorRect(x, y, 1, h, frameColor, 255);
+    touch.colorRect(x + w - 1, y, 1, h, frameColor, 255);
+    touch.drawText(x + 6, y + 6, label, frameColor, 255, true);
+}
+
+// Repaints the whole HUD (status bar + buttons). Called after every clear
+// so the layer never accumulates stale marks.
+function drawHud() {
+    touch.fillRect(0, 0, SW, SH, 0);
+    touch.colorRect(0, SH - 22, SW, 22, 0x202020, 255);
+    touch.drawText(8, SH - 20, statusText, 0xffff00, 255, true);
+    drawButton(BTN_A, BTN_Y, BTN_AW, BTN_H, 0x00ffff, bgmLabel);
+    drawButton(BTN_B, BTN_Y, BTN_BW, BTN_H, 0x00ff00, layerLabel);
+    drawButton(BTN_C, BTN_Y, BTN_CW, BTN_H, 0xff00ff, patternLabel);
+}
+
+function statusLine(text) {
+    statusText = text;
+    drawHud();
+}
+
+function drawCross(x, y, color) {
+    drawHud();
+    touch.colorRect(x - 30, y - 1, 60, 2, color, 255);
+    touch.colorRect(x - 1, y - 30, 2, 60, color, 255);
+    var lx = x + 8, ly = y - 22;
+    // keep the coordinate label inside the screen
+    lx = lx + 90 > SW ? SW - 96 : lx;
+    ly = ly < 0 ? y + 8 : ly;
+    touch.drawText(lx, ly, "(" + x + ", " + y + ")", color, 255, true);
+}
+
+// Click routing by visible button rectangles.
+function zoneAction(x, y) {
+    if (y < BTN_Y || y > BTN_Y + BTN_H) return;
+    if (x >= BTN_A && x < BTN_A + BTN_AW) { toggleBgm(); return; }
+    if (x >= BTN_B && x < BTN_B + BTN_BW) { cycleLayer(); return; }
+    if (x >= BTN_C && x < BTN_C + BTN_CW) { togglePattern(); return; }
+}
+
+touch.onMouseDown = function (x, y, btn) {
+    drawCross(x, y, 0x00ffff);
+    if (btn == mbRight) toggleBgm();
+    zoneAction(x, y);
+    return true;
+};
+touch.onMouseMove = function (x, y, flags) {
+    drawCross(x, y, 0x00ff00);
+    return true;
+};
+
+// ============================================================
+// 6. Keyboard
+// ============================================================
+win.onKeyDown = function (key, shift) {
+    // key is a TVP virtual-key code (number), e.g. 'Z' = 0x5A. String
+    // literals like 'z' would never match.
+    if (key == 0x5A || key == 0x7A) { cycleLayer(); return true; }     // Z
+    if (key == 0x58 || key == 0x78) { toggleBgm(); return true; }      // X
+    if (key == 0x43 || key == 0x63) { toggleStack(); return true; }    // C
+    if (key == 0x53 || key == 0x73) { togglePattern(); return true; }  // S
+    if (key == 27) { win.close(); return true; } // Esc
+    return false;
+};
+
+// ============================================================
+// 7. Actions
+// ============================================================
+function cycleLayer() {
+    var target = (stackTop + 1) % 5;
+    stackLayers[target].bringToFront();
+    stackTop = target;
+    layerLabel = "Layer: " + stackNames[target];
+    statusLine("Layer top -> " + stackNames[target] + " (opacity " +
+               stackLayers[target].opacity + ")");
+}
+
+function toggleStack() {
+    var visible = !stackLayers[0].visible;
+    for (var i = 0; i < 5; ++i) stackLayers[i].visible = visible;
+    statusLine("Layer stack " + (visible ? "shown" : "hidden"));
+}
+
+function togglePattern() {
+    pattern.visible = !pattern.visible;
+    patternLabel = "Pattern: " + (pattern.visible ? "shown" : "hidden");
+    statusLine("Pattern layer " + (pattern.visible ? "shown" : "hidden"));
+}
+
+// ============================================================
+// 8. Startup banner + auto BGM after a short delay
+// ============================================================
+statusLine("Ready: move=green cross, L-click=cyan, R-click=BGM, "
+           + "buttons below = BGM/Layer/Pattern");
+
+var startupTimer = new Timer(function () {
+    toggleBgm();
+}, "startup");
+startupTimer.interval = 1500; // ms
