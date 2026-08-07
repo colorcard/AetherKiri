@@ -67,11 +67,14 @@ if(TARGET krkr2core AND TARGET krkr2plugin)
                 "${KRKR2PLUGIN_PATH}/simplebinder")
             # LINKER:SHELL keeps the archive path raw so CMake does not treat
             # it as a link item (which would also propagate the archive's
-            # interface and re-enter the link-feature checks).
+            # interface and re-enter the link-feature checks). Use plain
+            # --whole-archive/--no-whole-archive without an embedded "-Wl,"
+            # prefix: CMake 4.x wraps each SHELL token again, turning
+            # "-Wl,--whole-archive" into the invalid "-Wl,-Wl,--whole-archive".
             set(_KRKR2PLUGIN_ARCHIVE
                 "${CMAKE_BINARY_DIR}/cpp/plugins/libkrkr2plugin.a")
             target_link_options(engine_api PRIVATE
-                "LINKER:SHELL:-Wl,--whole-archive ${_KRKR2PLUGIN_ARCHIVE} -Wl,--no-whole-archive")
+                "LINKER:SHELL:--whole-archive ${_KRKR2PLUGIN_ARCHIVE} --no-whole-archive")
             target_link_libraries(engine_api PRIVATE
                 psdfile
                 psbfile
