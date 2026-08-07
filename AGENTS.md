@@ -23,7 +23,9 @@ AetherKiri：Godot 宿主 + C ABI + C++17 KiriKiri2 引擎核心。
 - 游戏路径传**绝对路径**（引擎 normalize 相对路径有 bug）。
 - 常用参数：`--fps 0`（不设帧率上限）、`--screenshot <path> --screenshot-frames <n>`
   （帧验证）、`--diagnostics [profile]`（结构化诊断 JSONL）、`--benchmark <sec>`
-  （计时统计，阶段 2 GPU 对比基线）、`--slow-frame-threshold-ms <n>`（默认 20）、
+  （计时统计，GPU/软件对比）、`--slow-frame-threshold-ms <n>`（默认 20）、
+  `--render-backend <software|gpu_bridge|sdl3_gpu>`（渲染后端；gpu_bridge 与
+  sdl3_gpu 均为零拷贝 SDL 纹理直显，software 为 CPU readback）、
   `--option key=value` + 便捷开关（--trace/--plugin-trace 等）。
 - Linux 桌面**无系统字体回退**：引擎只找工作目录的 `NotoSansCJK-Regular.ttc`，
   开发时从 `/usr/share/fonts/opentype/noto/` 复制（勿提交仓库）。
@@ -37,6 +39,15 @@ AetherKiri：Godot 宿主 + C ABI + C++17 KiriKiri2 引擎核心。
   gpu_bridge/debug_cpu）。`cpp/core/visual/godot/GodotRenderManager.*` **不依赖 Godot**
   （GPU 全走 `TVPGodotGpuBridgeCallbacks` 回调表 + uint64 句柄）——SDL3 GPU 后端
   只需实现该回调表，RenderManager 可复用。
+- **SDL3 GPU 直显（已落地）**：`apps/sdl_host/src/gpu/gpu_bridge.cpp` 用
+  SDL_Renderer 实现回调表（create/update/clear/read 走 SDL_LockTexture，
+  ABGR8888 流式纹理）；宿主 `engine_get_gpu_frame_texture`（新通用 C ABI，
+  Godot 版 `engine_get_godot_native_frame_texture` 是其别名）取句柄
+  `SDL_RenderTexture` 直显——**无 readback**。blend/triangles/mosaic 回调
+  返回 false（当前无引擎调用者，引擎回退软件）。引擎 release 的纹理延迟到
+  present 后销毁（`GpuBridgeFlushReleasedTextures`）。注意：新 C ABI 函数
+  必须同时接 **dispatch 层**（engine_api_dispatch.cpp Route 转发）——导出
+  handle 是 dispatch 包装，直接调 legacy 层实现会收到无效 handle。
 - **Linux engine_api 链接是手工维护的**（`bridge/engine_api/CMakeLists.txt`：
   显式 `--whole-archive` + 子插件显式链接）——CMake 的 LINK_LIBRARY_OVERRIDE +
   RESCAN 组合会重复包装 krkr2plugin（历史 bug）。**勿改回 override 方案**。
