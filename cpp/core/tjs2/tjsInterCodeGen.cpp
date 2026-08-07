@@ -226,8 +226,60 @@ namespace TJS // following is in the namespace
         sb->GetTJS()->OutputToConsole(str.c_str());
 
         // Emit the fully-qualified error to the log channel too; the TJS
-        // console gateway output is not consumed by all hosts.
-        spdlog::get("tjs2")->critical("{}", Utf16ToUtf8(str.c_str()));
+        // console gateway output is not consumed by all hosts. Include the
+        // offending source line with a column caret when the position is
+        // resolvable.
+        const tjs_int line = sb->SrcPosToLine(errpos);
+        const tjs_int line_start = sb->LineToSrcPos(line);
+        const tjs_char *script = sb->GetScript();
+        const tjs_int script_len =
+            script ? static_cast<tjs_int>(TJS_strlen(script)) : 0;
+        if(script && errpos >= 0 && errpos <= script_len &&
+           line_start >= 0 && line_start <= script_len) {
+            // Extract the source line (up to CR/LF/end), trim trailing
+            // whitespace, and compute the caret column.
+            const tjs_char *line_ptr = script + line_start;
+            const tjs_char *line_end = line_ptr;
+            while(*line_end && *line_end != TJS_W('\n') &&
+                  *line_end != TJS_W('\r'))
+                ++line_end;
+            while(line_end > line_ptr &&
+                  (line_end[-1] == TJS_W(' ') || line_end[-1] == TJS_W('\t')))
+                --line_end;
+            tjs_int col = errpos - line_start;
+            if(col < 0)
+                col = 0;
+            if(col > line_end - line_ptr)
+                col = static_cast<tjs_int>(line_end - line_ptr);
+
+            // Keep the caret visible: show a window around the error column
+            // when the line is long.
+            const tjs_int window = 64;
+            const tjs_int line_len = static_cast<tjs_int>(line_end - line_ptr);
+            tjs_int window_start = 0;
+            if(line_len > window) {
+                window_start = col - window / 2;
+                if(window_start < 0)
+                    window_start = 0;
+                if(window_start + window > line_len)
+                    window_start = line_len - window;
+            }
+            const tjs_int shown_len = std::min(line_len - window_start, window);
+            ttstr line_text(line_ptr + window_start, shown_len);
+            if(shown_len < line_len)
+                line_text += TJS_W("...");
+            ttstr caret;
+            for(tjs_int i = 0; i < (col - window_start); ++i)
+                caret += TJS_W(" ");
+            caret += TJS_W("^");
+
+            spdlog::get("tjs2")->critical(
+                "{}\n  {}\n  {}", Utf16ToUtf8(str.c_str()),
+                Utf16ToUtf8(line_text.c_str()), Utf16ToUtf8(caret.c_str()));
+        } else {
+            spdlog::get("tjs2")->critical("{}",
+                                          Utf16ToUtf8(str.c_str()));
+        }
 
         return 0;
     }
