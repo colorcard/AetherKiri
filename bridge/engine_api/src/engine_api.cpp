@@ -80,6 +80,7 @@ void krkr_GetSurfaceDimensions(uint32_t*, uint32_t*);
 #include "sound/win32/WaveImpl.h"
 #include "sound/win32/WaveMixer.h"
 #include "tjsDebug.h"
+#include "DebugIntf.h"
 #include "engine_options.h"
 #include "PluginCallTracer.hpp"
 #include "PluginImpl.h"
@@ -191,6 +192,13 @@ struct engine_handle_s {
     std::thread worker;
     bool worker_running = false;
   } startup;
+
+  // Host-drainable runtime (post-startup) log buffer. New lines are pulled
+  // from the engine's TVPDrainRuntimeLogs on each drain call.
+  struct RuntimeLogState {
+    std::mutex mutex;
+    std::deque<std::string> logs;
+  } runtime_logs;
 
   struct MemoryOptionState {
     int psb_cache_mb = 0;
@@ -2416,6 +2424,79 @@ engine_result_t engine_drain_startup_logs(engine_handle_t handle,
     out_buffer[buffer_size - 1] = '\0';
   }
   *out_bytes_written = written;
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t engine_drain_runtime_logs(engine_handle_t handle,
+                                          char* out_buffer,
+                                          uint32_t buffer_size,
+                                          uint32_t* out_bytes_written) {
+  if (out_bytes_written == nullptr) {
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "out_bytes_written is null");
+  }
+  if (out_buffer == nullptr || buffer_size == 0) {
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "out_buffer is null or buffer_size is 0");
+  }
+
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  result = ValidateHandleThreadLocked(impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  // Pull new engine lines into the per-handle buffer, then drain the buffer.
+  {
+    std::lock_guard<std::mutex> runtime_guard(impl->runtime_logs.mutex);
+    ttstr pending = TVPDrainRuntimeLogs();
+    if (!pending.IsEmpty()) {
+      tTJSNarrowStringHolder narrow(pending.c_str());
+      const char* text = narrow.operator const char*();
+      std::string line;
+      for (const char* p = text; *p != '\0'; ++p) {
+        if (*p == '\n') {
+          impl->runtime_logs.logs.push_back(line);
+          line.clear();
+        } else {
+          line.push_back(*p);
+        }
+      }
+      if (!line.empty()) {
+        impl->runtime_logs.logs.push_back(line);
+      }
+      constexpr size_t kMaxRuntimeLogs = 4000;
+      while (impl->runtime_logs.logs.size() > kMaxRuntimeLogs) {
+        impl->runtime_logs.logs.pop_front();
+      }
+    }
+
+    uint32_t written = 0;
+    while (!impl->runtime_logs.logs.empty()) {
+      const std::string line = impl->runtime_logs.logs.front();
+      const uint32_t needed = static_cast<uint32_t>(line.size() + 1u);
+      if (written + needed > buffer_size) {
+        break;
+      }
+      std::memcpy(out_buffer + written, line.data(), line.size());
+      written += static_cast<uint32_t>(line.size());
+      out_buffer[written++] = '\n';
+      impl->runtime_logs.logs.pop_front();
+    }
+    if (written < buffer_size) {
+      out_buffer[written] = '\0';
+    } else {
+      out_buffer[buffer_size - 1] = '\0';
+    }
+    *out_bytes_written = written;
+  }
   SetThreadError(nullptr);
   return ENGINE_RESULT_OK;
 }

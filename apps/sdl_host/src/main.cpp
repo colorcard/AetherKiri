@@ -54,6 +54,7 @@ struct HostState {
     // production without any host notification; exit after a stall.
     uint64_t last_frame_serial = 0;
     uint64_t no_frame_since_ms = 0;
+    uint64_t last_log_poll_ms = 0;
 };
 
 void SavePpm(const std::string &path, const uint8_t *rgba,
@@ -339,6 +340,26 @@ void DrainStartupLogs(HostState &state) {
     }
 }
 
+void DrainRuntimeLogs(HostState &state) {
+    if(state.engine == nullptr)
+        return;
+    // Poll the engine's runtime log queue at a low cadence and forward new
+    // lines to stderr. The queue cursor advances inside the engine, so
+    // lines stay deduplicated across calls.
+    const uint64_t now = SDL_GetTicks();
+    if(state.last_log_poll_ms != 0 && now - state.last_log_poll_ms < 100)
+        return;
+    state.last_log_poll_ms = now;
+
+    char buffer[8192];
+    uint32_t written = 0;
+    while(engine_drain_runtime_logs(state.engine, buffer, sizeof(buffer),
+                                    &written) == ENGINE_RESULT_OK &&
+          written > 0) {
+        fwrite(buffer, 1, written, stderr);
+    }
+}
+
 void RunStartup(HostState &state) {
     uint32_t startup_state = ENGINE_STARTUP_STATE_IDLE;
     if(engine_get_startup_state(state.engine, &startup_state) !=
@@ -458,6 +479,7 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
 
         if(state.startup_complete)
             TickEngine(state);
+        DrainRuntimeLogs(state);
 
         PresentFrame(state);
         UpdateFps(state);

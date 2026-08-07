@@ -29,6 +29,11 @@ TJS_EXP_FUNC_DEF(void, TVPAddImportantLog, (const ttstr &line));
 
 extern ttstr TVPGetLastLog(tjs_uint n);
 
+// Returns all log lines not yet consumed by the host (separated by '\n')
+// and advances the host cursor. Truncated entries are dropped like the
+// ring-buffer queue itself.
+extern ttstr TVPDrainRuntimeLogs();
+
 extern iTJSConsoleOutput *TVPGetTJS2ConsoleOutputGateway();
 
 extern iTJSConsoleOutput *TVPGetTJS2DumpOutputGateway();

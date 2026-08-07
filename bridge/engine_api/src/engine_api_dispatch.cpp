@@ -804,6 +804,25 @@ engine_result_t engine_drain_startup_logs(engine_handle_t public_handle,
                });
 }
 
+engine_result_t engine_drain_runtime_logs(engine_handle_t public_handle,
+                                          char* out_buffer,
+                                          uint32_t buffer_size,
+                                          uint32_t* out_bytes_written) {
+  return Route(public_handle, "drain_runtime_logs",
+               [&](engine_handle_t legacy) {
+                 return engine_legacy_drain_runtime_logs(
+                     legacy, out_buffer, buffer_size, out_bytes_written);
+               },
+               [&](DispatchHandle*) {
+                 // Provider backends do not feed the TVP log queue; report
+                 // no new lines.
+                 if (out_bytes_written != nullptr) {
+                   *out_bytes_written = 0;
+                 }
+                 return ENGINE_RESULT_OK;
+               });
+}
+
 engine_result_t engine_tick(engine_handle_t public_handle, uint32_t delta_ms) {
   return Route(public_handle, "tick",
                [&](engine_handle_t legacy) {

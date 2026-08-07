@@ -32,15 +32,26 @@
 struct tTVPLogItem {
     ttstr Log;
     ttstr Time;
+    uint64_t Seq; // monotonic sequence, stable across deque truncation
 
-    tTVPLogItem(const ttstr &log, const ttstr &time) {
+    tTVPLogItem(const ttstr &log, const ttstr &time, uint64_t seq) {
         Log = log;
         Time = time;
+        Seq = seq;
     }
 };
 
 static std::deque<tTVPLogItem> *TVPLogDeque = nullptr;
 static tjs_uint TVPLogMaxLines = 2048;
+
+// Guards TVPLogDeque (production from engine threads, consumption from the
+// host through TVPDrainRuntimeLogs). Logging is not a hot path; the lock is
+// uncontended except during explicit drains.
+static std::mutex g_log_mutex;
+static uint64_t g_log_seq = 0;
+// Host-side consumption cursor: TVPDrainRuntimeLogs returns entries with
+// Seq > g_log_consumed_seq and advances it to the last returned entry.
+static uint64_t g_log_consumed_seq = 0;
 
 bool TVPAutoLogToFileOnError = true;
 bool TVPAutoClearLogOnError = false;
@@ -340,7 +351,9 @@ void tTVPLogStreamHolder::Log(const ttstr &text) {
 void TVPAddLog(const ttstr &line, bool appendtoimportant) {
     // add a line to the log.
     // exceeded lines over TVPLogMaxLines are eliminated.
-    // this function is not thread-safe ...
+    // thread-safe through g_log_mutex; host drains via TVPDrainRuntimeLogs.
+
+    std::lock_guard<std::mutex> lock(g_log_mutex);
 
     TVPEnsureLogObjects();
     if(!TVPLogDeque)
@@ -363,7 +376,7 @@ void TVPAddLog(const ttstr &line, bool appendtoimportant) {
         prevtimebuf = timebuf;
     }
 
-    TVPLogDeque->emplace_back(line, prevtimebuf);
+    TVPLogDeque->emplace_back(line, prevtimebuf, ++g_log_seq);
 
     if(appendtoimportant) {
 #ifdef TJS_TEXT_OUT_CRLF
@@ -420,6 +433,7 @@ ttstr TVPGetImportantLog() {
 // '\n'/'\r\n' )
 //---------------------------------------------------------------------------
 ttstr TVPGetLastLog(tjs_uint n) {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
     TVPEnsureLogObjects();
     if(!TVPLogDeque)
         return TJS_W(""); // log system is shuttingdown
@@ -464,6 +478,34 @@ ttstr TVPGetLastLog(tjs_uint n) {
 #endif
         i++;
     }
+    return buf;
+}
+//---------------------------------------------------------------------------
+
+//---------------------------------------------------------------------------
+// TVPDrainRuntimeLogs : return all host-unconsumed log lines and advance
+// the host cursor. Sequence numbers make the cursor robust against deque
+// truncation: entries evicted before being drained are simply lost, matching
+// the queue's ring-buffer semantics. TVPGetLastLog is unaffected (it reads
+// the history tail without consuming).
+//---------------------------------------------------------------------------
+ttstr TVPDrainRuntimeLogs() {
+    std::lock_guard<std::mutex> lock(g_log_mutex);
+    if(!TVPLogDeque || TVPLogDeque->empty())
+        return {};
+
+    uint64_t last_returned = g_log_consumed_seq;
+    ttstr buf;
+    for(const auto &item : *TVPLogDeque) {
+        if(item.Seq <= g_log_consumed_seq)
+            continue;
+        if(!buf.IsEmpty())
+            buf += TJS_W("\n");
+        buf += item.Log;
+        last_returned = item.Seq;
+    }
+    if(last_returned > g_log_consumed_seq)
+        g_log_consumed_seq = last_returned;
     return buf;
 }
 //---------------------------------------------------------------------------

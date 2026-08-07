@@ -8,6 +8,7 @@
 #define engine_open_game_async engine_legacy_open_game_async
 #define engine_get_startup_state engine_legacy_get_startup_state
 #define engine_drain_startup_logs engine_legacy_drain_startup_logs
+#define engine_drain_runtime_logs engine_legacy_drain_runtime_logs
 #define engine_tick engine_legacy_tick
 #define engine_pause engine_legacy_pause
 #define engine_resume engine_legacy_resume

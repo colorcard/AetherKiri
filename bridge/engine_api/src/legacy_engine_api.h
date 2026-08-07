@@ -20,6 +20,9 @@ engine_result_t engine_legacy_get_startup_state(engine_handle_t handle,
 engine_result_t engine_legacy_drain_startup_logs(
     engine_handle_t handle, char* out_buffer, uint32_t buffer_size,
     uint32_t* out_bytes_written);
+engine_result_t engine_legacy_drain_runtime_logs(
+    engine_handle_t handle, char* out_buffer, uint32_t buffer_size,
+    uint32_t* out_bytes_written);
 engine_result_t engine_legacy_tick(engine_handle_t handle, uint32_t delta_ms);
 engine_result_t engine_legacy_pause(engine_handle_t handle);
 engine_result_t engine_legacy_resume(engine_handle_t handle);

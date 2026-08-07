@@ -308,6 +308,17 @@ ENGINE_API_EXPORT engine_result_t engine_drain_startup_logs(
     uint32_t* out_bytes_written);
 
 /*
+ * Drains runtime (post-startup) engine logs into caller buffer as UTF-8
+ * text. Each log line is terminated by '\n'. Lines produced before the
+ * previous call are consumed and never returned again; the engine's ring
+ * buffer may drop the oldest lines under heavy logging.
+ * Returns bytes written in out_bytes_written.
+ */
+ENGINE_API_EXPORT engine_result_t engine_drain_runtime_logs(
+    engine_handle_t handle, char* out_buffer, uint32_t buffer_size,
+    uint32_t* out_bytes_written);
+
+/*
  * Ticks engine main loop once.
  * handle must be non-null.
  * delta_ms is caller-provided elapsed milliseconds.
