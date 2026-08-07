@@ -5,6 +5,7 @@
 #include <SDL3/SDL.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -55,6 +56,12 @@ struct HostState {
     uint64_t last_frame_serial = 0;
     uint64_t no_frame_since_ms = 0;
     uint64_t last_log_poll_ms = 0;
+    // Structured diagnostics (--diagnostics [profile]).
+    bool diagnostics_enabled = false;
+    uint64_t diagnostic_mask = 0;
+    uint64_t last_diag_poll_ms = 0;
+    uint64_t last_title_stats_ms = 0;
+    char memory_stats_text[96] = "";
 };
 
 void SavePpm(const std::string &path, const uint8_t *rgba,
@@ -110,11 +117,12 @@ void EnsureDirectory(const std::string &path) {
 }
 
 void UpdateWindowTitle(HostState &state) {
-    char title[160];
+    char title[192];
     if(state.startup_complete) {
         snprintf(title, sizeof(title),
-                 "AetherKiri SDL Host - %ux%u @ %.1f fps",
-                 state.surface_width, state.surface_height, state.fps);
+                 "AetherKiri SDL Host - %ux%u @ %.1f fps%s",
+                 state.surface_width, state.surface_height, state.fps,
+                 state.memory_stats_text);
     } else {
         snprintf(title, sizeof(title), "AetherKiri SDL Host - starting...");
     }
@@ -360,6 +368,98 @@ void DrainRuntimeLogs(HostState &state) {
     }
 }
 
+// Diagnostic profile -> category mask, mirroring the Godot host's
+// PROFILE_MASK table (category bits: lifecycle=1 input=2 render=4
+// storage=8 script=16 audio=32 video=64 plugin=128 memory=256 system=512).
+uint64_t DiagnosticMaskForProfile(const std::string &profile) {
+    if(profile == "input")
+        return (1ull << 0) | (1ull << 1) | (1ull << 2);
+    if(profile == "render")
+        return (1ull << 0) | (1ull << 2) | (1ull << 8);
+    if(profile == "storage")
+        return (1ull << 0) | (1ull << 2) | (1ull << 3) | (1ull << 8);
+    if(profile == "script")
+        return (1ull << 0) | (1ull << 2) | (1ull << 4);
+    if(profile == "audio")
+        return (1ull << 0) | (1ull << 2) | (1ull << 5);
+    if(profile == "video")
+        return (1ull << 0) | (1ull << 6) | (1ull << 2);
+    if(profile == "plugin")
+        return (1ull << 0) | (1ull << 2) | (1ull << 7);
+    if(profile == "system")
+        return (1ull << 0) | (1ull << 2) | (1ull << 9);
+    if(profile == "full")
+        return (1ull << 10) - 1;
+    return (1ull << 0) | (1ull << 2);  // baseline
+}
+
+void EnableDiagnostics(HostState &state, const std::string &profile) {
+    if(state.engine == nullptr)
+        return;
+    state.diagnostics_enabled = true;
+    state.diagnostic_mask = DiagnosticMaskForProfile(profile);
+
+    engine_diagnostic_config_t config;
+    memset(&config, 0, sizeof(config));
+    config.struct_size = sizeof(config);
+    config.enabled = 1;
+    config.category_mask = state.diagnostic_mask;
+    config.slow_frame_threshold_us = 20000;
+    config.max_events = 2000;
+    // Called before SDL_Init, so SDL_GetTicks is not usable yet.
+    static std::string session_id =
+        "sdl-host-" + std::to_string(std::chrono::steady_clock::now()
+                                         .time_since_epoch()
+                                         .count());
+    config.session_id_utf8 = session_id.c_str();
+    if(engine_set_diagnostic_config(state.engine, &config) !=
+       ENGINE_RESULT_OK) {
+        fprintf(stderr, "[host] diagnostic config failed: %s\n",
+                engine_get_last_error(state.engine));
+    }
+}
+
+void DrainDiagnosticEvents(HostState &state) {
+    if(!state.diagnostics_enabled || state.engine == nullptr)
+        return;
+    const uint64_t now = SDL_GetTicks();
+    if(state.last_diag_poll_ms != 0 && now - state.last_diag_poll_ms < 1000)
+        return;
+    state.last_diag_poll_ms = now;
+
+    char buffer[8192];
+    uint32_t written = 0;
+    while(engine_drain_diagnostic_events(state.engine, buffer, sizeof(buffer),
+                                         &written) == ENGINE_RESULT_OK &&
+          written > 0) {
+        fwrite(buffer, 1, written, stderr);
+        written = 0;
+    }
+}
+
+// Refreshes the memory-stats suffix shown in the window title once per
+// second (best-effort; silently ignored when the call fails).
+void RefreshMemoryStatsText(HostState &state) {
+    const uint64_t now = SDL_GetTicks();
+    if(state.last_title_stats_ms != 0 && now - state.last_title_stats_ms < 1000)
+        return;
+    state.last_title_stats_ms = now;
+
+    engine_memory_stats_t stats;
+    memset(&stats, 0, sizeof(stats));
+    stats.struct_size = sizeof(stats);
+    if(engine_get_memory_stats(state.engine, &stats) != ENGINE_RESULT_OK)
+        return;
+    snprintf(state.memory_stats_text, sizeof(state.memory_stats_text),
+             " | rss %lluM gfx %lluM xp3 %lluM",
+             static_cast<unsigned long long>(stats.process_resident_bytes /
+                                             1024 / 1024),
+             static_cast<unsigned long long>(stats.graphic_cache_bytes / 1024 /
+                                            1024),
+             static_cast<unsigned long long>(stats.xp3_segment_cache_bytes /
+                                             1024 / 1024));
+}
+
 void RunStartup(HostState &state) {
     uint32_t startup_state = ENGINE_STARTUP_STATE_IDLE;
     if(engine_get_startup_state(state.engine, &startup_state) !=
@@ -395,7 +495,10 @@ void UpdateFps(HostState &state) {
 }
 
 int RunHost(const std::string &game_path, uint32_t fps_limit,
-            const std::string &screenshot_path, int screenshot_after_frames) {
+            const std::string &screenshot_path, int screenshot_after_frames,
+            const std::string &diagnostics_profile,
+            const std::vector<std::pair<std::string, std::string>>
+                &extra_options) {
     HostState state;
     state.screenshot_path = screenshot_path;
     state.screenshot_after_frames = screenshot_after_frames;
@@ -421,6 +524,17 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
     option.value_utf8 = ENGINE_RENDERER_SOFTWARE;
     engine_set_option(state.engine, &option);
 
+    // Extra engine options from the command line (--option key=value and the
+    // convenience switches). Applied before game startup so they are visible
+    // to the whole session.
+    for(const auto &kv : extra_options) {
+        engine_option_t opt;
+        memset(&opt, 0, sizeof(opt));
+        opt.key_utf8 = kv.first.c_str();
+        opt.value_utf8 = kv.second.c_str();
+        engine_set_option(state.engine, &opt);
+    }
+
     if(const char *trace = std::getenv("AETHERKIRI_INPUT_TRACE");
        trace != nullptr && strcmp(trace, "1") == 0) {
         engine_option_t input_trace;
@@ -428,6 +542,10 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
         input_trace.key_utf8 = "input_trace";
         input_trace.value_utf8 = "1";
         engine_set_option(state.engine, &input_trace);
+    }
+
+    if(!diagnostics_profile.empty()) {
+        EnableDiagnostics(state, diagnostics_profile);
     }
 
     if(SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_EVENTS) < 0) {
@@ -480,6 +598,8 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
         if(state.startup_complete)
             TickEngine(state);
         DrainRuntimeLogs(state);
+        DrainDiagnosticEvents(state);
+        RefreshMemoryStatsText(state);
 
         PresentFrame(state);
         UpdateFps(state);
@@ -511,6 +631,8 @@ int main(int argc, char *argv[]) {
     uint32_t fps_limit = kDefaultFpsLimit;
     std::string screenshot_path;
     int screenshot_after_frames = 0;
+    std::string diagnostics_profile;
+    std::vector<std::pair<std::string, std::string>> extra_options;
     for(int i = 1; i < argc; ++i) {
         if((strcmp(argv[i], "--game") == 0 || strcmp(argv[i], "-g") == 0) &&
            i + 1 < argc) {
@@ -524,10 +646,41 @@ int main(int argc, char *argv[]) {
         } else if(strcmp(argv[i], "--screenshot-frames") == 0 &&
                   i + 1 < argc) {
             screenshot_after_frames = std::max(0, atoi(argv[++i]));
+        } else if(strcmp(argv[i], "--diagnostics") == 0) {
+            // Optional profile argument; default to baseline.
+            if(i + 1 < argc && argv[i + 1][0] != '-')
+                diagnostics_profile = argv[++i];
+            else
+                diagnostics_profile = "baseline";
+        } else if(strcmp(argv[i], "--option") == 0 && i + 1 < argc) {
+            const std::string kv = argv[++i];
+            const size_t eq = kv.find('=');
+            if(eq != std::string::npos && eq > 0) {
+                extra_options.emplace_back(kv.substr(0, eq),
+                                          kv.substr(eq + 1));
+            } else {
+                fprintf(stderr, "ignoring malformed --option '%s' "
+                                "(expected key=value)\n",
+                        kv.c_str());
+            }
+        } else if(strcmp(argv[i], "--trace") == 0) {
+            extra_options.emplace_back("trace_log", "1");
+        } else if(strcmp(argv[i], "--plugin-trace") == 0) {
+            extra_options.emplace_back("plugin_trace", "1");
+        } else if(strcmp(argv[i], "--export-scripts") == 0) {
+            extra_options.emplace_back("export_scripts", "1");
+        } else if(strcmp(argv[i], "--no-mock") == 0) {
+            extra_options.emplace_back("mock_enabled", "0");
+        } else if(strcmp(argv[i], "--console-log-file") == 0) {
+            extra_options.emplace_back("console_log_file", "1");
         } else if(strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             fprintf(stderr,
-                    "Usage: aetherkiri_sdl [--game <path>] [--fps <n>] "
-                    "[--screenshot <path>] [--screenshot-frames <n>]\n"
+                    "Usage: aetherkiri_sdl [--game <path>] [--fps <n>]\n"
+                    "  [--screenshot <path>] [--screenshot-frames <n>]\n"
+                    "  [--diagnostics [profile]]  structured event stream\n"
+                    "  [--option key=value]       any engine option\n"
+                    "  [--trace] [--plugin-trace] [--export-scripts]\n"
+                    "  [--no-mock] [--console-log-file]\n"
                     "  AETHERKIRI_GAME_PATH env var is honored too.\n");
             return 0;
         }
@@ -550,5 +703,6 @@ int main(int argc, char *argv[]) {
     }
 
     return RunHost(game_path, fps_limit, screenshot_path,
-                   screenshot_after_frames);
+                   screenshot_after_frames, diagnostics_profile,
+                   extra_options);
 }
