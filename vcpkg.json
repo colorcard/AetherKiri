@@ -13,10 +13,6 @@
       "name": "boost-locale",
       "default-features": false
     },
-    {
-      "name": "bullet3",
-      "platform": "!emscripten"
-    },
     "boost-phoenix",
     "boost-spirit",
     "curl",

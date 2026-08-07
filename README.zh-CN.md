@@ -432,6 +432,29 @@ Profile 字段：
 验收要求包括启动、渲染、输入、菜单操作、音频、存档路径、干净退出，以及
 Godot Native 或 GPU Bridge 达到性能目标。Debug CPU 只作为诊断 fallback。
 
+## SDL3 宿主（仅引擎）
+
+一个不依赖 Godot 的桌面宿主，通过 C ABI（`bridge/engine_api`）驱动引擎：
+窗口、输入转发、软件渲染 readback 呈现，以及一套诊断设施。适合在无
+Godot 工具链的环境下做引擎开发。
+
+```bash
+# 构建（Linux，无需 Godot）
+./tools/build_sdl_host.sh linux debug
+
+# 运行自检 demo（不设帧率上限）
+LD_LIBRARY_PATH=$PWD/out/linux/debug/vcpkg_installed/x64-linux/lib \
+  out/linux/debug/apps/sdl_host/aetherkiri_sdl \
+  --game demos/aetherkiri-test/data --fps 0
+```
+
+常用参数（详见 `--help`）：`--screenshot <path> --screenshot-frames <n>`
+帧验证、`--diagnostics [profile]` 结构化 JSONL 事件、`--benchmark <seconds>`
+计时统计，以及 `--option key=value` 与便捷开关（`--trace`、
+`--plugin-trace` 等）透传引擎选项。Linux 桌面引擎无系统字体回退，
+需在工作目录放置 `NotoSansCJK-Regular.ttc`。迁移记录与踩坑见
+`doc/migration-sdl3.md`。
+
 ## 文档
 
 - 开发文档：`doc/development.zh-CN.md`

@@ -525,6 +525,32 @@ Acceptance requires startup, rendering, input, menu operations, audio, save
 paths, clean exit, and performance parity from Godot Native or GPU Bridge. Debug
 CPU is only a diagnostic fallback.
 
+## SDL3 Host (Engine-Only)
+
+A Godot-free desktop host drives the engine through the C ABI
+(`bridge/engine_api`): window, input forwarding, software-render
+readback presentation, and a suite of diagnostics. Useful for engine
+work without the Godot toolchain.
+
+```bash
+# Build (Linux; no Godot required)
+./tools/build_sdl_host.sh linux debug
+
+# Run the self-test demo (unlimited frame rate)
+LD_LIBRARY_PATH=$PWD/out/linux/debug/vcpkg_installed/x64-linux/lib \
+  out/linux/debug/apps/sdl_host/aetherkiri_sdl \
+  --game demos/aetherkiri-test/data --fps 0
+```
+
+Key options (see `--help`): `--screenshot <path> --screenshot-frames <n>`
+for frame verification, `--diagnostics [profile]` for structured JSONL
+events, `--benchmark <seconds>` for timing statistics, and
+`--option key=value` plus convenience switches (`--trace`,
+`--plugin-trace`, ...) for engine options. On Linux desktop the engine
+needs a `NotoSansCJK-Regular.ttc` font next to the working directory
+(no system-font fallback). See `doc/migration-sdl3.md` for the migration
+record and gotchas.
+
 ## Documentation
 
 - Developer guide: `doc/development.md`
