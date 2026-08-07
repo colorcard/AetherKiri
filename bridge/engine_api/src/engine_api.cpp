@@ -2316,6 +2316,12 @@ engine_result_t engine_destroy(engine_handle_t handle) {
     TVPSystemUninitCalled = false;
     TVPEngineApi_SetGlobalException("");
     g_runtime_started_once = false;
+
+    // Reset the bootstrap state so the next engine_create runs the full
+    // runtime initialization (graphics backend, render manager registry,
+    // UI extensions, locale) instead of silently skipping it.
+    TVPEngineBootstrap::Shutdown();
+    g_engine_bootstrapped = false;
   }
 
   delete impl;
