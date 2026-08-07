@@ -50,6 +50,7 @@ export CCACHE_DIR="${CCACHE_DIR:-${AETHERKIRI_CACHE_DIR}/ccache}"
 export VCPKG_ROOT="${VCPKG_ROOT:-${AETHERKIRI_CACHE_DIR}/vcpkg}"
 export VCPKG_DOWNLOADS="${VCPKG_DOWNLOADS:-${AETHERKIRI_CACHE_DIR}/vcpkg-downloads}"
 export VCPKG_DEFAULT_BINARY_CACHE="${VCPKG_DEFAULT_BINARY_CACHE:-${AETHERKIRI_CACHE_DIR}/vcpkg-binaries}"
+mkdir -p "$VCPKG_DOWNLOADS" "$VCPKG_DEFAULT_BINARY_CACHE"
 
 preset=""
 case "$platform" in
@@ -70,7 +71,8 @@ cmake --preset "$preset" \
     -DBUILD_GODOT_EXTENSION=OFF \
     -DBUILD_GPU_BRIDGE=OFF \
     -DBUILD_SDL_HOST=ON \
-    -DAETHERKIRI_ENABLE_INTERNAL=OFF
+    -DAETHERKIRI_ENABLE_INTERNAL=OFF \
+    -DCMAKE_MAKE_PROGRAM="${CMAKE_MAKE_PROGRAM:-$(command -v ninja || true)}"
 
 echo "[build_sdl_host] building with $jobs jobs"
 cmake --build --preset "${preset% Config} Build" --parallel "$jobs"
