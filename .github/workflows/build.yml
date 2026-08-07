@@ -71,6 +71,9 @@ env:
 
 jobs:
   android:
+    # Disabled while the SDL host migration is the active line; re-enable by
+    # removing this line. (Private submodule checkout requires repo secrets.)
+    if: false
     name: Build Android App
     runs-on: ubuntu-latest
     env:
@@ -306,6 +309,9 @@ jobs:
           key: ${{ runner.os }}-android-ccache-v2
 
   ios:
+    # Disabled while the SDL host migration is the active line; re-enable by
+    # removing this line. (Private submodule checkout requires repo secrets.)
+    if: false
     name: Build iOS App
     runs-on: macos-latest
     env:
@@ -562,6 +568,9 @@ jobs:
           key: ${{ runner.os }}-ios-ccache-v2
 
   macos:
+    # Disabled while the SDL host migration is the active line; re-enable by
+    # removing this line. (Private submodule checkout requires repo secrets.)
+    if: false
     name: Build macOS App
     runs-on: macos-latest
     env:
@@ -802,6 +811,9 @@ jobs:
           key: ${{ runner.os }}-macos-ccache-v2
 
   web:
+    # Disabled while the SDL host migration is the active line; re-enable by
+    # removing this line. (Private submodule checkout requires repo secrets.)
+    if: false
     name: Build Web App
     runs-on: ubuntu-latest
     env:
@@ -1017,6 +1029,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y cmake ninja-build pkg-config autoconf automake libtool gettext bison flex curl unzip zip zstd ccache jq mono-complete nasm yasm libopenal-dev libxrender-dev libx11-dev libxext-dev libcairo2-dev
 
+      - name: Restore vcpkg binary cache
+        id: restore-vcpkg
+        uses: actions/cache/restore@v5
+        with:
+          path: .aetherkiri-cache/vcpkg-binaries
+          key: ${{ runner.os }}-sdl-host-vcpkg-${{ hashFiles('vcpkg.json') }}
+          restore-keys: |
+            ${{ runner.os }}-sdl-host-vcpkg-
+
       - name: Restore ccache
         id: restore-ccache
         uses: actions/cache/restore@v5
@@ -1045,9 +1066,6 @@ jobs:
           fi
           echo "VCPKG_ROOT=${GITHUB_WORKSPACE}/.devtools/vcpkg" >> "$GITHUB_ENV"
 
-      - name: Configure vcpkg binary cache
-        run: bash .github/scripts/configure-vcpkg-binary-cache.sh "$VCPKG_ROOT/vcpkg"
-
       - name: Build SDL host (engine + host, no Godot)
         run: |
           set -euo pipefail
@@ -1071,6 +1089,13 @@ jobs:
             out/linux/debug/bridge/engine_api/libengine_api.so
             out/linux/debug/apps/sdl_host/aetherkiri_sdl
           retention-days: 7
+
+      - name: Save vcpkg binary cache
+        if: success() && steps.restore-vcpkg.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+        uses: actions/cache/save@v5
+        with:
+          path: .aetherkiri-cache/vcpkg-binaries
+          key: ${{ runner.os }}-sdl-host-vcpkg-${{ hashFiles('vcpkg.json') }}
 
       - name: Save ccache
         if: success() && github.event_name != 'pull_request' && steps.restore-ccache.outputs.cache-hit != 'true'
