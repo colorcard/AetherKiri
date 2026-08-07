@@ -432,8 +432,29 @@ ttstr TVPGetImportantLog() {
 // spearated with
 // '\n'/'\r\n' )
 //---------------------------------------------------------------------------
+static ttstr TVPGetLastLogLocked(tjs_uint n);
+
 ttstr TVPGetLastLog(tjs_uint n) {
     std::lock_guard<std::mutex> lock(g_log_mutex);
+    return TVPGetLastLogLocked(n);
+}
+
+//---------------------------------------------------------------------------
+// TVPGetLastLogNoBlock : crash-safe variant. Returns the last n log lines
+// when the log mutex is free; returns an empty string when another thread
+// holds it (for example the thread that crashed mid-log). Callers must not
+// block in signal handlers.
+//---------------------------------------------------------------------------
+ttstr TVPGetLastLogNoBlock(tjs_uint n) {
+    if(!g_log_mutex.try_lock())
+        return {};
+    ttstr result = TVPGetLastLogLocked(n);
+    g_log_mutex.unlock();
+    return result;
+}
+
+//---------------------------------------------------------------------------
+static ttstr TVPGetLastLogLocked(tjs_uint n) {
     TVPEnsureLogObjects();
     if(!TVPLogDeque)
         return TJS_W(""); // log system is shuttingdown

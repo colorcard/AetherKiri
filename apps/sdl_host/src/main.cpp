@@ -506,6 +506,12 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
     const std::string base_dir = WritableBaseDir();
     EnsureDirectory(base_dir);
 
+    // Crash artifacts (stack/log/frame) land under the writable data dir so
+    // they survive terminal loss and are easy to find.
+    const std::string crash_dir = base_dir + "/crashes";
+    EnsureDirectory(crash_dir);
+    setenv("AETHERKIRI_CRASH_DIR", crash_dir.c_str(), 1);
+
     engine_create_desc_t desc;
     memset(&desc, 0, sizeof(desc));
     desc.struct_size = sizeof(desc);

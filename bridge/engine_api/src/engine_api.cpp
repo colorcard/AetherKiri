@@ -8,7 +8,9 @@
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <deque>
 #include <exception>
 #include <filesystem>
@@ -21,6 +23,10 @@
 #include <memory>
 #include <sstream>
 #include <vector>
+
+#if defined(__APPLE__) || defined(__linux__)
+#include <dlfcn.h>
+#endif
 
 #include <csignal>
 #include <cstdio>
@@ -806,6 +812,149 @@ std::shared_ptr<spdlog::logger> EnsureNamedLogger(const char* name) {
   return spdlog::stdout_color_mt(name);
 }
 
+// Resolves a code address to "module+offset (symbol+offset)" where possible.
+// Falls back to the raw address when dladdr is unavailable or fails.
+void SymbolizeAddress(void* addr, char* out, size_t out_size) {
+#if defined(__APPLE__) || defined(__linux__)
+  Dl_info info{};
+  if (addr != nullptr && dladdr(addr, &info) != 0 && info.dli_sname != nullptr) {
+    const uintptr_t base =
+        reinterpret_cast<uintptr_t>(info.dli_fbase != nullptr
+                                        ? info.dli_fbase
+                                        : info.dli_saddr);
+    const uintptr_t sym = reinterpret_cast<uintptr_t>(info.dli_saddr);
+    const char* module = info.dli_fname != nullptr ? info.dli_fname : "?";
+    const char* slash = strrchr(module, '/');
+    if (slash != nullptr) module = slash + 1;
+    if (base != 0) {
+      snprintf(out, out_size, "%s+0x%llx (%s+0x%llx)", module,
+               static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(addr) - base),
+               info.dli_sname,
+               static_cast<unsigned long long>(sym - base));
+    } else {
+      snprintf(out, out_size, "%s (%s)", module, info.dli_sname);
+    }
+    return;
+  }
+  if (addr != nullptr) {
+    snprintf(out, out_size, "%p", addr);
+    return;
+  }
+#else
+  (void)addr;
+#endif
+  if (out_size > 0) out[0] = '\0';
+}
+
+// Crash artifact directory: $AETHERKIRI_CRASH_DIR or a timestamped
+// "crash-<pid>-<time>" directory in the current working directory.
+std::string CrashArtifactDirectory() {
+  const char* dir = std::getenv("AETHERKIRI_CRASH_DIR");
+  if (dir != nullptr && *dir != '\0') {
+    return std::string(dir);
+  }
+  char stamp[64];
+  const std::time_t now = std::time(nullptr);
+  std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", std::localtime(&now));
+  return "crash-" + std::to_string(static_cast<long long>(getpid())) + "-" +
+         stamp;
+}
+
+void WriteCrashFile(const std::string& path, const std::string& content) {
+  std::ofstream out(path, std::ios::binary);
+  if (out) out << content;
+}
+
+extern "C" bool TVPHostSnapshotFrameRgba(std::vector<uint8_t>*,
+                                         uint32_t*, uint32_t*);
+
+// Best-effort crash scene collection: symbolized stack, engine log tail and
+// the last host-visible frame. Called from the signal handler; nothing here
+// may block on locks held by the crashing thread.
+void WriteCrashArtifacts(int sig, siginfo_t* info, void* context) {
+  const std::string dir = CrashArtifactDirectory();
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+
+  std::ostringstream stack;
+  stack << "AetherKiri crash report\n"
+        << "signal=" << sig
+        << " fault=" << (info != nullptr ? info->si_addr : nullptr) << "\n";
+#if defined(__APPLE__) && defined(__aarch64__)
+  if (auto* uctx = static_cast<ucontext_t*>(context);
+      uctx && uctx->uc_mcontext) {
+    const auto& ss = uctx->uc_mcontext->__ss;
+    stack << "pc=" << reinterpret_cast<void*>(ss.__pc)
+          << " lr=" << reinterpret_cast<void*>(ss.__lr)
+          << " sp=" << reinterpret_cast<void*>(ss.__sp)
+          << " fp=" << reinterpret_cast<void*>(ss.__fp) << "\n";
+  }
+#else
+  (void)context;
+#endif
+#if defined(ENGINE_API_HAS_EXECINFO)
+  void* frames[32];
+  const int count = backtrace(frames, 32);
+  for (int i = 0; i < count; ++i) {
+    char line[256];
+    SymbolizeAddress(frames[i], line, sizeof(line));
+    stack << "  [" << i << "] " << line << "\n";
+  }
+#else
+  (void)sig;
+#endif
+  if (const char* trace = std::getenv("AETHERKIRI_TJS_CRASH_TRACE");
+      trace && *trace && *trace != '0') {
+    try {
+      const auto tjs_trace = TJS::TJSGetStackTraceString(32, TJS_W("\n  <-- "));
+      if (!tjs_trace.IsEmpty()) {
+        stack << "TJS stack:\n  " << tjs_trace.AsStdString() << "\n";
+      }
+    } catch (...) {
+      stack << "TJS stack: <unavailable>\n";
+    }
+  }
+  if (const char* trace = std::getenv("AETHERKIRI_EXEC_ARG_TRACE");
+      trace && *trace && *trace != '0') {
+    if (const char* recent = TJSGetRecentExecArgTrace();
+        recent && *recent) {
+      stack << "Recent TJS argument trace:\n" << recent << "\n";
+    }
+  }
+  WriteCrashFile(dir + "/stack.txt", stack.str());
+
+  // Log tail (never blocks; empty when the log mutex is held by the crash).
+  const ttstr log_tail = TVPGetLastLogNoBlock(200);
+  if (!log_tail.IsEmpty()) {
+    WriteCrashFile(dir + "/log.txt",
+                   tTJSNarrowStringHolder(log_tail.c_str())
+                       .operator const char*());
+  }
+
+  // Last host-visible frame, if one was published.
+  std::vector<uint8_t> frame;
+  uint32_t frame_w = 0;
+  uint32_t frame_h = 0;
+  TVPHostSnapshotFrameRgba(&frame, &frame_w, &frame_h);
+  if (!frame.empty() && frame_w > 0 && frame_h > 0) {
+    const size_t stride = frame_w * 4;
+    std::string ppm;
+    ppm.reserve(static_cast<size_t>(frame_w) * frame_h * 3 + 64);
+    char header[64];
+    snprintf(header, sizeof(header), "P6\n%u %u\n255\n", frame_w, frame_h);
+    ppm.append(header);
+    for (uint32_t y = 0; y < frame_h; ++y) {
+      const uint8_t* row = frame.data() + static_cast<size_t>(y) * stride;
+      for (uint32_t x = 0; x < frame_w; ++x) {
+        ppm.push_back(static_cast<char>(row[x * 4 + 0]));
+        ppm.push_back(static_cast<char>(row[x * 4 + 1]));
+        ppm.push_back(static_cast<char>(row[x * 4 + 2]));
+      }
+    }
+    WriteCrashFile(dir + "/frame.ppm", ppm);
+  }
+}
+
 #if !defined(_WIN32)
 void CrashSignalHandler(int sig, siginfo_t* info, void* context) {
   spdlog::critical("FATAL SIGNAL {} received! fault={}", sig,
@@ -858,11 +1007,16 @@ void CrashSignalHandler(int sig, siginfo_t* info, void* context) {
   char** symbols = backtrace_symbols(frames, count);
   if (symbols) {
     for (int i = 0; i < count; ++i) {
-      spdlog::critical("  [{}] {}", i, symbols[i]);
+      char line[256];
+      SymbolizeAddress(frames[i], line, sizeof(line));
+      spdlog::critical("  [{}] {}  ({})", i, symbols[i], line);
     }
     free(symbols);
   }
 #endif
+
+  // Persist the crash scene (stack/log/frame) for post-mortem analysis.
+  WriteCrashArtifacts(sig, info, context);
 
   spdlog::default_logger()->flush();
   // Re-raise so the OS generates a proper crash report

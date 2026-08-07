@@ -29,6 +29,10 @@ TJS_EXP_FUNC_DEF(void, TVPAddImportantLog, (const ttstr &line));
 
 extern ttstr TVPGetLastLog(tjs_uint n);
 
+// Crash-safe variant: returns the last n log lines only when the log mutex
+// is free, otherwise an empty string (never blocks).
+extern ttstr TVPGetLastLogNoBlock(tjs_uint n);
+
 // Returns all log lines not yet consumed by the host (separated by '\n')
 // and advances the host cursor. Truncated entries are dropped like the
 // ring-buffer queue itself.

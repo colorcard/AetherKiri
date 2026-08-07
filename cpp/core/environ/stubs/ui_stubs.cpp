@@ -661,6 +661,23 @@ void ApplyDrawDeviceSurfaceRect(iTVPDrawDevice *dd, const tTVPRect &rect,
 
 }
 
+// Crash-safe snapshot of the last host-visible RGBA frame. Never blocks:
+// returns false when the frame mutex is held (e.g. by the crashing thread).
+extern "C" bool TVPHostSnapshotFrameRgba(std::vector<uint8_t> *out_rgba,
+                                         uint32_t *out_width,
+                                         uint32_t *out_height) {
+    if(!g_host_frame_mutex.try_lock())
+        return false;
+    if(out_rgba)
+        *out_rgba = g_host_frame_rgba;
+    if(out_width)
+        *out_width = g_host_frame_width;
+    if(out_height)
+        *out_height = g_host_frame_height;
+    g_host_frame_mutex.unlock();
+    return true;
+}
+
 extern "C" void TVPHostGetTextInputState(uint32_t *ime_active,
                                           int32_t *ime_mode,
                                           uint32_t *attention_point_valid,
