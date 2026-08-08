@@ -12,7 +12,10 @@ void LauncherHeader(UiState &state) {
     ImGui::SeparatorText(u8"引擎设置");
     ImGui::SetNextItemWidth(240);
     const char *backends[] = {"software", "gpu_bridge", "sdl3_gpu"};
-    static int backend_idx = 0;
+    int backend_idx =
+        state.settings.render_backend == "gpu_bridge"
+            ? 1
+            : (state.settings.render_backend == "sdl3_gpu" ? 2 : 0);
     ImGui::Combo(u8"渲染后端", &backend_idx, backends,
                  IM_ARRAYSIZE(backends));
     state.settings.render_backend =
