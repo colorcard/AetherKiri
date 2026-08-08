@@ -35,6 +35,14 @@
     "ffmpeg",
     "expat",
     "fmt",
+    {
+      "name": "imgui",
+      "default-features": false,
+      "features": [
+        "sdl3-binding",
+        "sdl3-renderer-binding"
+      ]
+    },
     "freetype",
     "godot-cpp",
     "jxrlib",
