@@ -1038,6 +1038,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-sdl-host-vcpkg-
 
+      - name: Restore vcpkg downloads cache
+        id: restore-vcpkg-downloads
+        uses: actions/cache/restore@v5
+        with:
+          path: .devtools/vcpkg/downloads
+          key: ${{ runner.os }}-sdl-host-vcpkg-downloads-v1
+          restore-keys: |
+            ${{ runner.os }}-sdl-host-vcpkg-downloads-
+
       - name: Restore ccache
         id: restore-ccache
         uses: actions/cache/restore@v5
@@ -1096,6 +1105,13 @@ jobs:
         with:
           path: .aetherkiri-cache/vcpkg-binaries
           key: ${{ runner.os }}-sdl-host-vcpkg-${{ hashFiles('vcpkg.json') }}
+
+      - name: Save vcpkg downloads cache
+        if: success() && steps.restore-vcpkg-downloads.outputs.cache-hit != 'true' && github.event_name != 'pull_request'
+        uses: actions/cache/save@v5
+        with:
+          path: .devtools/vcpkg/downloads
+          key: ${{ runner.os }}-sdl-host-vcpkg-downloads-v1
 
       - name: Save ccache
         if: success() && github.event_name != 'pull_request' && steps.restore-ccache.outputs.cache-hit != 'true'
