@@ -214,7 +214,8 @@ void DestroyPresentation(HostState &state) {
     }
 }
 
-// Presents the latest engine frame to the window (stretched).
+// Presents the latest engine frame to the window (aspect-correct, centered;
+// the window keeps a fixed aspect ratio so the frame is never stretched).
 // Clears the renderer and draws the game texture (ImGui is layered on top
 // before the final SDL_RenderPresent in the host loop).
 void PresentGameTexture(HostState &state) {
@@ -234,9 +235,58 @@ void PresentGameTexture(HostState &state) {
     }
     if(frame == nullptr)
         return;
-    SDL_FRect dst{0.0f, 0.0f, static_cast<float>(state.window_width),
-                  static_cast<float>(state.window_height)};
+    int frame_w = 0;
+    int frame_h = 0;
+    float tex_w = 0.0f;
+    float tex_h = 0.0f;
+    if(SDL_GetTextureSize(frame, &tex_w, &tex_h) || tex_w <= 0.0f ||
+       tex_h <= 0.0f) {
+        return;
+    }
+    frame_w = static_cast<int>(tex_w);
+    frame_h = static_cast<int>(tex_h);
+    const float win_w = static_cast<float>(state.window_width);
+    const float win_h = static_cast<float>(state.window_height);
+    const float src_aspect =
+        static_cast<float>(frame_w) / static_cast<float>(frame_h);
+    const float win_aspect = win_w / win_h;
+    // Fit the frame inside the window preserving its aspect (letterbox);
+    // a no-op when the window aspect matches the frame.
+    SDL_FRect dst;
+    if(src_aspect > win_aspect) {
+        dst.w = win_w;
+        dst.h = win_w / src_aspect;
+    } else {
+        dst.h = win_h;
+        dst.w = win_h * src_aspect;
+    }
+    dst.x = (win_w - dst.w) * 0.5f;
+    dst.y = (win_h - dst.h) * 0.5f;
     SDL_RenderTexture(state.renderer, frame, nullptr, &dst);
+}
+
+// Keeps the window aspect ratio in sync with the engine's surface (the
+// game's logical resolution, which may differ from the default window).
+// SDL_SetWindowAspectRatio also resizes the window immediately to satisfy
+// the new constraint, so the frame fills the window exactly.
+void MatchWindowToSurfaceAspect(HostState &state) {
+    if(state.window == nullptr || state.surface_width == 0 ||
+       state.surface_height == 0) {
+        return;
+    }
+    const uint32_t flags = SDL_GetWindowFlags(state.window);
+    if((flags & (SDL_WINDOW_MAXIMIZED | SDL_WINDOW_FULLSCREEN)) != 0) {
+        return;
+    }
+    const float surface_aspect =
+        static_cast<float>(state.surface_width) /
+        static_cast<float>(state.surface_height);
+    SDL_SetWindowAspectRatio(state.window, surface_aspect, surface_aspect);
+    int win_w = 0;
+    int win_h = 0;
+    SDL_GetWindowSize(state.window, &win_w, &win_h);
+    fprintf(stderr, "[host] window aspect locked to game: %dx%d (game %ux%u)\n",
+            win_w, win_h, state.surface_width, state.surface_height);
 }
 
 // Copies the engine frame into the streaming texture.
@@ -307,6 +357,7 @@ void TickEngine(HostState &state) {
         state.surface_height = frame_desc.height;
         engine_set_surface_size(state.engine, frame_desc.width,
                                 frame_desc.height);
+        MatchWindowToSurfaceAspect(state);
         if(state.screen != nullptr) {
             SDL_DestroyTexture(state.screen);
             state.screen = nullptr;
@@ -851,6 +902,12 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
         SDL_Quit();
         return 1;
     }
+    // Lock the window to the default surface aspect so user resizing can
+    // never distort the picture (SDL3 re-constrains on live resize).
+    const float default_aspect =
+        static_cast<float>(kDefaultSurfaceWidth) /
+        static_cast<float>(kDefaultSurfaceHeight);
+    SDL_SetWindowAspectRatio(state.window, default_aspect, default_aspect);
     if(!CreatePresentation(state)) {
         SDL_DestroyWindow(state.window);
         SDL_Quit();
