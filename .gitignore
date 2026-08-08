@@ -53,3 +53,6 @@ apps/godot_app/.godot
 plugin_trace.log
 __pycache__/
 *.pyc
+
+# Dev-time CJK font for the SDL host UI/engine (copied from system, not committed)
+NotoSansCJK-Regular.ttc

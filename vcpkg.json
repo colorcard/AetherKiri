@@ -92,10 +92,22 @@
       "name": "sdl3",
       "default-features": false,
       "features": [
-        "wayland",
-        "x11",
-        "ibus",
-        "alsa"
+        {
+          "name": "wayland",
+          "platform": "linux"
+        },
+        {
+          "name": "x11",
+          "platform": "linux"
+        },
+        {
+          "name": "ibus",
+          "platform": "linux"
+        },
+        {
+          "name": "alsa",
+          "platform": "linux"
+        }
       ]
     },
     "spdlog",

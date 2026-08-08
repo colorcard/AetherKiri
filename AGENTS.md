@@ -17,14 +17,33 @@ AetherKiri：Godot 宿主 + C ABI + C++17 KiriKiri2 引擎核心。
 - 系统依赖：`libopenal-dev`（OpenAL 头）、`nasm/yasm`（ffmpeg port）、
   `bison/flex`（gettext port）、`libxrender-dev`（libgdiplus port）。
 
-## 运行（两个可执行）
+## 构建（macOS）
 
-- 必须带 vcpkg 运行库：`LD_LIBRARY_PATH=$PWD/out/linux/debug/vcpkg_installed/x64-linux/lib`
-- **`aetherkiri_engine`**（`apps/aetherkiri_engine/`，引擎独立壳，无 UI）：直接
-  `--game <path>` 跑游戏（krkrz 式 SDL_AppInit/AppIterate/AppQuit，窗口/输入/
-  present 自含）。参数：`--game/--fps/--render-backend/--screenshot/--screenshot-frames`。
-- **`aetherkiri_ui`**（`apps/sdl_host/`，UI 壳）：Launcher（ImGui）+ Debug Overlay
-  （F12）+ 诊断面板，游戏运行外的一切（引擎级重启、多游戏切换、benchmark）。
+- 同一脚本：`./tools/build_sdl_host.sh macos debug`（arm64，preset
+  `MacOS Debug Config`，deployment target 13.0）。需 `brew install ninja`。
+- **vcpkg 缓存复用**：脚本优先用现成 vcpkg checkout
+  （`AETHERKIRI_REF_VCPKG_ROOT`，默认 `.devtools/vcpkg`，仓库根下；旧位置
+  `~/Documents/AetherKiri/.devtools/vcpkg` 作兜底）的 downloads/buildtrees
+  存量，避免重下源码；新编译产物进 `.aetherkiri-cache/vcpkg-binaries`。
+  勿用那个 checkout 做其他 triplet 的并发构建。
+- **vcpkg.json 的 sdl3 features**（wayland/x11/ibus/alsa）已限 linux——
+  不要改回无条件，否则 macOS 报 unsupported。
+- 网络：github 直连可达，但 **ffmpeg.org 被墙**（vcpkg 内置 curl 报 SSL
+  connect error 35）。手动预下载 tarball 到
+  `$VCPKG_DOWNLOADS/ffmpeg-8.1.2.tar.xz`（sha512 与 `vcpkg/ports/ffmpeg/
+  portfile.cmake` 一致）即可继续；或先 export http_proxy/https_proxy
+  （http://127.0.0.1:10808，**不要设 socks5 all_proxy**）。
+- 构建后脚本自动给 `aetherkiri_sdl`/`libengine_api.dylib` 加 vcpkg_installed
+  的 @rpath 并 ad-hoc 重签（install_name_tool 会废掉签名），无需
+  DYLD_LIBRARY_PATH。engine_api 链接走 `LINK_LIBRARY_OVERRIDE ... WHOLE_ARCHIVE`
+  （CMake 在 Apple 上映射为 -force_load），`LINK_GROUP:RESCAN` 仅 Linux 需要。
+- 完整构建（Godot 生态）用 `./build.sh macos <debug|release>`。
+
+## 运行 sdl_host
+
+- Linux 必须带 vcpkg 运行库：
+  `LD_LIBRARY_PATH=$PWD/out/linux/debug/vcpkg_installed/x64-linux/lib`；macOS
+  无需（脚本已嵌入 @rpath）。
 - 游戏路径传**绝对路径**（引擎 normalize 相对路径有 bug）。
 - 常用参数（ui 壳）：`--fps 0`（不设帧率上限）、`--screenshot <path> --screenshot-frames <n>`
   （帧验证）、`--diagnostics [profile]`（结构化诊断 JSONL）、`--benchmark <sec>`
@@ -33,7 +52,8 @@ AetherKiri：Godot 宿主 + C ABI + C++17 KiriKiri2 引擎核心。
   sdl3_gpu 均为引擎内 SDL 纹理直显，software 为 CPU readback）、
   `--option key=value` + 便捷开关（--trace/--plugin-trace 等）。
 - Linux 桌面**无系统字体回退**：引擎只找工作目录的 `NotoSansCJK-Regular.ttc`，
-  开发时从 `/usr/share/fonts/opentype/noto/` 复制（勿提交仓库）。
+  开发时从 `/usr/share/fonts/opentype/noto/` 复制（勿提交仓库）。macOS 同理
+  （本机无 PingFang.ttc，可用 `/System/Library/Fonts/Hiragino Sans GB.ttc` 替代）。
 - 自检 demo：`--game demos/aetherkiri-test/data`（纯 TJS，测试渲染/音频/输入/层级）。
 
 ## 架构事实（文件名看不出）
