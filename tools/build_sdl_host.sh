@@ -83,4 +83,8 @@ if [[ "$platform" == "windows" ]]; then
 fi
 
 echo "[build_sdl_host] done: $out_dir"
-find "$out_dir" -name "$binary" -o -name "libengine_api*" 2>/dev/null
+# The preset binaryDir is ${sourceDir}/out/<platform>/<type> (not the
+# out/sdl/... path used for clean/echo above). Verify the real artifacts;
+# || true keeps the script exit code 0 when nothing matches.
+find "$PROJECT_ROOT/out/$platform/$build_type" \
+    \( -name "$binary" -o -name "libengine_api*" \) 2>/dev/null || true
