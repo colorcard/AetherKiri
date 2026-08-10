@@ -13,6 +13,10 @@ add_executable(aetherkiri_sdl
     src/ui/ui_overlay.cpp
 )
 
+# The sdl host is now the UI shell (Launcher/Overlay/diagnostics); the
+# standalone engine shell is apps/aetherkiri_engine.
+set_target_properties(aetherkiri_sdl PROPERTIES OUTPUT_NAME "aetherkiri_ui")
+
 target_compile_features(aetherkiri_sdl PRIVATE cxx_std_17)
 
 target_include_directories(aetherkiri_sdl PRIVATE

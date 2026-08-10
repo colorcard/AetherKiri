@@ -1010,6 +1010,9 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
 
         // Destroy textures the engine released this frame only after the
         // present above no longer references them.
+        if(state.engine != nullptr) {
+            engine_flush_released_textures(state.engine);
+        }
         aetherkiri::GpuBridgeFlushReleasedTextures();
 
         if(state.benchmark_seconds > 0 && state.benchmark_start_ms != 0 &&
@@ -1193,8 +1196,17 @@ bool StartEngine(HostState &state, const std::string &base_dir,
     engine_set_option(state.engine, &option);
     state.use_gpu_present = gpu_backend;
     if(gpu_backend) {
-        fprintf(stderr, "[host] render backend: gpu_bridge (zero-copy SDL "
-                        "texture presentation)\n");
+        // The engine's built-in SDL3 render backend creates its own
+        // textures on the injected renderer; the host keeps presentation.
+        if(engine_set_sdl_renderer(state.engine, state.renderer) !=
+           ENGINE_RESULT_OK) {
+            fprintf(stderr, "[host] engine_set_sdl_renderer failed; "
+                            "falling back to software path\n");
+            state.use_gpu_present = false;
+        } else {
+            fprintf(stderr, "[host] render backend: gpu_bridge (in-engine "
+                            "SDL textures, zero-copy present)\n");
+        }
     }
 
     for(const auto &kv : extra_options) {
@@ -1323,7 +1335,7 @@ int main(int argc, char *argv[]) {
             extra_options.emplace_back("console_log_file", "1");
         } else if(strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             fprintf(stderr,
-                    "Usage: aetherkiri_sdl [--game <path>] [--fps <n>]\n"
+                    "Usage: aetherkiri_ui [--game <path>] [--fps <n>]\n"
                     "  [--screenshot <path>] [--screenshot-frames <n>]\n"
                     "  [--diagnostics [profile]]  structured event stream\n"
                     "  [--slow-frame-threshold-ms <n>]  default 20 (0=off)\n"

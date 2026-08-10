@@ -201,6 +201,7 @@ endif()
 
 if(BUILD_SDL_HOST AND NOT (IOS OR ANDROID OR WEB OR EMSCRIPTEN))
     add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/apps/sdl_host)
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/apps/aetherkiri_engine)
 endif()
 
 if(ENABLE_TESTS AND NOT (IOS OR ANDROID OR WEB OR EMSCRIPTEN))

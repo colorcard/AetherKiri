@@ -77,9 +77,9 @@ cmake --preset "$preset" \
 echo "[build_sdl_host] building with $jobs jobs"
 cmake --build --preset "${preset% Config} Build" --parallel "$jobs"
 
-binary="aetherkiri_sdl"
+binary="aetherkiri_ui"
 if [[ "$platform" == "windows" ]]; then
-    binary="aetherkiri_sdl.exe"
+    binary="aetherkiri_ui.exe"
 fi
 
 echo "[build_sdl_host] done: $out_dir"
