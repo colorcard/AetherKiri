@@ -239,7 +239,9 @@ void PresentGameTexture(HostState &state) {
     int frame_h = 0;
     float tex_w = 0.0f;
     float tex_h = 0.0f;
-    if(SDL_GetTextureSize(frame, &tex_w, &tex_h) || tex_w <= 0.0f ||
+    // SDL3 returns true on success; a failed query leaves the frame
+    // undrawable, so skip drawing then (the window stays cleared).
+    if(!SDL_GetTextureSize(frame, &tex_w, &tex_h) || tex_w <= 0.0f ||
        tex_h <= 0.0f) {
         return;
     }
