@@ -64,6 +64,7 @@ void krkr_GetSurfaceDimensions(uint32_t*, uint32_t*);
 #include "environ/Application.h"
 #include "environ/combase.h"
 #include "environ/Platform.h"
+#include "environ/sdl/sdl_render_backend.h"
 #include "environ/EngineBootstrap.h"
 #include "environ/EngineLoop.h"
 #include "environ/MainScene.h"
@@ -3427,6 +3428,53 @@ engine_result_t engine_set_surface_size(engine_handle_t handle,
     }
   }
 
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t engine_set_sdl_renderer(engine_handle_t handle,
+                                        void* sdl_renderer_ptr) {
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  result = ValidateHandleThreadLocked(impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  // The engine's built-in SDL3 render backend (core/visual GodotRenderManager
+  // SDL path) creates its own textures on the injected renderer; the host
+  // keeps presentation. Pass nullptr to detach.
+  TVPSetSdlRenderer(static_cast<SDL_Renderer*>(sdl_renderer_ptr));
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t engine_flush_released_textures(engine_handle_t handle) {
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  result = ValidateHandleThreadLocked(impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  // Destroy textures the engine released this frame. The host calls this
+  // after its present so a frame still being presented is never destroyed
+  // mid-frame.
+  TVPFlushReleasedSdlTextures();
   ClearHandleErrorLocked(impl);
   SetThreadError(nullptr);
   return ENGINE_RESULT_OK;

@@ -1024,6 +1024,40 @@ engine_result_t engine_get_godot_native_frame_texture(
                });
 }
 
+engine_result_t engine_set_sdl_renderer(engine_handle_t public_handle,
+                                        void* sdl_renderer_ptr) {
+  return Route(public_handle, "set_sdl_renderer",
+               [&](engine_handle_t legacy) {
+#if defined(ENGINE_API_USE_KRKR2_RUNTIME)
+                 return engine_legacy_set_sdl_renderer(legacy,
+                                                        sdl_renderer_ptr);
+#else
+                 (void)legacy;
+                 return ENGINE_RESULT_NOT_SUPPORTED;
+#endif
+               },
+               [&](DispatchHandle* handle) {
+                 (void)handle;
+                 return ENGINE_RESULT_NOT_SUPPORTED;
+               });
+}
+
+engine_result_t engine_flush_released_textures(engine_handle_t public_handle) {
+  return Route(public_handle, "flush_released_textures",
+               [&](engine_handle_t legacy) {
+#if defined(ENGINE_API_USE_KRKR2_RUNTIME)
+                 return engine_legacy_flush_released_textures(legacy);
+#else
+                 (void)legacy;
+                 return ENGINE_RESULT_NOT_SUPPORTED;
+#endif
+               },
+               [&](DispatchHandle* handle) {
+                 (void)handle;
+                 return ENGINE_RESULT_NOT_SUPPORTED;
+               });
+}
+
 engine_result_t engine_get_gpu_frame_texture(
     engine_handle_t public_handle, uint64_t* out_texture_id,
     uint32_t* out_width, uint32_t* out_height, uint64_t* out_frame_serial) {

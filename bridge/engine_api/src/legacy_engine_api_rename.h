@@ -14,6 +14,8 @@
 #define engine_resume engine_legacy_resume
 #define engine_set_option engine_legacy_set_option
 #define engine_set_surface_size engine_legacy_set_surface_size
+#define engine_set_sdl_renderer engine_legacy_set_sdl_renderer
+#define engine_flush_released_textures engine_legacy_flush_released_textures
 #define engine_get_frame_desc engine_legacy_get_frame_desc
 #define engine_read_frame_rgba engine_legacy_read_frame_rgba
 #define engine_media_open engine_legacy_media_open

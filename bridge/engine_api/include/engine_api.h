@@ -355,6 +355,26 @@ ENGINE_API_EXPORT engine_result_t engine_set_surface_size(engine_handle_t handle
                                                           uint32_t height);
 
 /*
+ * Injects the host's SDL_Renderer into the engine's built-in SDL3 render
+ * backend. The engine then creates and paints its own SDL textures on this
+ * renderer (krkrz-style in-engine rendering); presentation stays with the
+ * host. Pass NULL to detach.
+ *
+ * sdl_renderer_ptr: opaque pointer; interpreted as SDL_Renderer* by the
+ * engine. Returns ENGINE_RESULT_OK on success.
+ */
+ENGINE_API_EXPORT engine_result_t engine_set_sdl_renderer(
+    engine_handle_t handle, void* sdl_renderer_ptr);
+
+/*
+ * Destroys textures the engine released since the previous call. The host
+ * calls this after its present so a frame still being presented is never
+ * destroyed mid-frame.
+ */
+ENGINE_API_EXPORT engine_result_t engine_flush_released_textures(
+    engine_handle_t handle);
+
+/*
  * Gets current frame descriptor.
  * out_frame_desc->struct_size must be initialized by caller.
  */

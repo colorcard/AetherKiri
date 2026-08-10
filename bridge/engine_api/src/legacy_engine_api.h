@@ -31,6 +31,9 @@ engine_result_t engine_legacy_set_option(engine_handle_t handle,
 engine_result_t engine_legacy_set_surface_size(engine_handle_t handle,
                                                uint32_t width,
                                                uint32_t height);
+engine_result_t engine_legacy_set_sdl_renderer(engine_handle_t handle,
+                                               void* sdl_renderer_ptr);
+engine_result_t engine_legacy_flush_released_textures(engine_handle_t handle);
 engine_result_t engine_legacy_get_frame_desc(
     engine_handle_t handle, engine_frame_desc_t* out_frame_desc);
 engine_result_t engine_legacy_read_frame_rgba(engine_handle_t handle,
