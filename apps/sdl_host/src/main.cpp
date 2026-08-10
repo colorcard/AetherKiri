@@ -37,12 +37,21 @@ constexpr uint32_t kDefaultSurfaceWidth = 1280;
 constexpr uint32_t kDefaultSurfaceHeight = 720;
 constexpr uint32_t kDefaultFpsLimit = 60;
 
+// The ImGui control panel lives in its own window so the game picture is
+// never crowded by UI overlays.
+constexpr uint32_t kUiWindowWidth = 520;
+constexpr uint32_t kUiWindowHeight = 760;
+
 struct HostState {
     engine_handle_t engine = nullptr;
     SDL_Window *window = nullptr;
     SDL_Renderer *renderer = nullptr;
     SDL_Texture *screen = nullptr;
     SDL_Texture *pixel_buffer = nullptr;
+
+    // Separate window for the ImGui launcher/overlay panels.
+    SDL_Window *ui_window = nullptr;
+    SDL_Renderer *ui_renderer = nullptr;
 
     uint32_t surface_width = kDefaultSurfaceWidth;
     uint32_t surface_height = kDefaultSurfaceHeight;
@@ -620,13 +629,15 @@ void PrintBenchmarkSummary(HostState &state) {
 }
 
 void HandleWindowEvent(HostState &state, const SDL_Event *event) {
-    if(event->type == SDL_EVENT_WINDOW_RESIZED) {
+    if(event->type == SDL_EVENT_WINDOW_RESIZED &&
+       event->window.windowID == SDL_GetWindowID(state.window)) {
         state.window_width = event->window.data1;
         state.window_height = event->window.data2;
     }
 }
 
 void PollInput(HostState &state) {
+    const SDL_WindowID game_win_id = SDL_GetWindowID(state.window);
     SDL_Event event;
     while(SDL_PollEvent(&event)) {
         switch(event.type) {
@@ -636,6 +647,10 @@ void PollInput(HostState &state) {
             case SDL_EVENT_WINDOW_RESIZED:
                 HandleWindowEvent(state, &event);
                 break;
+            case SDL_EVENT_WINDOW_CLOSE_REQUESTED:
+                // Closing either window quits the host.
+                state.exit_requested = true;
+                return;
             case SDL_EVENT_KEY_DOWN: {
                 if(event.key.key == SDLK_F12) {
                     g_ui_state.show_overlay = !g_ui_state.show_overlay;
@@ -669,8 +684,21 @@ void PollInput(HostState &state) {
              event.type == SDL_EVENT_KEY_UP ||
              event.type == SDL_EVENT_TEXT_INPUT) &&
             io.WantCaptureKeyboard;
+        // Only game-window input reaches the engine; the UI window's mouse
+        // and keyboard stay with ImGui.
+        const bool from_game_window =
+            event.type == SDL_EVENT_MOUSE_BUTTON_DOWN ||
+            event.type == SDL_EVENT_MOUSE_BUTTON_UP ||
+            event.type == SDL_EVENT_MOUSE_MOTION ||
+            event.type == SDL_EVENT_MOUSE_WHEEL
+                ? event.window.windowID == game_win_id
+                : (event.type == SDL_EVENT_KEY_DOWN ||
+                   event.type == SDL_EVENT_KEY_UP ||
+                   event.type == SDL_EVENT_TEXT_INPUT)
+                      ? event.key.windowID == game_win_id
+                      : true;
         if(state.engine != nullptr && state.startup_complete &&
-           !capture_mouse && !capture_key) {
+           !capture_mouse && !capture_key && from_game_window) {
             const float scale_x =
                 static_cast<float>(state.surface_width) /
                 static_cast<float>(state.window_width);
@@ -916,8 +944,75 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
         return 1;
     }
 
-    if(!InitImGui(state.window, state.renderer,
+    // Separate ImGui control window, placed beside the game window.
+    // Transparent background so only the ImGui panels are visible, sized
+    // to fit the current display (never larger than the usable area).
+    {
+        int usable_w = 0, usable_h = 0;
+        SDL_DisplayID display = SDL_GetPrimaryDisplay();
+        SDL_Rect usable{};
+        if(SDL_GetDisplayUsableBounds(display, &usable)) {
+            usable_w = usable.w;
+            usable_h = usable.h;
+        }
+        const uint32_t ui_w = std::min<uint32_t>(kUiWindowWidth, usable_w);
+        const uint32_t ui_h =
+            std::min<uint32_t>(kUiWindowHeight,
+                               usable_h > 40 ? usable_h - 40 : usable_h);
+        state.ui_window = SDL_CreateWindow(
+            "AetherKiri 控制台", ui_w, ui_h,
+            SDL_WINDOW_RESIZABLE | SDL_WINDOW_TRANSPARENT);
+        if(state.ui_window == nullptr) {
+            fprintf(stderr, "SDL_CreateWindow(ui) failed: %s\n",
+                    SDL_GetError());
+            DestroyPresentation(state);
+            SDL_DestroyWindow(state.window);
+            SDL_Quit();
+            return 1;
+        }
+    }
+    state.ui_renderer = SDL_CreateRenderer(state.ui_window, nullptr);
+    if(state.ui_renderer == nullptr) {
+        fprintf(stderr, "SDL_CreateRenderer(ui) failed: %s\n", SDL_GetError());
+        SDL_DestroyWindow(state.ui_window);
+        DestroyPresentation(state);
+        SDL_DestroyWindow(state.window);
+        SDL_Quit();
+        return 1;
+    }
+    {
+        // Place the UI window beside the game window, keeping it inside
+        // the usable display area (right side first, then left/below).
+        int win_x = 0, win_y = 0, win_w = 0, win_h = 0;
+        int ui_w = 0, ui_h = 0;
+        SDL_GetWindowPosition(state.window, &win_x, &win_y);
+        SDL_GetWindowSize(state.window, &win_w, &win_h);
+        SDL_GetWindowSize(state.ui_window, &ui_w, &ui_h);
+        SDL_Rect usable{};
+        if(!SDL_GetDisplayUsableBounds(SDL_GetPrimaryDisplay(), &usable)) {
+            usable = SDL_Rect{0, 0, ui_w, ui_h};
+        }
+        int place_x = win_x + win_w + 24;
+        int place_y = win_y;
+        if(place_x + ui_w > usable.x + usable.w) {
+            place_x = win_x - ui_w - 24;
+            if(place_x < usable.x) {
+                place_x = usable.x;
+                place_y = win_y + win_h + 24;
+            }
+        }
+        if(place_y + ui_h > usable.y + usable.h) {
+            place_y = usable.y + usable.h - ui_h;
+        }
+        if(place_x < usable.x)
+            place_x = usable.x;
+        SDL_SetWindowPosition(state.ui_window, place_x, place_y);
+    }
+
+    if(!InitImGui(state.ui_window, state.ui_renderer,
                   g_ui_state.settings.font_path)) {
+        SDL_DestroyRenderer(state.ui_renderer);
+        SDL_DestroyWindow(state.ui_window);
         DestroyPresentation(state);
         SDL_DestroyWindow(state.window);
         SDL_Quit();
@@ -958,7 +1053,8 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
         PollInput(state);
         if(state.exit_requested)
             break;
-        PollFileDialog(state.window);
+        PollFileDialog(state.ui_window != nullptr ? state.ui_window
+                                                  : state.window);
 
         // UI-driven engine actions.
         if(g_ui_state.want_start) {
@@ -1036,8 +1132,7 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
             g_overlay_stats.stats_valid = false;
         }
 
-        // Draw the scene (game texture or launcher background), then layer
-        // ImGui on top, then present once.
+        // Game window: scene only, no UI overlays.
         if(game_running) {
             PresentGameTexture(state);
             UpdateFps(state);
@@ -1045,15 +1140,19 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
             SDL_SetRenderDrawColor(state.renderer, 24, 24, 32, 255);
             SDL_RenderClear(state.renderer);
         }
+        SDL_RenderPresent(state.renderer);
 
+        // UI window: ImGui launcher/overlay panels on a transparent
+        // background (only the ImGui windows themselves are visible).
+        SDL_SetRenderDrawColor(state.ui_renderer, 0, 0, 0, 0);
+        SDL_RenderClear(state.ui_renderer);
         BeginImGuiFrame();
         PaintUi(g_ui_state, game_running);
         if(game_running && state.startup_complete) {
             g_overlay_stats.fps = state.fps;
         }
-        EndImGuiFrame(state.renderer);
-
-        SDL_RenderPresent(state.renderer);
+        EndImGuiFrame(state.ui_renderer);
+        SDL_RenderPresent(state.ui_renderer);
 
         // Destroy textures the engine released this frame only after the
         // present above no longer references them.
@@ -1083,6 +1182,10 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
 
     StopEngine(state);
     ShutdownImGui();
+    if(state.ui_renderer != nullptr)
+        SDL_DestroyRenderer(state.ui_renderer);
+    if(state.ui_window != nullptr)
+        SDL_DestroyWindow(state.ui_window);
     DestroyPresentation(state);
     SDL_DestroyWindow(state.window);
     SDL_Quit();
