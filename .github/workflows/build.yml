@@ -1088,6 +1088,7 @@ jobs:
           set -euo pipefail
           test -f out/linux/debug/bridge/engine_api/libengine_api.so
           test -x out/linux/debug/apps/sdl_host/aetherkiri_ui
+          test -x out/linux/debug/apps/aetherkiri_engine/aetherkiri_engine
 
       - name: Upload SDL host artifacts
         if: success()
@@ -1097,6 +1098,7 @@ jobs:
           path: |
             out/linux/debug/bridge/engine_api/libengine_api.so
             out/linux/debug/apps/sdl_host/aetherkiri_ui
+            out/linux/debug/apps/aetherkiri_engine/aetherkiri_engine
           retention-days: 7
 
       - name: Save vcpkg binary cache
