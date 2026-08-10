@@ -33,7 +33,7 @@ struct ShellState {
     engine_handle_t engine = nullptr;
 
     std::string game_path;
-    bool use_gpu = true;
+    bool use_gpu = false;
     uint32_t fps_limit = 0;
 
     std::string screenshot_path;
@@ -65,7 +65,7 @@ void PrintUsage() {
             "usage: aetherkiri_engine --game <path> [options]\n"
             "  --game <path>              game directory (absolute path)\n"
             "  --fps <n>                  frame rate limit (0 = unlimited)\n"
-            "  --render-backend <name>    software | gpu_bridge (default gpu_bridge)\n"
+            "  --render-backend <name>    software | gpu_bridge (default software)\n"
             "  --screenshot <path>        save a PPM after N frames\n"
             "  --screenshot-frames <n>    frames before screenshot (default 180)\n");
 }
