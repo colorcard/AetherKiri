@@ -566,6 +566,13 @@ namespace {
         TVPProjectDir = TVPNormalizeStorageName(testRoot);
         if(TVPProjectDir.GetLastChar() != TJS_W('/'))
             TVPProjectDir += TJS_W("/");
+        // Resources are loaded by absolute path, but PSB internal references
+        // (e.g. mouth-track archives) are lazy-loaded by relative name.
+        // Register the fixture directory on the storage AutoPath (and clear
+        // caches so previously-missed lookups are re-resolved) for those to
+        // work.
+        TVPAddAutoPath(ttstr(TEST_FILES_PATH "/emote/"));
+        TVPClearStorageCaches();
         if(TVPGetScriptEngine() == nullptr)
             TVPScriptEngine = new tTJS();
         ncbAutoRegister::AllRegist();
