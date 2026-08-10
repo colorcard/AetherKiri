@@ -75,12 +75,29 @@ AetherKiri：Godot 宿主 + C ABI + C++17 KiriKiri2 引擎核心。
   事件，全屏交互层需 `hitThreshold=0`）；`fillRect(0,0,w,h,0)` 是标准清空
   （`colorRect(...,0)` 是 no-op）；`ltOpaque` 层未填充区域显示白色（必须显式填充）。
 - **pkill 自杀**：`pkill -f <模式>` 若模式匹配当前 shell 命令行会杀掉自己导致命令挂起
-  ——先 `ps aux | grep` 确认 pid 再 kill。
+  ——先 `ps aux | grep` 确认 pid 再 kill。更稳的是 `ps -C <进程名> -o pid=`。
 - **xdotool 注入键/点击无效**：SDL 过滤 XSendEvent 合成事件——交互验证交给用户手动。
 - **窗口截图采样**：`xwd` 抓的是含边框的整个窗口（内容区偏移未知），
   引擎坐标→窗口像素映射不可靠，验证画面用 `--screenshot`（引擎侧 PPM）或问用户。
 - **引擎终止无宿主通知**：脚本 `win.close()` → `TVPTerminateAsync` 后帧停止但 sdl_host
   不自动退出——已有帧停止检测（3 秒无新帧退出），改宿主循环时勿删。
+- **fork 与 origin 的引擎核心差异可能是游戏兼容问题的根因**：同一游戏在
+  AetherKiri/AetherKiri（origin）与 krkrsdl3 正常、而本 fork 异常时，先
+  `git diff origin/main fork/main -- <模块>` 找缺失的 origin 修复，再逐个验证
+  （如 `176ea404 fix: stabilize L3J title transitions`——千恋万花主菜单背景丢失的根因，
+  本 fork 一直缺它；缺失的 yuzu 标题动画时钟逻辑导致动画结束帧把背景变黑）。
+- **柚子社（Yuzusoft）游戏的 xp3 是加密变体**（头 8 字节 `XP3\r\n \x1a\x8b` 且
+  索引 zlib 压缩），项目自带 `tools/xp3` 解不开；用
+  `https://github.com/storycraft/xp3-tool`（Rust，`cargo build --release` 后
+  `xp3-unpacker <xp3> <dir>`）解包读 TJS/PSB。`yuzuex.dll` 是 Windows PE，
+  Linux 引擎无法加载（`LoadModule('yuzuex.dll'): not found in internal plugin map`），
+  但 krkrsdl3 无它也能跑——不要把它当成画面问题的根因。
+- **readback 帧内容只有局部区域有内容**（如 4096 采样点中只有几百可见）时，先用
+  `StoreLatestCpuFrameFromTexture`（ui_stubs.cpp）采样 readback 源纹理的像素，
+  区分"合成只写了局部"与"读取/同步错误"；再结合"合成 Blt 日志"（LayerManager::DrawCompleted）
+  判断。层更新区域（UpdateRegion）为空不等于画面不该更新——静态背景层依赖
+  内容变化触发 InvalidateRect，场景切换（draw buffer RESIZE/清空）后若未全屏重绘
+  会黑屏（`EnsureDrawBufferSize` RESIZE 分支需 `AddUpdateRegion(全屏)`）。
 
 ## 调试设施速查
 

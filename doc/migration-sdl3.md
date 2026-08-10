@@ -1,7 +1,7 @@
 # AetherKiri → SDL3 渲染/播放层迁移计划
 
-日期: 2026-08-07
-状态: 阶段 1 执行中
+日期: 2026-08-07（更新: 2026-08-11）
+状态: 阶段 1 完成；引擎内嵌 SDL 渲染落地；GPU 合成/UI 层为后续
 范围: 引擎独立为渲染/播放库（无 Godot），UI 层由 Flutter/Swift 另行构建
 
 ## 1. 背景与目标
@@ -23,24 +23,44 @@ AetherKiri 当前为 Godot 4.7 宿主应用：C++17 引擎核心 + C ABI + GDExt
 | D1 | 平台范围：macOS/iOS + Android + 桌面(Win/Linux)，不含 Web | 用户确认 |
 | D2 | 先 CPU readback 跑通，GPU 零拷贝后置 | 用户确认；1080p ≈3.7MB/帧 可接受 |
 | D3 | 音频引擎内部播放，SDL3 音频 | 用户确认；WaveMixer.cpp 已是 SDL |
-| D4 | 主力渲染后端：SDL3 GPU API | 直接映射 Metal/Vulkan/D3D12/D3D11，一致性最强、UI 纹理互操作最顺 |
-| D5 | 渲染后端可插拔：software / sdl3_gpu / (保留 gl)，工厂机制现成 | TVPRegisterRenderManager 已支持 |
+| D4 | ~~主力渲染后端：SDL3 GPU API~~ → **引擎内嵌 SDL 渲染（krkrz 式）**：引擎在宿主注入的 `SDL_Renderer` 上直接创建/绘制纹理（`engine_set_sdl_renderer`），宿主只负责 present；Godot GPU 回调表已删除 | 回调表中间层（17 回调 + 句柄 + 延迟释放）纯属用 C ABI 模拟一体化；krkrz/krkrsdl3 证明引擎内嵌路径更简单 |
+| D5 | 渲染后端可插拔：software / gpu_bridge（引擎内嵌 SDL）| `TVPRegisterRenderManager` 工厂现成；GodotRenderManager 已改名 SDLRenderManager（不依赖 Godot/宿主回调） |
 | D6 | 宿主 C ABI 作为唯一边界，engine_api.h 基本不变 | 已解耦，仅追加导出接口 |
+| D7 | **引擎独立壳 `aetherkiri_engine`**（krkrz 式 SDL 入口：SDL_AppInit/AppEvent/AppIterate/AppQuit）直接跑游戏（无 UI）；`aetherkiri_ui`（原 sdl_host）为 UI 壳（Launcher/Overlay/诊断） | 双形态：引擎可独立运行 + 宿主可选的 UI 壳 |
+| D8 | 软件路径 readback 保留（截图/诊断依赖）；GPU 合成操作（blend/triangles/mask）回退软件 | 引擎内嵌后主路径为 SDL 纹理直写；PS 特效等 GPU 合成为后续增强 |
 
-## 3. 目标架构
+## 3. 目标架构（现状）
 
 ```
-UI 层 (Flutter / Swift, 自建窗口/事件/呈现)
-  │  C ABI (engine_api.h, 仅加导出接口)
+UI 壳 (aetherkiri_ui: ImGui Launcher/Overlay/诊断)   ── 可选
+  │  C ABI (engine_api.h)
   ├─ engine_create / engine_open_game / engine_tick
   ├─ engine_send_input
-  ├─ engine_read_frame_rgba (阶段1-2 CPU readback)
-  └─ engine_export_texture (阶段3 新增: SDL3 GPU 纹理零拷贝导出)
-AetherKiri 引擎库
-  ├─ 渲染: software(现成) → SDL3 GPU 新后端(主力, 移植 GodotRenderManager)
+  ├─ engine_set_sdl_renderer (注入 SDL_Renderer)
+  ├─ engine_get_gpu_frame_texture (引擎内 SDL 纹理句柄, 零拷贝 present)
+  ├─ engine_read_frame_rgba (软件路径 readback)
+  └─ engine_flush_released_textures (present 后清引擎释放队列)
+引擎 (含独立壳 aetherkiri_engine: SDL_AppInit/AppIterate 自含窗口/输入/present)
+  ├─ 渲染: SDLRenderManager (cpp/core/visual/sdl3/, 引擎内嵌 SDL 纹理直写)
+  │        软件路径保留 (CPU readback)
   ├─ 音频: SDL3 (WaveMixer.cpp)
-  └─ 平台: SDL3 窗口/事件/IME/文件对话框 (sdl_host / UI 层宿主)
+  └─ 平台: SDL3 (窗口/输入/事件)
 ```
+
+关键点（2026-08-11 架构快照）：
+
+- **引擎内嵌 SDL 渲染**：`cpp/core/visual/sdl3/SdlRenderManager.{h,cpp}`（原
+  GodotRenderManager，Godot 依赖与回调表已彻底删除）；`SDLTexture2D` 在宿主
+  注入的 renderer 上创建 ABGR8888 流式纹理，合成结果经 `SDL_LockTexture`
+  直写/直读；GPU 合成操作返回 false 回退软件。
+- **双可执行**：`apps/aetherkiri_engine`（引擎独立壳，无 UI，直接
+  `--game <path>` 跑游戏）；`apps/sdl_host`（产物 `aetherkiri_ui`，UI 壳：
+  Launcher/Overlay/诊断/引擎级重启）。
+- **宿主注入**：`engine_set_sdl_renderer(handle, SDL_Renderer*)`（宿主/壳创建
+  renderer 后注入）；present 归宿主（保留 ImGui 叠层）；`engine_get_gpu_frame_texture`
+  返回引擎创建的 SDL_Texture* 句柄零拷贝直显。
+- **motionplayer**：恢复 origin 的 `176ea404`（L3J 标题转场/yuzu 标题动画时钟），
+  缺少它会导致千恋万花主菜单动画结束后背景变黑。
 
 ## 4. 现状资产分析（已验证）
 
@@ -57,40 +77,46 @@ AetherKiri 引擎库
 
 ## 5. 阶段计划
 
-### 阶段 1: SDL3 平台层 + 软件渲染跑通（2-4 周）
+### 阶段 1: SDL3 平台层 + 软件渲染跑通（2-4 周）✅ 完成
 
 目标：Linux/macOS 上无 Godot 构建出 `engine_api` + SDL3 宿主，软件渲染播放内置 demo。
 
-任务：
+任务（全部完成）：
 
 - T1.0 环境基线：vcpkg bootstrap（代理）、sdl3 端口确认、预设确认
-- T1.1 依赖切换：`vcpkg.json` sdl2→sdl3（wayland/x11/ibus/alsa 特性）；
-  `cpp/core/base/CMakeLists.txt` find_package(SDL2)→SDL3
-- T1.2 音频升级：`cpp/core/sound/win32/WaveMixer.cpp`
-  - `SDL_BuildAudioCVT/SDL_ConvertAudio` → `SDL_ConvertAudioSamples`（每 stream 一次转换）
-  - `SDL_OpenAudioDevice` 回调模型 → `SDL_OpenAudioDeviceStream` + 回调 + `SDL_PutAudioStreamData`
-  - 转换比修正：回调 total_amount 为设备格式，混音输出为请求格式，按字节速率比例换算
-  - `SDL_PauseAudioDevice` → `SDL_PauseAudioStream`；状态查询 → `SDL_GetAudioStreamDeviceState`
-  - 保留：4-buffer 队列、混音逻辑、suspend/resume 宿主生命周期、延迟统计
+- T1.1 依赖切换：`vcpkg.json` sdl2→sdl3（wayland/x11/ibus/alsa 特性）
+- T1.2 音频升级：WaveMixer.cpp → `SDL_OpenAudioDeviceStream` + `SDL_PutAudioStreamData`
 - T1.3 无 Godot 构建验证：BUILD_GODOT_EXTENSION=OFF 下编译 engine_api，符号检查
 - T1.4 SDL3 宿主 `apps/sdl_host/`（窗口/输入/循环/readback 呈现）
-  - 输入语义与 main.gd 对齐：key→TVP VK（0x08..0x2F/F1-F24/字母大写化）、
-    modifiers（shift 0x01/alt 0x02/ctrl 0x04/echo 0x80）、pointer button（left=0/right=1/mid=2）、
-    scroll（wheel up → delta_y=-1）、TEXT_INPUT 逐 codepoint
-  - 固定 1280x720 引擎 surface，窗口拉伸显示；resize 不重建引擎 surface
+  - 输入语义与 main.gd 对齐：key→TVP VK、modifiers、pointer button、scroll、TEXT_INPUT
   - `AETHERKIRI_GAME_PATH` 或 `--game <path>`；数据目录 `~/.local/share/aetherkiri-sdl`
 - T1.5 构建入口 `tools/build_sdl_host.sh`
 - T1.6 验证与回归
 
-### 阶段 2: SDL3 GPU 渲染后端（3-5 周）
+阶段 1 后追加（2026-08-11 架构演进，见第 3 节）：
 
-- 新模块 `cpp/core/visual/sdl3/`：Sdl3Texture2D + Sdl3RenderManager
-- 实现 `TVPGodotGpuBridgeCallbacks` 回调表 → SDL3 GPU（同步队列 + render pass）
-- 22 种 blend 模式（含 Cubism/Live2D tag、alpha mask、ALPHA_D_MASK_* 融合）→ 管线状态 + 少量 compute
-- batch 表 → SDL3 command buffer 合并
-- Shader: SPIR-V + DXIL + MSL 三格式，glslang + SPIRV-Cross，CI 固化
-- 后端选择 `SDL_GPUSelectDriver`（Metal/Vulkan/D3D12/D3D11）
-- 验收: sdl3_gpu vs debug_cpu 逐像素一致；性能 ≥ GL 基线
+- **引擎独立壳** `apps/aetherkiri_engine`（krkrz 式 SDL 入口，无 UI 直接跑游戏）
+- **引擎内嵌 SDL 渲染**：GodotRenderManager → `cpp/core/visual/sdl3/SdlRenderManager`
+  + `SDLTexture2D`（宿主注入 renderer 上直写），Godot GPU 回调表与 `bridge/godot_extension`
+  宿主彻底删除
+- **UI 壳改名**：`apps/sdl_host` 产物 → `aetherkiri_ui`
+- C ABI 增补：`engine_set_sdl_renderer`、`engine_flush_released_textures`、
+  `engine_get_gpu_frame_texture`；移除 `engine_register_godot_gpu_bridge` 等回调表 API
+
+### 阶段 2: 渲染性能深化（后续，未启动）
+
+原"SDL3 GPU 回调表"方案已废弃（D4 变更）。当前渲染：
+
+- **软件路径**：CPU 合成 → readback（保留，截图/诊断依赖）
+- **gpu_bridge**：引擎内嵌 SDL 纹理直写（ABGR8888 流式 + `SDL_LockTexture`），宿主
+  `SDL_RenderTexture` 零拷贝直显（已落地）
+
+后续可深化项：
+
+- GPU 合成操作（blend/triangles/mask，当前返回 false 回退软件）——SDL TARGET 纹理
+  + `SDL_RenderGeometry` 实现非 PS 模式；PS 特效（SCREEN/MULTIPLY 等）需自定义管线
+- 软件路径 readback 最终移除（krkrz 式软件直写 SDL 纹理）
+- benchmark 对比基线：软件 1738fps / gpu_bridge 2325fps（引擎内嵌后重测）
 
 ### 阶段 3: 纹理导出 + UI 层接入（1-2 周）
 

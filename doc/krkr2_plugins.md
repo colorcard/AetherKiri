@@ -52,3 +52,15 @@
 | windowEx.dll           | https://github.com/wtnbgo/windowEx                                                                      |
 | wutcwf.dll             | https://github.com/krkrz/SamplePlugin/tree/master/wutcwf                                                |
 | xp3filter.dll          | nan                                                                                                     |
+| yuzuex.dll             | 柚子社（Yuzusoft）扩展插件，Windows PE 二进制。Linux 引擎无法加载（`LoadModule('yuzuex.dll'): not found in internal plugin map`），但 krkrsdl3/AetherKiri origin 无它也能正常跑多数柚子社游戏——不要把它当画面问题的根因。千恋万花主菜单背景依赖的是引擎侧的 yuzu 标题动画时钟（origin `176ea404`，见 AGENTS.md 踩坑） |
+
+## Linux/SDL3 线的插件可用性说明
+
+- **Windows DLL 无法加载**：`plugin/` 目录下的 `.dll`（yuzuex.dll、k2compat.dll 等）是
+  Windows PE 二进制，Linux 引擎只能加载内置插件（`internal plugin map`）与源码内置的
+  public 插件（motionplayer/psbfile/KAGParserEx 等）。
+- **yuzuex.dll**：柚子社扩展（affinesourceimage.tjs/blandlogo 等 GPU 伴随脚本与资源）。
+  缺失时相关资源加载会打 `Cannot open storage ...` 警告（可忽略）；多数柚子社游戏
+  （千恋万花等）核心功能不受影响。
+- **柚子社 xp3 加密变体**：`data.xp3` 头为 `XP3\r\n \x1a\x8b`（索引 zlib 压缩），
+  项目 `tools/xp3` 解不开；用 https://github.com/storycraft/xp3-tool（Rust）解包。
