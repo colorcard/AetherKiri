@@ -1,9 +1,10 @@
 #include "GodotRenderManager.h"
 
-#include "GodotGpuBridge.h"
 #include "../LayerBitmapIntf.h"
 #include "MsgIntf.h"
 #include "tjsHashSearch.h"
+#include "sdl_render_backend.h"
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <atomic>
 #include <cstdlib>
@@ -14,6 +15,38 @@
 #include <unordered_map>
 
 namespace {
+
+// Blend-mode tags previously supplied by GodotGpuBridge.h. The Godot GPU
+// bridge is gone; these values are kept so the (now always-failing) GPU fast
+// paths and E-mote mask helpers compile unchanged and fall back to software.
+enum : uint32_t {
+    TVP_GODOT_GPU_BLEND_ALPHA = 1,
+    TVP_GODOT_GPU_BLEND_ALPHA_D = 2,
+    TVP_GODOT_GPU_BLEND_COPY_COLOR = 3,
+    TVP_GODOT_GPU_BLEND_CONST_ALPHA_SD = 4,
+    TVP_GODOT_GPU_BLEND_FILL_ARGB = 5,
+    TVP_GODOT_GPU_BLEND_ALPHA_A = 6,
+    TVP_GODOT_GPU_BLEND_ALPHA_BLEND_A = 7,
+    TVP_GODOT_GPU_BLEND_REMOVE_CONST_OPACITY = 8,
+    TVP_GODOT_GPU_BLEND_CONST_ALPHA_SD_D = 9,
+    TVP_GODOT_GPU_BLEND_CONST_ALPHA_D = 10,
+    TVP_GODOT_GPU_BLEND_PS_SCREEN = 11,
+    TVP_GODOT_GPU_BLEND_UNIVERSAL = 12,
+    TVP_GODOT_GPU_BLEND_UNIVERSAL_D = 13,
+    TVP_GODOT_GPU_BLEND_UNIVERSAL_A = 14,
+    TVP_GODOT_GPU_BLEND_PS_MULTIPLY = 15,
+    TVP_GODOT_GPU_BLEND_PS_ADD = 16,
+    TVP_GODOT_GPU_BLEND_PS_SUBTRACT = 17,
+    TVP_GODOT_GPU_BLEND_FILL_MASK = 18,
+    TVP_GODOT_GPU_BLEND_APPLY_ALPHA_MASK = 19,
+    TVP_GODOT_GPU_BLEND_COPY_RGBA = 20,
+    TVP_GODOT_GPU_BLEND_ALPHA_D_MASK_MULTIPLY = 21,
+    TVP_GODOT_GPU_BLEND_ALPHA_D_MASK_THRESHOLD = 22,
+    TVP_GODOT_GPU_BLEND_TVP_OPERATION = 0x00010000u,
+    TVP_GODOT_GPU_BLEND_MASK_WRITE = 0x00020000u,
+};
+constexpr uint32_t TVP_GODOT_GPU_TRIANGLE_TVP_BLEND =
+    TVP_GODOT_GPU_BLEND_TVP_OPERATION;
 
 int BytesPerPixel(TVPTextureFormat::e format) {
     switch (format) {
@@ -116,15 +149,9 @@ bool TraceGpuFallback() {
 }
 
 bool DeferredGodotGpuDrainEnabled() {
-    if (TVPGodotGpuBridgeBatchActive()) return true;
-    static const bool enabled = []() {
-        const char *value = std::getenv("AETHERKIRI_GODOT_DEFER_GPU_DRAIN");
-        if (value == nullptr || value[0] == '\0') {
-            return TVP_GODOT_DEFER_GPU_DRAIN_DEFAULT;
-        }
-        return std::strcmp(value, "0") != 0;
-    }();
-    return enabled;
+    // The Godot GPU bridge batch machinery was removed with the bridge;
+    // deferred draining is no longer available.
+    return false;
 }
 
 bool IsGpuRectFastPathEnabled(const char *name) {
@@ -489,8 +516,8 @@ void GodotTexture2D::MarkOpaqueKnown() {
 }
 
 void GodotTexture2D::CreateGpuHandle(const void *pixel, int pitch) {
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if (bridge == nullptr || bridge->create_rgba == nullptr) return;
+    SDL_Renderer *renderer = TVPGetSdlRenderer();
+    if (renderer == nullptr) return;
     const void *src = pixel != nullptr ? pixel :
         (pixels_.empty() ? nullptr : pixels_.data());
     uint32_t stride = static_cast<uint32_t>(
@@ -512,12 +539,40 @@ void GodotTexture2D::CreateGpuHandle(const void *pixel, int pitch) {
     } else if(format_ != TVPTextureFormat::RGBA) {
         return;
     }
-    gpu_handle_ = bridge->create_rgba(static_cast<uint32_t>(Width),
-                                      static_cast<uint32_t>(Height),
-                                      src, stride);
-    if (gpu_handle_ == 0) {
+
+    // Engine CPU pixels are R,G,B,A in memory (little-endian), which matches
+    // SDL_PIXELFORMAT_ABGR8888 (see AGENTS.md). Streaming textures let the
+    // composited frame be written/read back directly with SDL_LockTexture.
+    SDL_Texture *tex = SDL_CreateTexture(
+        renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
+        static_cast<int>(Width), static_cast<int>(Height));
+    if (tex == nullptr) {
         return;
     }
+    // SDL3 defaults to BLEND: alpha=0 regions would show the host's
+    // RenderClear through. The frame is fully composited, so present with
+    // NONE (same as the software path).
+    SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
+    SDL_SetTextureScaleMode(tex, SDL_SCALEMODE_NEAREST);
+
+    void *dst = nullptr;
+    int tex_pitch = 0;
+    if (SDL_LockTexture(tex, nullptr, &dst, &tex_pitch)) {
+        std::memset(dst, 0, static_cast<size_t>(tex_pitch) * Height);
+        if (src != nullptr) {
+            const uint32_t copy_bytes = std::min<uint32_t>(
+                static_cast<uint32_t>(tex_pitch), stride);
+            const auto *src_bytes = static_cast<const uint8_t *>(src);
+            auto *dst_bytes = static_cast<uint8_t *>(dst);
+            for (int y = 0; y < Height; ++y) {
+                std::memcpy(dst_bytes + static_cast<size_t>(y) * tex_pitch,
+                            src_bytes + static_cast<size_t>(y) * stride,
+                            copy_bytes);
+            }
+        }
+        SDL_UnlockTexture(tex);
+    }
+    gpu_handle_ = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(tex));
     gpu_dirty_ = false;
     cpu_dirty_ = false;
     if(format_ == TVPTextureFormat::RGBA) DiscardCpuStorage();
@@ -527,59 +582,87 @@ bool GodotTexture2D::EnsureGpuHandle() {
     if (gpu_handle_ == 0) {
         CreateGpuHandle(nullptr, 0);
     } else if (cpu_dirty_) {
-        const auto *bridge = TVPGodotGpuBridgeGet();
-        if (bridge == nullptr || bridge->update_rgba == nullptr ||
-            format_ != TVPTextureFormat::RGBA || pixels_.empty()) {
-            return false;
-        }
-        const tTVPRect full_rect(0, 0, Width, Height);
-        if (!bridge->update_rgba(gpu_handle_, pixels_.data(),
-                                 static_cast<uint32_t>(pitch_), &full_rect)) {
-            return false;
-        }
-        gpu_dirty_ = false;
-        cpu_dirty_ = false;
-        DiscardCpuStorage();
+        return UploadCpuToGpu(false);
     }
     return gpu_handle_ != 0;
 }
 
+namespace {
+// Synchronous SDL readback slots: begin reads the streaming texture into a
+// request-owned buffer; poll copies it out; discard frees it.
+std::mutex g_sdl_readback_mutex;
+uint64_t g_sdl_next_readback_id = 1;
+std::unordered_map<uint64_t, std::vector<uint8_t>> g_sdl_readbacks;
+}  // namespace
+
 uint64_t GodotTexture2D::BeginGpuReadback() const {
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if(gpu_handle_ == 0 || bridge == nullptr ||
-       bridge->begin_read_rgba == nullptr) {
+    SDL_Texture *tex = reinterpret_cast<SDL_Texture *>(
+        static_cast<uintptr_t>(gpu_handle_));
+    if (tex == nullptr) {
         return 0;
     }
-    return bridge->begin_read_rgba(gpu_handle_);
+    void *src = nullptr;
+    int tex_pitch = 0;
+    if (!SDL_LockTexture(tex, nullptr, &src, &tex_pitch)) {
+        return 0;
+    }
+    std::vector<uint8_t> data(static_cast<size_t>(tex_pitch) * Height);
+    std::memcpy(data.data(), src, data.size());
+    SDL_UnlockTexture(tex);
+    std::lock_guard<std::mutex> lock(g_sdl_readback_mutex);
+    const uint64_t id = g_sdl_next_readback_id++;
+    if (id == 0) g_sdl_next_readback_id = 1;
+    g_sdl_readbacks[id] = std::move(data);
+    return id;
 }
 
 bool GodotTexture2D::PollGpuReadback(
     uint64_t request, void *out_pixels, size_t out_pixels_size,
     uint32_t stride_bytes, bool *ready) const {
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if(request == 0 || bridge == nullptr ||
-       bridge->poll_read_rgba == nullptr) {
-        if(ready) *ready = false;
+    if (ready != nullptr) {
+        *ready = false;
+    }
+    if (request == 0 || out_pixels == nullptr) {
         return false;
     }
-    return bridge->poll_read_rgba(
-        request, out_pixels, out_pixels_size, stride_bytes, ready);
+    std::vector<uint8_t> data;
+    {
+        std::lock_guard<std::mutex> lock(g_sdl_readback_mutex);
+        const auto it = g_sdl_readbacks.find(request);
+        if (it == g_sdl_readbacks.end()) {
+            return false;
+        }
+        data = it->second;
+    }
+    if (ready != nullptr) {
+        *ready = true;
+    }
+    const uint32_t tight_stride = static_cast<uint32_t>(Width) * 4u;
+    const uint32_t dst_stride = stride_bytes != 0 ? stride_bytes : tight_stride;
+    if (out_pixels_size < static_cast<size_t>(dst_stride) * Height) {
+        return false;
+    }
+    auto *dst = static_cast<uint8_t *>(out_pixels);
+    for (int y = 0; y < Height; ++y) {
+        std::memcpy(dst + static_cast<size_t>(y) * dst_stride,
+                    data.data() + static_cast<size_t>(y) * tight_stride,
+                    tight_stride);
+    }
+    return true;
 }
 
 void GodotTexture2D::DiscardGpuReadback(uint64_t request) const {
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if(request != 0 && bridge != nullptr &&
-       bridge->discard_read_rgba != nullptr) {
-        bridge->discard_read_rgba(request);
+    if (request == 0) {
+        return;
     }
+    std::lock_guard<std::mutex> lock(g_sdl_readback_mutex);
+    g_sdl_readbacks.erase(request);
 }
 
 void GodotTexture2D::ReleaseGpuHandle() {
     if (gpu_handle_ == 0) return;
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if (bridge != nullptr && bridge->release_texture != nullptr) {
-        bridge->release_texture(gpu_handle_);
-    }
+    TVPQueueSdlTextureRelease(reinterpret_cast<SDL_Texture *>(
+        static_cast<uintptr_t>(gpu_handle_)));
     gpu_handle_ = 0;
     gpu_dirty_ = false;
     cpu_dirty_ = false;
@@ -596,31 +679,42 @@ void GodotTexture2D::EnsureCpuReadable() {
     }
     if (!gpu_dirty_ && !pixels_.empty()) return;
     EnsureCpuStorage();
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if (format_ == TVPTextureFormat::Gray && bridge != nullptr &&
-        bridge->read_rgba != nullptr) {
-        const uint32_t rgba_pitch = static_cast<uint32_t>(Width) * 4u;
-        std::vector<uint8_t> rgba(static_cast<size_t>(rgba_pitch) * Height);
-        if (bridge->read_rgba(gpu_handle_, rgba.data(), rgba.size(),
-                              rgba_pitch)) {
-            for (int y = 0; y < Height; ++y) {
-                const auto *source =
-                    rgba.data() + static_cast<size_t>(y) * rgba_pitch;
-                auto *destination =
-                    pixels_.data() + static_cast<size_t>(y) * pitch_;
-                for (int x = 0; x < Width; ++x) {
-                    destination[x] = source[static_cast<size_t>(x) * 4];
-                }
-            }
-            gpu_dirty_ = false;
-        }
+    SDL_Texture *tex = reinterpret_cast<SDL_Texture *>(
+        static_cast<uintptr_t>(gpu_handle_));
+    if (tex == nullptr) {
         return;
     }
-    if (bridge != nullptr && bridge->read_rgba != nullptr &&
-        bridge->read_rgba(gpu_handle_, pixels_.data(), pixels_.size(),
-                          static_cast<uint32_t>(pitch_))) {
+    void *src = nullptr;
+    int tex_pitch = 0;
+    if (!SDL_LockTexture(tex, nullptr, &src, &tex_pitch)) {
+        return;
+    }
+    if (format_ == TVPTextureFormat::Gray) {
+        const uint32_t rgba_pitch = static_cast<uint32_t>(Width) * 4u;
+        const auto *source = static_cast<const uint8_t *>(src);
+        auto *destination = pixels_.data();
+        for (int y = 0; y < Height; ++y) {
+            const auto *row =
+                source + static_cast<size_t>(y) * tex_pitch;
+            for (int x = 0; x < Width; ++x) {
+                destination[static_cast<size_t>(y) * pitch_ + x] =
+                    row[static_cast<size_t>(x) * 4];
+            }
+        }
+        gpu_dirty_ = false;
+    } else if (format_ == TVPTextureFormat::RGBA) {
+        const uint32_t copy_bytes = std::min<uint32_t>(
+            static_cast<uint32_t>(tex_pitch), static_cast<uint32_t>(pitch_));
+        const auto *source = static_cast<const uint8_t *>(src);
+        auto *destination = pixels_.data();
+        for (int y = 0; y < Height; ++y) {
+            std::memcpy(destination + static_cast<size_t>(y) * pitch_,
+                        source + static_cast<size_t>(y) * tex_pitch,
+                        copy_bytes);
+        }
         gpu_dirty_ = false;
     }
+    SDL_UnlockTexture(tex);
 }
 
 const void *GodotTexture2D::GetScanLineForRead(tjs_uint l) {
@@ -720,10 +814,33 @@ void GodotTexture2D::SetSize(unsigned int w, unsigned int h) {
 }
 
 bool GodotTexture2D::ClearGpu(uint32_t rgba, const tTVPRect &rc) {
-    if (gpu_handle_ == 0 || format_ != TVPTextureFormat::RGBA) return false;
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if (bridge == nullptr || bridge->clear_rgba == nullptr) return false;
-    if (!bridge->clear_rgba(gpu_handle_, rgba, &rc)) return false;
+    SDL_Texture *tex = reinterpret_cast<SDL_Texture *>(
+        static_cast<uintptr_t>(gpu_handle_));
+    if (tex == nullptr || format_ != TVPTextureFormat::RGBA) return false;
+    const uint32_t width = static_cast<uint32_t>(rc.get_width());
+    const uint32_t height = static_cast<uint32_t>(rc.get_height());
+    if (width == 0 || height == 0) return false;
+    SDL_Rect sdl_rect{rc.left, rc.top, static_cast<int>(width),
+                      static_cast<int>(height)};
+    void *dst = nullptr;
+    int tex_pitch = 0;
+    if (!SDL_LockTexture(tex, &sdl_rect, &dst, &tex_pitch)) {
+        return false;
+    }
+    // Script-facing AARRGGBB was converted by the caller to the backend's
+    // AABBGGRR value; the ABGR8888 texture stores bytes as R,G,B,A on
+    // little-endian, i.e. the 32-bit value's memory layout.
+    const uint8_t bytes[4] = {
+        static_cast<uint8_t>(rgba), static_cast<uint8_t>(rgba >> 8u),
+        static_cast<uint8_t>(rgba >> 16u), static_cast<uint8_t>(rgba >> 24u)};
+    auto *out = static_cast<uint8_t *>(dst);
+    for (uint32_t y = 0; y < height; ++y) {
+        uint8_t *row = out + static_cast<size_t>(y) * tex_pitch;
+        for (uint32_t x = 0; x < width; ++x) {
+            std::memcpy(row + static_cast<size_t>(x) * 4u, bytes, 4u);
+        }
+    }
+    SDL_UnlockTexture(tex);
     gpu_dirty_ = true;
     cpu_dirty_ = false;
     if (IsFullTextureRect(rc, Width, Height)) {
@@ -737,24 +854,12 @@ bool GodotTexture2D::ClearGpu(uint32_t rgba, const tTVPRect &rc) {
 
 bool GodotTexture2D::CopyGpuFrom(GodotTexture2D *src, const tTVPRect &dst_rc,
                                  const tTVPRect &src_rc) {
-    if (src == nullptr || gpu_handle_ == 0 || src->gpu_handle_ == 0) {
-        return false;
-    }
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if (bridge == nullptr || bridge->copy_rect == nullptr) return false;
-    if (!bridge->copy_rect(gpu_handle_, src->gpu_handle_, &dst_rc, &src_rc)) {
-        return false;
-    }
-    gpu_dirty_ = true;
-    cpu_dirty_ = false;
-    if (IsFullTextureRect(dst_rc, Width, Height) &&
-        IsFullTextureRect(src_rc, src->Width, src->Height)) {
-        opacity_known_ = src->opacity_known_;
-        opaque_ = src->opaque_;
-    } else {
-        MarkOpacityUnknown();
-    }
-    return true;
+    // GPU compositing operations were provided by the removed Godot GPU
+    // bridge; report failure so callers fall back to the software path.
+    (void)src;
+    (void)dst_rc;
+    (void)src_rc;
+    return false;
 }
 
 bool GodotTexture2D::CopyTrianglesGpuFrom(GodotTexture2D *src,
@@ -762,40 +867,26 @@ bool GodotTexture2D::CopyTrianglesGpuFrom(GodotTexture2D *src,
                                           const tTVPRect &clip_rc,
                                           const tTVPPointD *dst_points,
                                           const tTVPPointD *src_points) {
-    if (src == nullptr || triangle_count == 0 || dst_points == nullptr ||
-        src_points == nullptr || gpu_handle_ == 0 || src->gpu_handle_ == 0) {
-        return false;
-    }
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if (bridge == nullptr || bridge->copy_triangles == nullptr) return false;
-    if (!bridge->copy_triangles(gpu_handle_, src->gpu_handle_, triangle_count,
-                                &clip_rc, dst_points, src_points)) {
-        return false;
-    }
-    gpu_dirty_ = true;
-    cpu_dirty_ = false;
-    MarkOpacityUnknown();
-    return true;
+    (void)src;
+    (void)triangle_count;
+    (void)clip_rc;
+    (void)dst_points;
+    (void)src_points;
+    return false;
 }
 
 bool GodotTexture2D::BlendTrianglesGpuFrom(
     GodotTexture2D *src, uint32_t triangle_count, const tTVPRect &clip_rc,
     const tTVPPointD *dst_points, const tTVPPointD *src_points, uint32_t mode,
     int opacity) {
-    if (mode != TVP_GODOT_GPU_BLEND_ALPHA &&
-        mode != TVP_GODOT_GPU_BLEND_ALPHA_D &&
-        mode != TVP_GODOT_GPU_BLEND_COPY_COLOR &&
-        mode != TVP_GODOT_GPU_BLEND_ALPHA_BLEND_A &&
-        mode != TVP_GODOT_GPU_BLEND_CONST_ALPHA_D &&
-        mode != TVP_GODOT_GPU_BLEND_PS_SCREEN &&
-        mode != TVP_GODOT_GPU_BLEND_PS_MULTIPLY &&
-        mode != TVP_GODOT_GPU_BLEND_PS_ADD &&
-        mode != TVP_GODOT_GPU_BLEND_PS_SUBTRACT) {
-        return false;
-    }
-    return DrawTrianglesGpuFrom(
-        src, triangle_count, clip_rc, dst_points, src_points, opacity,
-        TVP_GODOT_GPU_TRIANGLE_TVP_BLEND | mode);
+    (void)src;
+    (void)triangle_count;
+    (void)clip_rc;
+    (void)dst_points;
+    (void)src_points;
+    (void)mode;
+    (void)opacity;
+    return false;
 }
 
 bool GodotTexture2D::DrawTrianglesGpuFrom(GodotTexture2D *src,
@@ -805,24 +896,14 @@ bool GodotTexture2D::DrawTrianglesGpuFrom(GodotTexture2D *src,
                                           const tTVPPointD *src_points,
                                           int opacity,
                                           uint32_t blend_mode) {
-    if(src == nullptr || src == this || triangle_count == 0 ||
-       dst_points == nullptr || src_points == nullptr || gpu_handle_ == 0 ||
-       src->gpu_handle_ == 0) {
-        return false;
-    }
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if(bridge == nullptr || bridge->draw_triangles == nullptr) return false;
-    const float normalizedOpacity =
-        static_cast<float>(std::clamp(opacity, 0, 255)) / 255.0f;
-    if(!bridge->draw_triangles(gpu_handle_, src->gpu_handle_, triangle_count,
-                               &clip_rc, dst_points, src_points,
-                               normalizedOpacity, blend_mode)) {
-        return false;
-    }
-    gpu_dirty_ = true;
-    cpu_dirty_ = false;
-    MarkOpacityUnknown();
-    return true;
+    (void)src;
+    (void)triangle_count;
+    (void)clip_rc;
+    (void)dst_points;
+    (void)src_points;
+    (void)opacity;
+    (void)blend_mode;
+    return false;
 }
 
 bool GodotTexture2D::DrawMaskedTrianglesGpuFrom(
@@ -831,54 +912,29 @@ bool GodotTexture2D::DrawMaskedTrianglesGpuFrom(
     const tTVPPointD *dst_points, const tTVPPointD *src_points,
     const tTVPPointD *mask_points, int opacity, uint32_t blend_mode,
     bool use_mask_alpha) {
-    if(src == nullptr || mask == nullptr || src == this || mask == this ||
-       triangle_count == 0 || dst_points == nullptr || src_points == nullptr ||
-       mask_points == nullptr || gpu_handle_ == 0 || src->gpu_handle_ == 0 ||
-       mask->gpu_handle_ == 0) {
-        return false;
-    }
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if(bridge == nullptr || bridge->draw_masked_triangles == nullptr) {
-        return false;
-    }
-    const float normalizedOpacity =
-        static_cast<float>(std::clamp(opacity, 0, 255)) / 255.0f;
-    // The bridge flag is named inverted_mask for its original Cubism caller.
-    // Its shader starts from (1 - mask alpha), so true selects ordinary
-    // alpha-mask semantics and false selects the inverse mask.
-    if(!bridge->draw_masked_triangles(
-           gpu_handle_, src->gpu_handle_, mask->gpu_handle_, triangle_count,
-           &clip_rc, dst_points, src_points, mask_points, normalizedOpacity,
-           blend_mode, use_mask_alpha)) {
-        return false;
-    }
-    gpu_dirty_ = true;
-    cpu_dirty_ = false;
-    MarkOpacityUnknown();
-    return true;
+    (void)src;
+    (void)mask;
+    (void)triangle_count;
+    (void)clip_rc;
+    (void)dst_points;
+    (void)src_points;
+    (void)mask_points;
+    (void)opacity;
+    (void)blend_mode;
+    (void)use_mask_alpha;
+    return false;
 }
 
 bool GodotTexture2D::BlendGpuFrom(GodotTexture2D *src, const tTVPRect &dst_rc,
                                   const tTVPRect &src_rc, uint32_t mode,
                                   int opacity, uint32_t color) {
-    if (src == nullptr || gpu_handle_ == 0 || src->gpu_handle_ == 0) {
-        return false;
-    }
-    if (src == this &&
-        mode != TVP_GODOT_GPU_BLEND_REMOVE_CONST_OPACITY &&
-        mode != TVP_GODOT_GPU_BLEND_FILL_MASK) {
-        return false;
-    }
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if (bridge == nullptr || bridge->blend_rect == nullptr) return false;
-    if (!bridge->blend_rect(gpu_handle_, src->gpu_handle_, &dst_rc, &src_rc,
-                            mode, opacity, color)) {
-        return false;
-    }
-    gpu_dirty_ = true;
-    cpu_dirty_ = false;
-    MarkOpacityUnknown();
-    return true;
+    (void)src;
+    (void)dst_rc;
+    (void)src_rc;
+    (void)mode;
+    (void)opacity;
+    (void)color;
+    return false;
 }
 
 bool GodotTexture2D::BlendGpuFrom2(GodotTexture2D *src1, GodotTexture2D *src2,
@@ -886,21 +942,15 @@ bool GodotTexture2D::BlendGpuFrom2(GodotTexture2D *src1, GodotTexture2D *src2,
                                    const tTVPRect &src1_rc,
                                    const tTVPRect &src2_rc, uint32_t mode,
                                    int opacity, uint32_t color) {
-    if (src1 == nullptr || src2 == nullptr || gpu_handle_ == 0 ||
-        src1->gpu_handle_ == 0 || src2->gpu_handle_ == 0) {
-        return false;
-    }
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if (bridge == nullptr || bridge->blend_rect2 == nullptr) return false;
-    if (!bridge->blend_rect2(gpu_handle_, src1->gpu_handle_, src2->gpu_handle_,
-                             &dst_rc, &src1_rc, &src2_rc, mode, opacity,
-                             color)) {
-        return false;
-    }
-    gpu_dirty_ = true;
-    cpu_dirty_ = false;
-    MarkOpacityUnknown();
-    return true;
+    (void)src1;
+    (void)src2;
+    (void)dst_rc;
+    (void)src1_rc;
+    (void)src2_rc;
+    (void)mode;
+    (void)opacity;
+    (void)color;
+    return false;
 }
 
 bool GodotTexture2D::BlendGpuFrom3(
@@ -908,50 +958,47 @@ bool GodotTexture2D::BlendGpuFrom3(
     const tTVPRect &dst_rc, const tTVPRect &src1_rc,
     const tTVPRect &src2_rc, const tTVPRect &src3_rc, uint32_t mode,
     int opacity, uint32_t color) {
-    if(src1 == nullptr || src2 == nullptr || src3 == nullptr ||
-       gpu_handle_ == 0 || src1->gpu_handle_ == 0 ||
-       src2->gpu_handle_ == 0 || src3->gpu_handle_ == 0) {
-        return false;
-    }
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if(bridge == nullptr || bridge->blend_rect3 == nullptr) return false;
-    if(!bridge->blend_rect3(
-           gpu_handle_, src1->gpu_handle_, src2->gpu_handle_,
-           src3->gpu_handle_, &dst_rc, &src1_rc, &src2_rc, &src3_rc, mode,
-           opacity, color)) {
-        return false;
-    }
-    gpu_dirty_ = true;
-    cpu_dirty_ = false;
-    MarkOpacityUnknown();
-    return true;
+    (void)src1;
+    (void)src2;
+    (void)src3;
+    (void)dst_rc;
+    (void)src1_rc;
+    (void)src2_rc;
+    (void)src3_rc;
+    (void)mode;
+    (void)opacity;
+    (void)color;
+    return false;
 }
 
 bool GodotTexture2D::UploadCpuToGpu(bool flush_pending_gpu_writes) {
+    (void)flush_pending_gpu_writes;
     if (!cpu_dirty_) {
-        if (gpu_dirty_ && flush_pending_gpu_writes) {
-            const auto *bridge = TVPGodotGpuBridgeGet();
-            if (bridge != nullptr && bridge->flush != nullptr) {
-                return bridge->flush();
-            }
-        }
         return true;
     }
     if (format_ != TVPTextureFormat::RGBA || pixels_.empty()) {
         return false;
     }
-    const auto *bridge = TVPGodotGpuBridgeGet();
-    if (bridge == nullptr) return false;
-    if (gpu_handle_ == 0) {
+    SDL_Texture *tex = reinterpret_cast<SDL_Texture *>(
+        static_cast<uintptr_t>(gpu_handle_));
+    if (tex == nullptr) {
         CreateGpuHandle(pixels_.data(), pitch_);
         return gpu_handle_ != 0;
     }
-    if (bridge->update_rgba == nullptr) return false;
-    const tTVPRect full_rect(0, 0, Width, Height);
-    if (!bridge->update_rgba(gpu_handle_, pixels_.data(),
-                             static_cast<uint32_t>(pitch_), &full_rect)) {
+    void *dst = nullptr;
+    int tex_pitch = 0;
+    if (!SDL_LockTexture(tex, nullptr, &dst, &tex_pitch)) {
         return false;
     }
+    const uint32_t copy_bytes = std::min<uint32_t>(
+        static_cast<uint32_t>(tex_pitch), static_cast<uint32_t>(pitch_));
+    const auto *src = pixels_.data();
+    auto *out = static_cast<uint8_t *>(dst);
+    for (int y = 0; y < Height; ++y) {
+        std::memcpy(out + static_cast<size_t>(y) * tex_pitch,
+                    src + static_cast<size_t>(y) * pitch_, copy_bytes);
+    }
+    SDL_UnlockTexture(tex);
     gpu_dirty_ = false;
     cpu_dirty_ = false;
     DiscardCpuStorage();

@@ -34,6 +34,7 @@ set(ENVIRON_SOURCE_FILES
     ${ENVIRON_PATH}/ConfigManager/IndividualConfigManager.cpp
     ${ENVIRON_PATH}/ConfigManager/LocaleConfigManager.cpp
     ${ENVIRON_PATH}/sdl/tvpsdl.cpp
+    ${ENVIRON_PATH}/sdl/sdl_render_backend.cpp
 
     # ui/ — all removed (Godot handles UI now).
     # Stub implementations are in stubs/ui_stubs.cpp
@@ -60,9 +61,11 @@ target_link_libraries(${PROJECT_NAME} PUBLIC tjs2 PRIVATE core_base_module core_
 find_package(7zip CONFIG REQUIRED)
 find_package(tinyxml2 CONFIG REQUIRED)
 find_package(unofficial-minizip CONFIG REQUIRED)
+find_package(SDL3 CONFIG REQUIRED)
 
 target_link_libraries(${PROJECT_NAME} PRIVATE
         7zip::7zip
         unofficial::minizip::minizip
         tinyxml2::tinyxml2
+        SDL3::SDL3
 )

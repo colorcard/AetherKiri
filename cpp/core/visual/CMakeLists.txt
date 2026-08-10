@@ -80,6 +80,11 @@ add_library(${PROJECT_NAME} STATIC ${VISUAL_SOURCE_FILES})
 target_include_directories(${PROJECT_NAME} PUBLIC ${VISUAL_HEADERS_DIR})
 target_link_libraries(${PROJECT_NAME} PUBLIC tjs2 PRIVATE core_base_module core_environ_module core_plugin_module core_sound_module core_utils_module)
 
+# In-engine SDL3 render backend (krkrz-style platform layer): the render
+# manager creates/paints its own SDL textures on the host-injected renderer.
+find_package(SDL3 CONFIG REQUIRED)
+target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3)
+
 target_link_libraries(${PROJECT_NAME} PRIVATE libbpg)
 
 if(ANDROID AND NOT BUILD_GPU_BRIDGE)
