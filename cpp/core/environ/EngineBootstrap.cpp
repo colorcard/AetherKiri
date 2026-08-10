@@ -22,7 +22,7 @@
 // Forward declaration — defined in stubs/ui_stubs.cpp
 void TVPInitUIExtension();
 
-extern void TVPForceRegisterGodotRenderManager();
+extern void TVPForceRegisterSdlRenderManager();
 #if defined(KRKR_ENABLE_GPU_BRIDGE)
 extern void TVPForceRegisterOpenGLRenderManager();
 #endif
@@ -58,7 +58,7 @@ bool TVPEngineBootstrap::Initialize(uint32_t width, uint32_t height,
     InitializeGraphics(width, height, backend);
     spdlog::default_logger()->flush();
 
-    TVPForceRegisterGodotRenderManager();
+    TVPForceRegisterSdlRenderManager();
 #if defined(KRKR_ENABLE_GPU_BRIDGE)
     TVPForceRegisterOpenGLRenderManager();
 #endif

@@ -4,7 +4,7 @@
 #include "PlayerInternal.h"
 #include "HitTestInternal.h"
 #include "SourceCache.h"
-#include "godot/GodotRenderManager.h"
+#include "sdl3/SdlRenderManager.h"
 
 #include <cstdlib>
 #include <cstring>
@@ -1942,7 +1942,7 @@ namespace motion {
         const tTVPRect clearRect(
             0, 0, static_cast<tjs_int>(bitmap->GetWidth()),
             static_cast<tjs_int>(bitmap->GetHeight()));
-        if(!TVPGodotClearMotionScratchInPlace(
+        if(!TVPSdlClearMotionScratchInPlace(
                bitmap, clearRect, color)) {
             bitmap->Fill(clearRect, color);
         }

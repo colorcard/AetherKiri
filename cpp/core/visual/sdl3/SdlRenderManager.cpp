@@ -1,4 +1,4 @@
-#include "GodotRenderManager.h"
+#include "SdlRenderManager.h"
 
 #include "../LayerBitmapIntf.h"
 #include "MsgIntf.h"
@@ -148,7 +148,7 @@ bool TraceGpuFallback() {
     return enabled;
 }
 
-bool DeferredGodotGpuDrainEnabled() {
+bool DeferredSdlGpuDrainEnabled() {
     // The Godot GPU bridge batch machinery was removed with the bridge;
     // deferred draining is no longer available.
     return false;
@@ -242,10 +242,10 @@ bool IsGpuRectLargeEnoughForMethod(const tTVPRect &rect, const char *name) {
 }
 
 bool ShouldUseGpuRectFastPath(const tTVPRect &rect, const char *name,
-                              const GodotTexture2D *dst,
-                              const GodotTexture2D *src = nullptr,
-                              const GodotTexture2D *src2 = nullptr,
-                              const GodotTexture2D *src3 = nullptr) {
+                              const SDLTexture2D *dst,
+                              const SDLTexture2D *src = nullptr,
+                              const SDLTexture2D *src2 = nullptr,
+                              const SDLTexture2D *src3 = nullptr) {
     if (IsGpuRectLargeEnoughForMethod(rect, name)) return true;
     return (dst != nullptr && dst->HasPendingGpuWrites()) ||
            (src != nullptr && src->HasPendingGpuWrites()) ||
@@ -296,7 +296,7 @@ bool RectNeedsAreaDownsample(const tTVPRect &dst, const tTVPRect &src) {
 }
 
 bool RectNeedsAlphaAreaDownsample(const tTVPRect &dst, const tTVPRect &src,
-                                  const GodotTexture2D *texture) {
+                                  const SDLTexture2D *texture) {
     return texture != nullptr && texture->HasKnownTransparency() &&
            RectNeedsAreaDownsample(dst, src);
 }
@@ -348,13 +348,13 @@ bool TrianglesNeedStrongAreaDownsample(uint32_t triangle_count,
 bool TrianglesNeedAlphaAreaDownsample(uint32_t triangle_count,
                                       const tTVPPointD *dst_points,
                                       const tTVPPointD *src_points,
-                                      const GodotTexture2D *texture) {
+                                      const SDLTexture2D *texture) {
     return texture != nullptr && texture->HasKnownTransparency() &&
            TrianglesNeedStrongAreaDownsample(
                triangle_count, dst_points, src_points);
 }
 
-bool RectBoundsInsideTexture(const tTVPRect &rc, const GodotTexture2D *texture) {
+bool RectBoundsInsideTexture(const tTVPRect &rc, const SDLTexture2D *texture) {
     if (texture == nullptr) return false;
     const tjs_int left = std::min(rc.left, rc.right);
     const tjs_int right = std::max(rc.left, rc.right);
@@ -387,59 +387,59 @@ bool ScanOpaqueRgba(const void *pixel, int pitch, int width, int height) {
 
 iTVPRenderManager *TVPGetSoftwareRenderManager();
 
-GodotRenderMethod::GodotRenderMethod(iTVPRenderMethod *delegate)
+SDLRenderMethod::SDLRenderMethod(iTVPRenderMethod *delegate)
     : delegate_(delegate) {}
 
-int GodotRenderMethod::EnumParameterID(const char *name) {
+int SDLRenderMethod::EnumParameterID(const char *name) {
     const int id = delegate_ != nullptr ? delegate_->EnumParameterID(name) : -1;
     if(name != nullptr && std::strcmp(name, "phase") == 0) phase_id_ = id;
     if(name != nullptr && std::strcmp(name, "vague") == 0) vague_id_ = id;
     return id;
 }
-void GodotRenderMethod::SetParameterUInt(int id, unsigned int Value) {
+void SDLRenderMethod::SetParameterUInt(int id, unsigned int Value) {
     if (delegate_) delegate_->SetParameterUInt(id, Value);
 }
-void GodotRenderMethod::SetParameterInt(int id, int Value) {
+void SDLRenderMethod::SetParameterInt(int id, int Value) {
     if(id == phase_id_) phase_ = Value;
     if(id == vague_id_) vague_ = Value;
     if (delegate_) delegate_->SetParameterInt(id, Value);
 }
-void GodotRenderMethod::SetParameterPtr(int id, const void *Value) {
+void SDLRenderMethod::SetParameterPtr(int id, const void *Value) {
     if (delegate_) delegate_->SetParameterPtr(id, Value);
 }
-void GodotRenderMethod::SetParameterFloat(int id, float Value) {
+void SDLRenderMethod::SetParameterFloat(int id, float Value) {
     if (delegate_) delegate_->SetParameterFloat(id, Value);
 }
-void GodotRenderMethod::SetParameterColor4B(int id, unsigned int clr) {
+void SDLRenderMethod::SetParameterColor4B(int id, unsigned int clr) {
     color_ = clr;
     if (delegate_) delegate_->SetParameterColor4B(id, clr);
 }
-void GodotRenderMethod::SetParameterOpa(int id, int Value) {
+void SDLRenderMethod::SetParameterOpa(int id, int Value) {
     opacity_ = Value;
     if (delegate_) delegate_->SetParameterOpa(id, Value);
 }
-void GodotRenderMethod::SetParameterFloatArray(int id, float *Value, int nElem) {
+void SDLRenderMethod::SetParameterFloatArray(int id, float *Value, int nElem) {
     if (delegate_) delegate_->SetParameterFloatArray(id, Value, nElem);
 }
-iTVPRenderMethod *GodotRenderMethod::SetBlendFuncSeparate(
+iTVPRenderMethod *SDLRenderMethod::SetBlendFuncSeparate(
     int func, int srcRGB, int dstRGB, int srcAlpha, int dstAlpha) {
     if (delegate_) {
         delegate_->SetBlendFuncSeparate(func, srcRGB, dstRGB, srcAlpha, dstAlpha);
     }
     return this;
 }
-bool GodotRenderMethod::IsBlendTarget() {
+bool SDLRenderMethod::IsBlendTarget() {
     return delegate_ == nullptr || delegate_->IsBlendTarget();
 }
 
-iTVPRenderManager *GodotRenderManager::SoftwareDelegate() {
+iTVPRenderManager *SDLRenderManager::SoftwareDelegate() {
     if (software_delegate_ == nullptr) {
         software_delegate_ = TVPGetSoftwareRenderManager();
     }
     return software_delegate_;
 }
 
-GodotTexture2D::GodotTexture2D(const void *pixel, int pitch, unsigned int w,
+SDLTexture2D::SDLTexture2D(const void *pixel, int pitch, unsigned int w,
                                unsigned int h, TVPTextureFormat::e format,
                                int create_flags)
     : iTVPTexture2D(static_cast<tjs_int>(w), static_cast<tjs_int>(h)),
@@ -463,21 +463,21 @@ GodotTexture2D::GodotTexture2D(const void *pixel, int pitch, unsigned int w,
     MarkCpuDirty();
 }
 
-GodotTexture2D::~GodotTexture2D() { ReleaseGpuHandle(); }
+SDLTexture2D::~SDLTexture2D() { ReleaseGpuHandle(); }
 
-void GodotTexture2D::EnsureCpuStorage() {
+void SDLTexture2D::EnsureCpuStorage() {
     const size_t required = static_cast<size_t>(pitch_) * Height;
     if (pixels_.size() != required) {
         pixels_.assign(required, 0);
     }
 }
 
-void GodotTexture2D::DiscardCpuStorage() {
+void SDLTexture2D::DiscardCpuStorage() {
     if (pixels_.empty()) return;
     std::vector<uint8_t>().swap(pixels_);
 }
 
-void GodotTexture2D::SetOpacityFromPixels(const void *pixel, int pitch) {
+void SDLTexture2D::SetOpacityFromPixels(const void *pixel, int pitch) {
     if (format_ != TVPTextureFormat::RGBA) {
         MarkOpaqueKnown();
         return;
@@ -500,22 +500,22 @@ void GodotTexture2D::SetOpacityFromPixels(const void *pixel, int pitch) {
     MarkOpaqueKnown();
 }
 
-void GodotTexture2D::MarkOpacityUnknown() {
+void SDLTexture2D::MarkOpacityUnknown() {
     opacity_known_ = false;
     opaque_ = false;
 }
 
-void GodotTexture2D::MarkTransparentKnown() {
+void SDLTexture2D::MarkTransparentKnown() {
     opacity_known_ = true;
     opaque_ = false;
 }
 
-void GodotTexture2D::MarkOpaqueKnown() {
+void SDLTexture2D::MarkOpaqueKnown() {
     opacity_known_ = true;
     opaque_ = true;
 }
 
-void GodotTexture2D::CreateGpuHandle(const void *pixel, int pitch) {
+void SDLTexture2D::CreateGpuHandle(const void *pixel, int pitch) {
     SDL_Renderer *renderer = TVPGetSdlRenderer();
     if (renderer == nullptr) return;
     const void *src = pixel != nullptr ? pixel :
@@ -578,7 +578,7 @@ void GodotTexture2D::CreateGpuHandle(const void *pixel, int pitch) {
     if(format_ == TVPTextureFormat::RGBA) DiscardCpuStorage();
 }
 
-bool GodotTexture2D::EnsureGpuHandle() {
+bool SDLTexture2D::EnsureGpuHandle() {
     if (gpu_handle_ == 0) {
         CreateGpuHandle(nullptr, 0);
     } else if (cpu_dirty_) {
@@ -595,7 +595,7 @@ uint64_t g_sdl_next_readback_id = 1;
 std::unordered_map<uint64_t, std::vector<uint8_t>> g_sdl_readbacks;
 }  // namespace
 
-uint64_t GodotTexture2D::BeginGpuReadback() const {
+uint64_t SDLTexture2D::BeginGpuReadback() const {
     SDL_Texture *tex = reinterpret_cast<SDL_Texture *>(
         static_cast<uintptr_t>(gpu_handle_));
     if (tex == nullptr) {
@@ -616,7 +616,7 @@ uint64_t GodotTexture2D::BeginGpuReadback() const {
     return id;
 }
 
-bool GodotTexture2D::PollGpuReadback(
+bool SDLTexture2D::PollGpuReadback(
     uint64_t request, void *out_pixels, size_t out_pixels_size,
     uint32_t stride_bytes, bool *ready) const {
     if (ready != nullptr) {
@@ -651,7 +651,7 @@ bool GodotTexture2D::PollGpuReadback(
     return true;
 }
 
-void GodotTexture2D::DiscardGpuReadback(uint64_t request) const {
+void SDLTexture2D::DiscardGpuReadback(uint64_t request) const {
     if (request == 0) {
         return;
     }
@@ -659,7 +659,7 @@ void GodotTexture2D::DiscardGpuReadback(uint64_t request) const {
     g_sdl_readbacks.erase(request);
 }
 
-void GodotTexture2D::ReleaseGpuHandle() {
+void SDLTexture2D::ReleaseGpuHandle() {
     if (gpu_handle_ == 0) return;
     TVPQueueSdlTextureRelease(reinterpret_cast<SDL_Texture *>(
         static_cast<uintptr_t>(gpu_handle_)));
@@ -668,7 +668,7 @@ void GodotTexture2D::ReleaseGpuHandle() {
     cpu_dirty_ = false;
 }
 
-void GodotTexture2D::EnsureCpuReadable() {
+void SDLTexture2D::EnsureCpuReadable() {
     if (cpu_dirty_) {
         EnsureCpuStorage();
         return;
@@ -717,13 +717,13 @@ void GodotTexture2D::EnsureCpuReadable() {
     SDL_UnlockTexture(tex);
 }
 
-const void *GodotTexture2D::GetScanLineForRead(tjs_uint l) {
+const void *SDLTexture2D::GetScanLineForRead(tjs_uint l) {
     EnsureCpuReadable();
     if (l >= static_cast<tjs_uint>(Height) || pixels_.empty()) return nullptr;
     return pixels_.data() + static_cast<size_t>(l) * pitch_;
 }
 
-void *GodotTexture2D::GetScanLineForWrite(tjs_uint l) {
+void *SDLTexture2D::GetScanLineForWrite(tjs_uint l) {
     EnsureCpuReadable();
     if (l >= static_cast<tjs_uint>(Height) || pixels_.empty()) return nullptr;
     MarkOpacityUnknown();
@@ -731,7 +731,7 @@ void *GodotTexture2D::GetScanLineForWrite(tjs_uint l) {
     return pixels_.data() + static_cast<size_t>(l) * pitch_;
 }
 
-void GodotTexture2D::Update(const void *pixel, TVPTextureFormat::e format,
+void SDLTexture2D::Update(const void *pixel, TVPTextureFormat::e format,
                             int pitch, const tTVPRect &rc) {
     if (pixel == nullptr) return;
     const int new_bpp = BytesPerPixel(format);
@@ -766,7 +766,7 @@ void GodotTexture2D::Update(const void *pixel, TVPTextureFormat::e format,
     MarkCpuDirty();
 }
 
-uint32_t GodotTexture2D::GetPoint(int x, int y) {
+uint32_t SDLTexture2D::GetPoint(int x, int y) {
     if (x < 0 || y < 0 || x >= Width || y >= Height ||
         (format_ != TVPTextureFormat::Gray &&
          format_ != TVPTextureFormat::RGBA)) {
@@ -784,7 +784,7 @@ uint32_t GodotTexture2D::GetPoint(int x, int y) {
     return value;
 }
 
-void GodotTexture2D::SetPoint(int x, int y, uint32_t clr) {
+void SDLTexture2D::SetPoint(int x, int y, uint32_t clr) {
     if (x < 0 || y < 0 || x >= Width || y >= Height ||
         (format_ != TVPTextureFormat::Gray &&
          format_ != TVPTextureFormat::RGBA)) {
@@ -803,7 +803,7 @@ void GodotTexture2D::SetPoint(int x, int y, uint32_t clr) {
     MarkCpuDirty();
 }
 
-void GodotTexture2D::SetSize(unsigned int w, unsigned int h) {
+void SDLTexture2D::SetSize(unsigned int w, unsigned int h) {
     ReleaseGpuHandle();
     Width = static_cast<tjs_int>(w);
     Height = static_cast<tjs_int>(h);
@@ -813,7 +813,7 @@ void GodotTexture2D::SetSize(unsigned int w, unsigned int h) {
     MarkCpuDirty();
 }
 
-bool GodotTexture2D::ClearGpu(uint32_t rgba, const tTVPRect &rc) {
+bool SDLTexture2D::ClearGpu(uint32_t rgba, const tTVPRect &rc) {
     SDL_Texture *tex = reinterpret_cast<SDL_Texture *>(
         static_cast<uintptr_t>(gpu_handle_));
     if (tex == nullptr || format_ != TVPTextureFormat::RGBA) return false;
@@ -852,7 +852,7 @@ bool GodotTexture2D::ClearGpu(uint32_t rgba, const tTVPRect &rc) {
     return true;
 }
 
-bool GodotTexture2D::CopyGpuFrom(GodotTexture2D *src, const tTVPRect &dst_rc,
+bool SDLTexture2D::CopyGpuFrom(SDLTexture2D *src, const tTVPRect &dst_rc,
                                  const tTVPRect &src_rc) {
     // GPU compositing operations were provided by the removed Godot GPU
     // bridge; report failure so callers fall back to the software path.
@@ -862,7 +862,7 @@ bool GodotTexture2D::CopyGpuFrom(GodotTexture2D *src, const tTVPRect &dst_rc,
     return false;
 }
 
-bool GodotTexture2D::CopyTrianglesGpuFrom(GodotTexture2D *src,
+bool SDLTexture2D::CopyTrianglesGpuFrom(SDLTexture2D *src,
                                           uint32_t triangle_count,
                                           const tTVPRect &clip_rc,
                                           const tTVPPointD *dst_points,
@@ -875,8 +875,8 @@ bool GodotTexture2D::CopyTrianglesGpuFrom(GodotTexture2D *src,
     return false;
 }
 
-bool GodotTexture2D::BlendTrianglesGpuFrom(
-    GodotTexture2D *src, uint32_t triangle_count, const tTVPRect &clip_rc,
+bool SDLTexture2D::BlendTrianglesGpuFrom(
+    SDLTexture2D *src, uint32_t triangle_count, const tTVPRect &clip_rc,
     const tTVPPointD *dst_points, const tTVPPointD *src_points, uint32_t mode,
     int opacity) {
     (void)src;
@@ -889,7 +889,7 @@ bool GodotTexture2D::BlendTrianglesGpuFrom(
     return false;
 }
 
-bool GodotTexture2D::DrawTrianglesGpuFrom(GodotTexture2D *src,
+bool SDLTexture2D::DrawTrianglesGpuFrom(SDLTexture2D *src,
                                           uint32_t triangle_count,
                                           const tTVPRect &clip_rc,
                                           const tTVPPointD *dst_points,
@@ -906,8 +906,8 @@ bool GodotTexture2D::DrawTrianglesGpuFrom(GodotTexture2D *src,
     return false;
 }
 
-bool GodotTexture2D::DrawMaskedTrianglesGpuFrom(
-    GodotTexture2D *src, GodotTexture2D *mask,
+bool SDLTexture2D::DrawMaskedTrianglesGpuFrom(
+    SDLTexture2D *src, SDLTexture2D *mask,
     uint32_t triangle_count, const tTVPRect &clip_rc,
     const tTVPPointD *dst_points, const tTVPPointD *src_points,
     const tTVPPointD *mask_points, int opacity, uint32_t blend_mode,
@@ -925,7 +925,7 @@ bool GodotTexture2D::DrawMaskedTrianglesGpuFrom(
     return false;
 }
 
-bool GodotTexture2D::BlendGpuFrom(GodotTexture2D *src, const tTVPRect &dst_rc,
+bool SDLTexture2D::BlendGpuFrom(SDLTexture2D *src, const tTVPRect &dst_rc,
                                   const tTVPRect &src_rc, uint32_t mode,
                                   int opacity, uint32_t color) {
     (void)src;
@@ -937,7 +937,7 @@ bool GodotTexture2D::BlendGpuFrom(GodotTexture2D *src, const tTVPRect &dst_rc,
     return false;
 }
 
-bool GodotTexture2D::BlendGpuFrom2(GodotTexture2D *src1, GodotTexture2D *src2,
+bool SDLTexture2D::BlendGpuFrom2(SDLTexture2D *src1, SDLTexture2D *src2,
                                    const tTVPRect &dst_rc,
                                    const tTVPRect &src1_rc,
                                    const tTVPRect &src2_rc, uint32_t mode,
@@ -953,8 +953,8 @@ bool GodotTexture2D::BlendGpuFrom2(GodotTexture2D *src1, GodotTexture2D *src2,
     return false;
 }
 
-bool GodotTexture2D::BlendGpuFrom3(
-    GodotTexture2D *src1, GodotTexture2D *src2, GodotTexture2D *src3,
+bool SDLTexture2D::BlendGpuFrom3(
+    SDLTexture2D *src1, SDLTexture2D *src2, SDLTexture2D *src3,
     const tTVPRect &dst_rc, const tTVPRect &src1_rc,
     const tTVPRect &src2_rc, const tTVPRect &src3_rc, uint32_t mode,
     int opacity, uint32_t color) {
@@ -971,7 +971,7 @@ bool GodotTexture2D::BlendGpuFrom3(
     return false;
 }
 
-bool GodotTexture2D::UploadCpuToGpu(bool flush_pending_gpu_writes) {
+bool SDLTexture2D::UploadCpuToGpu(bool flush_pending_gpu_writes) {
     (void)flush_pending_gpu_writes;
     if (!cpu_dirty_) {
         return true;
@@ -1005,18 +1005,18 @@ bool GodotTexture2D::UploadCpuToGpu(bool flush_pending_gpu_writes) {
     return true;
 }
 
-iTVPTexture2D *GodotRenderManager::CreateTexture2D(const void *pixel, int pitch,
+iTVPTexture2D *SDLRenderManager::CreateTexture2D(const void *pixel, int pitch,
                                                    unsigned int w,
                                                    unsigned int h,
                                                    TVPTextureFormat::e format,
                                                    int flags) {
-    auto *texture = new GodotTexture2D(pixel, pitch, w, h, format, flags);
+    auto *texture = new SDLTexture2D(pixel, pitch, w, h, format, flags);
     vmem_size_ += static_cast<uint64_t>(texture->GetPitch()) * h;
     g_texture_create_count.fetch_add(1, std::memory_order_relaxed);
     return texture;
 }
 
-iTVPTexture2D *GodotRenderManager::CreateTexture2D(tTVPBitmap *bmp) {
+iTVPTexture2D *SDLRenderManager::CreateTexture2D(tTVPBitmap *bmp) {
     if (bmp == nullptr) {
         return CreateTexture2D(nullptr, 0, 1, 1, TVPTextureFormat::RGBA);
     }
@@ -1026,11 +1026,11 @@ iTVPTexture2D *GodotRenderManager::CreateTexture2D(tTVPBitmap *bmp) {
                                                : TVPTextureFormat::RGBA);
 }
 
-iTVPTexture2D *GodotRenderManager::CreateTexture2D(TJS::tTJSBinaryStream *) {
+iTVPTexture2D *SDLRenderManager::CreateTexture2D(TJS::tTJSBinaryStream *) {
     return CreateTexture2D(nullptr, 0, 1, 1, TVPTextureFormat::RGBA);
 }
 
-iTVPTexture2D *GodotRenderManager::CreateTexture2D(unsigned int neww,
+iTVPTexture2D *SDLRenderManager::CreateTexture2D(unsigned int neww,
                                                    unsigned int newh,
                                                    iTVPTexture2D *tex) {
     g_texture_clone_count.fetch_add(1, std::memory_order_relaxed);
@@ -1038,7 +1038,7 @@ iTVPTexture2D *GodotRenderManager::CreateTexture2D(unsigned int neww,
         tex->GetHeight() != static_cast<tjs_int>(newh)) {
         g_texture_resize_count.fetch_add(1, std::memory_order_relaxed);
     }
-    auto *ret = new GodotTexture2D(nullptr, 0, neww, newh,
+    auto *ret = new SDLTexture2D(nullptr, 0, neww, newh,
                                   tex != nullptr ? tex->GetFormat()
                                                  : TVPTextureFormat::RGBA);
     if (tex != nullptr) {
@@ -1052,11 +1052,11 @@ iTVPTexture2D *GodotRenderManager::CreateTexture2D(unsigned int neww,
             // Metal texture before uploading it into the replacement texture.
             // Keep that clone on the ordered GPU queue whenever both textures
             // use this backend.
-            auto *godot_src = dynamic_cast<GodotTexture2D *>(tex);
-            if (godot_src != nullptr &&
-                ret->EnsureGpuHandle() && godot_src->EnsureGpuHandle() &&
-                godot_src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
-                ret->CopyGpuFrom(godot_src, copy_rc, copy_rc)) {
+            auto *sdl_src = dynamic_cast<SDLTexture2D *>(tex);
+            if (sdl_src != nullptr &&
+                ret->EnsureGpuHandle() && sdl_src->EnsureGpuHandle() &&
+                sdl_src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
+                ret->CopyGpuFrom(sdl_src, copy_rc, copy_rc)) {
                 return ret;
             }
             const void *src_pixels = tex->GetScanLineForRead(0);
@@ -1069,7 +1069,7 @@ iTVPTexture2D *GodotRenderManager::CreateTexture2D(unsigned int neww,
     return ret;
 }
 
-iTVPRenderMethod *GodotRenderManager::GetRenderMethod(const char *name,
+iTVPRenderMethod *SDLRenderManager::GetRenderMethod(const char *name,
                                                       uint32_t *hint) {
     uint32_t hash = 0;
     if (hint != nullptr && *hint != 0) {
@@ -1081,13 +1081,13 @@ iTVPRenderMethod *GodotRenderManager::GetRenderMethod(const char *name,
     auto it = method_wrappers_.find(hash);
     if (it != method_wrappers_.end()) return it->second;
     iTVPRenderMethod *delegate = SoftwareDelegate()->GetRenderMethod(name, &hash);
-    auto *wrapper = new GodotRenderMethod(delegate);
+    auto *wrapper = new SDLRenderMethod(delegate);
     wrapper->SetName(name);
     method_wrappers_[hash] = wrapper;
     return wrapper;
 }
 
-bool GodotRenderManager::GetRenderStat(unsigned int &drawCount,
+bool SDLRenderManager::GetRenderStat(unsigned int &drawCount,
                                        uint64_t &vmemsize) {
     unsigned int delegate_draws = 0;
     uint64_t delegate_vmem = 0;
@@ -1098,65 +1098,65 @@ bool GodotRenderManager::GetRenderStat(unsigned int &drawCount,
     return ok;
 }
 
-bool GodotRenderManager::GetTextureStat(iTVPTexture2D *texture,
+bool SDLRenderManager::GetTextureStat(iTVPTexture2D *texture,
                                         uint64_t &vmemsize) {
     return SoftwareDelegate()->GetTextureStat(texture, vmemsize);
 }
 
-int GodotRenderManager::EnumParameterID(const char *name) {
+int SDLRenderManager::EnumParameterID(const char *name) {
     const int id = SoftwareDelegate()->EnumParameterID(name);
     if(name != nullptr && std::strcmp(name, "StretchType") == 0)
         stretch_parameter_id_ = id;
     return id;
 }
 
-void GodotRenderManager::SetParameterUInt(int id, unsigned int Value) {
+void SDLRenderManager::SetParameterUInt(int id, unsigned int Value) {
     SoftwareDelegate()->SetParameterUInt(id, Value);
 }
 
-void GodotRenderManager::SetParameterInt(int id, int Value) {
+void SDLRenderManager::SetParameterInt(int id, int Value) {
     if(id >= 0 && id == stretch_parameter_id_)
         stretch_type_ = Value;
     SoftwareDelegate()->SetParameterInt(id, Value);
 }
 
-void GodotRenderManager::SetParameterPtr(int id, const void *Value) {
+void SDLRenderManager::SetParameterPtr(int id, const void *Value) {
     SoftwareDelegate()->SetParameterPtr(id, Value);
 }
 
-void GodotRenderManager::SetParameterFloat(int id, float Value) {
+void SDLRenderManager::SetParameterFloat(int id, float Value) {
     SoftwareDelegate()->SetParameterFloat(id, Value);
 }
 
-void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *tar,
+void SDLRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *tar,
                                      iTVPTexture2D *reftar,
                                      const tTVPRect &rctar,
                                      const tRenderTexRectArray &textures) {
     ++draw_count_;
-    auto *godot_method = dynamic_cast<GodotRenderMethod *>(method);
+    auto *godot_method = dynamic_cast<SDLRenderMethod *>(method);
     iTVPRenderMethod *delegate_method =
         godot_method != nullptr ? godot_method->Delegate() : method;
     const std::string method_name =
         method != nullptr ? method->GetName() : std::string();
 
-    auto *dst = dynamic_cast<GodotTexture2D *>(tar);
+    auto *dst = dynamic_cast<SDLTexture2D *>(tar);
     auto *src = textures.size() == 1
-        ? dynamic_cast<GodotTexture2D *>(textures[0].first)
+        ? dynamic_cast<SDLTexture2D *>(textures[0].first)
         : nullptr;
     auto *src1 = textures.size() == 2
-        ? dynamic_cast<GodotTexture2D *>(textures[0].first)
+        ? dynamic_cast<SDLTexture2D *>(textures[0].first)
         : nullptr;
     auto *src2 = textures.size() == 2
-        ? dynamic_cast<GodotTexture2D *>(textures[1].first)
+        ? dynamic_cast<SDLTexture2D *>(textures[1].first)
         : nullptr;
     auto *src3_1 = textures.size() == 3
-        ? dynamic_cast<GodotTexture2D *>(textures[0].first)
+        ? dynamic_cast<SDLTexture2D *>(textures[0].first)
         : nullptr;
     auto *src3_2 = textures.size() == 3
-        ? dynamic_cast<GodotTexture2D *>(textures[1].first)
+        ? dynamic_cast<SDLTexture2D *>(textures[1].first)
         : nullptr;
     auto *src3_3 = textures.size() == 3
-        ? dynamic_cast<GodotTexture2D *>(textures[2].first)
+        ? dynamic_cast<SDLTexture2D *>(textures[2].first)
         : nullptr;
     const bool nearest_scaled = textures.size() == 1 &&
         !RectAbsSizeMatches(rctar, textures[0].second) &&
@@ -1166,7 +1166,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         IsGpuRectFastPathEnabled("Copy") &&
         ShouldUseGpuRectFastPath(rctar, method_name.c_str(), dst, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled())) {
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled())) {
         const tTVPRect &src_rc = textures[0].second;
         if (!RectBoundsInsideTexture(src_rc, src)) {
             CountCopyFallbackReason("copy_src_out_of_bounds");
@@ -1261,7 +1261,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         RectAbsSizeMatches(rctar, textures[0].second) &&
         RectBoundsInsideTexture(textures[0].second, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
         dst->BlendGpuFrom(src, rctar, textures[0].second,
                           TVP_GODOT_GPU_BLEND_COPY_COLOR, 255, 0)) {
         CountGpuFastPath(method_name);
@@ -1274,7 +1274,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         ShouldUseGpuRectFastPath(rctar, method_name.c_str(), dst, src) &&
         RectBoundsInsideTexture(textures[0].second, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
         dst->BlendGpuFrom(src, rctar, textures[0].second,
                           TVP_GODOT_GPU_BLEND_ALPHA,
                           godot_method != nullptr ? godot_method->Opacity() : 255,
@@ -1289,7 +1289,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         ShouldUseGpuRectFastPath(rctar, method_name.c_str(), dst, src) &&
         RectBoundsInsideTexture(textures[0].second, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
         dst->BlendGpuFrom(src, rctar, textures[0].second,
                           TVP_GODOT_GPU_BLEND_ALPHA_D,
                           godot_method != nullptr ? godot_method->Opacity() : 255,
@@ -1304,7 +1304,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         RectAbsSizeMatches(rctar, textures[0].second) &&
         RectBoundsInsideTexture(textures[0].second, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
         dst->BlendGpuFrom(src, rctar, textures[0].second,
                           TVP_GODOT_GPU_BLEND_CONST_ALPHA_D,
                           godot_method != nullptr ? godot_method->Opacity() : 255,
@@ -1319,7 +1319,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         RectAbsSizeMatches(rctar, textures[0].second) &&
         RectBoundsInsideTexture(textures[0].second, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
         dst->BlendGpuFrom(src, rctar, textures[0].second,
                           TVP_GODOT_GPU_BLEND_PS_SCREEN,
                           godot_method != nullptr ? godot_method->Opacity() : 255,
@@ -1334,7 +1334,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         RectAbsSizeMatches(rctar, textures[0].second) &&
         RectBoundsInsideTexture(textures[0].second, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
         dst->BlendGpuFrom(src, rctar, textures[0].second,
                           TVP_GODOT_GPU_BLEND_PS_ADD,
                           godot_method != nullptr ? godot_method->Opacity() : 255,
@@ -1349,7 +1349,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         RectAbsSizeMatches(rctar, textures[0].second) &&
         RectBoundsInsideTexture(textures[0].second, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
         dst->BlendGpuFrom(src, rctar, textures[0].second,
                           TVP_GODOT_GPU_BLEND_PS_SUBTRACT,
                           godot_method != nullptr ? godot_method->Opacity() : 255,
@@ -1364,7 +1364,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         RectAbsSizeMatches(rctar, textures[0].second) &&
         RectBoundsInsideTexture(textures[0].second, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
         dst->BlendGpuFrom(src, rctar, textures[0].second,
                           TVP_GODOT_GPU_BLEND_PS_MULTIPLY,
                           godot_method != nullptr ? godot_method->Opacity() : 255,
@@ -1379,7 +1379,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         IsGpuRectFastPathEnabled("AlphaBlend_a") &&
         ShouldUseGpuRectFastPath(rctar, "AlphaBlend_a", dst, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled())) {
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled())) {
         const tTVPRect &src_rc = textures[0].second;
         const int opacity = godot_method != nullptr ? godot_method->Opacity() : 255;
         if (!RectBoundsInsideTexture(src_rc, src)) {
@@ -1479,8 +1479,8 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
         RectBoundsInsideTexture(textures[1].second, src2) &&
         dst->EnsureGpuHandle() && src1->EnsureGpuHandle() &&
         src2->EnsureGpuHandle() &&
-        src1->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
-        src2->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+        src1->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
+        src2->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
         dst->BlendGpuFrom2(
             src1, src2, rctar, textures[0].second, textures[1].second,
             method_name == "ConstAlphaBlend_SD_d"
@@ -1504,9 +1504,9 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
        RectBoundsInsideTexture(textures[2].second, src3_3) &&
        dst->EnsureGpuHandle() && src3_1->EnsureGpuHandle() &&
        src3_2->EnsureGpuHandle() && src3_3->EnsureGpuHandle() &&
-       src3_1->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
-       src3_2->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
-       src3_3->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+       src3_1->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
+       src3_2->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
+       src3_3->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
        dst->BlendGpuFrom3(
            src3_1, src3_2, src3_3, rctar, textures[0].second,
            textures[1].second, textures[2].second,
@@ -1529,8 +1529,8 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
                      "dst_handle=%llu src_handle=%llu target=(%d,%d,%d,%d) "
                      "src_rect=(%d,%d,%d,%d) large=%d enabled=%d\n",
                      textures.size(), static_cast<void *>(dst), static_cast<void *>(src),
-                     static_cast<unsigned long long>(dst != nullptr ? dst->GetGodotGpuHandle() : 0),
-                     static_cast<unsigned long long>(src != nullptr ? src->GetGodotGpuHandle() : 0),
+                     static_cast<unsigned long long>(dst != nullptr ? dst->GetSdlTextureHandle() : 0),
+                     static_cast<unsigned long long>(src != nullptr ? src->GetSdlTextureHandle() : 0),
                      rctar.left, rctar.top, rctar.right, rctar.bottom,
                      textures.size() == 1 ? textures[0].second.left : 0,
                      textures.size() == 1 ? textures[0].second.top : 0,
@@ -1561,9 +1561,9 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
                    << "_src" << textures[0].second.left << "," << textures[0].second.top
                    << "," << textures[0].second.right << "," << textures[0].second.bottom;
             CountCopyFallbackReason(reason.str());
-        } else if (!dst->HasGodotGpuHandle()) {
+        } else if (!dst->HasSdlTextureHandle()) {
             CountCopyFallbackReason("dst_no_gpu_handle");
-        } else if (!src->HasGodotGpuHandle()) {
+        } else if (!src->HasSdlTextureHandle()) {
             CountCopyFallbackReason("src_no_gpu_handle");
         } else {
             CountCopyFallbackReason("bridge_copy_failed");
@@ -1577,7 +1577,7 @@ void GodotRenderManager::OperateRect(iTVPRenderMethod *method, iTVPTexture2D *ta
     }
 }
 
-void GodotRenderManager::OperateTriangles(iTVPRenderMethod *method, int nTriangles,
+void SDLRenderManager::OperateTriangles(iTVPRenderMethod *method, int nTriangles,
                                           iTVPTexture2D *target,
                                           iTVPTexture2D *reftar,
                                           const tTVPRect &rcclip,
@@ -1586,10 +1586,10 @@ void GodotRenderManager::OperateTriangles(iTVPRenderMethod *method, int nTriangl
     ++draw_count_;
     const std::string method_name =
         method != nullptr ? method->GetName() : std::string();
-    auto *godot_method = dynamic_cast<GodotRenderMethod *>(method);
-    auto *dst = dynamic_cast<GodotTexture2D *>(target);
+    auto *godot_method = dynamic_cast<SDLRenderMethod *>(method);
+    auto *dst = dynamic_cast<SDLTexture2D *>(target);
     auto *src = textures.size() == 1
-        ? dynamic_cast<GodotTexture2D *>(textures[0].first)
+        ? dynamic_cast<SDLTexture2D *>(textures[0].first)
         : nullptr;
     if (method_name == "Copy") {
         if (dst != nullptr && src != nullptr &&
@@ -1598,7 +1598,7 @@ void GodotRenderManager::OperateTriangles(iTVPRenderMethod *method, int nTriangl
             !TrianglesNeedAlphaAreaDownsample(static_cast<uint32_t>(nTriangles),
                                               pttar, textures[0].second, src) &&
             dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-            src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+            src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
             dst->CopyTrianglesGpuFrom(src, static_cast<uint32_t>(nTriangles),
                                       rcclip, pttar, textures[0].second)) {
             CountGpuFastPath(method_name);
@@ -1646,7 +1646,7 @@ void GodotRenderManager::OperateTriangles(iTVPRenderMethod *method, int nTriangl
         IsGpuBlendTrianglesEnabled() &&
         ShouldUseGpuRectFastPath(rcclip, fast_path_name, dst, src) &&
         dst->EnsureGpuHandle() && src->EnsureGpuHandle() &&
-        src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) &&
+        src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) &&
         dst->BlendTrianglesGpuFrom(
             src, static_cast<uint32_t>(nTriangles), rcclip, pttar,
             textures[0].second, blend_mode,
@@ -1663,7 +1663,7 @@ void GodotRenderManager::OperateTriangles(iTVPRenderMethod *method, int nTriangl
     }
 }
 
-void GodotRenderManager::OperatePerspective(iTVPRenderMethod *method, int nQuads,
+void SDLRenderManager::OperatePerspective(iTVPRenderMethod *method, int nQuads,
                                             iTVPTexture2D *target,
                                             iTVPTexture2D *reftar,
                                             const tTVPRect &rcclip,
@@ -1676,16 +1676,16 @@ void GodotRenderManager::OperatePerspective(iTVPRenderMethod *method, int nQuads
         CountCopyFallbackReason("perspective");
     }
     CountMethodFallback(method);
-    auto *godot_method = dynamic_cast<GodotRenderMethod *>(method);
+    auto *godot_method = dynamic_cast<SDLRenderMethod *>(method);
     SoftwareDelegate()->OperatePerspective(
         godot_method != nullptr ? godot_method->Delegate() : method,
         nQuads, target, reftar, rcclip, pttar, textures);
-    if (auto *dst = dynamic_cast<GodotTexture2D *>(target)) {
+    if (auto *dst = dynamic_cast<SDLTexture2D *>(target)) {
         dst->MarkCpuDirty();
     }
 }
 
-bool TVPGodotClearMotionScratchInPlace(
+bool TVPSdlClearMotionScratchInPlace(
     iTVPBaseBitmap *bitmap, const tTVPRect &rect, uint32_t argb) {
     if(bitmap == nullptr || !bitmap->Is32BPP() || rect.is_empty()) {
         return false;
@@ -1697,7 +1697,7 @@ bool TVPGodotClearMotionScratchInPlace(
     // copying instead of mutating an assignImages destination.
     bitmap->IndependNoCopy();
     auto *texture =
-        dynamic_cast<GodotTexture2D *>(bitmap->GetTexture());
+        dynamic_cast<SDLTexture2D *>(bitmap->GetTexture());
     if(texture == nullptr || !texture->EnsureGpuHandle()) {
         return false;
     }
@@ -1710,7 +1710,7 @@ bool TVPGodotClearMotionScratchInPlace(
     return texture->ClearGpu(abgr, rect);
 }
 
-bool TVPGodotCompositeAlphaUnionMask(
+bool TVPSdlCompositeAlphaUnionMask(
     iTVPBaseBitmap *dst_bitmap, iTVPBaseBitmap *src_bitmap,
     iTVPBaseBitmap *mask_scratch_bitmap,
     iTVPBaseBitmap *const *mask_bitmaps,
@@ -1748,15 +1748,15 @@ bool TVPGodotCompositeAlphaUnionMask(
         return false;
     }
 
-    auto *dst = dynamic_cast<GodotTexture2D *>(
+    auto *dst = dynamic_cast<SDLTexture2D *>(
         dst_bitmap->GetTextureForRender(true, &full_dst));
-    auto *src = dynamic_cast<GodotTexture2D *>(src_bitmap->GetTexture());
-    auto *mask_scratch = dynamic_cast<GodotTexture2D *>(
+    auto *src = dynamic_cast<SDLTexture2D *>(src_bitmap->GetTexture());
+    auto *mask_scratch = dynamic_cast<SDLTexture2D *>(
         mask_scratch_bitmap->GetTextureForRender(true, &full_mask));
     if(dst == nullptr || src == nullptr || mask_scratch == nullptr ||
        !dst->EnsureGpuHandle() || !src->EnsureGpuHandle() ||
        !mask_scratch->EnsureGpuHandle() ||
-       !src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) ||
+       !src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) ||
        !dst->ClearGpu(0x00000000u, full_dst) ||
        !mask_scratch->ClearGpu(0x00000000u, full_mask)) {
         return false;
@@ -1769,10 +1769,10 @@ bool TVPGodotCompositeAlphaUnionMask(
            mask_dst_rects[i].get_height() != mask_src_rects[i].get_height()) {
             continue;
         }
-        auto *mask = dynamic_cast<GodotTexture2D *>(
+        auto *mask = dynamic_cast<SDLTexture2D *>(
             mask_bitmaps[i]->GetTexture());
         if(mask == nullptr || !mask->EnsureGpuHandle() ||
-           !mask->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) ||
+           !mask->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) ||
            !mask_scratch->BlendGpuFrom(
                mask, mask_dst_rects[i], mask_src_rects[i],
                // AlphaBlend holds the destination alpha in KiriKiri.  The
@@ -1798,7 +1798,7 @@ bool TVPGodotCompositeAlphaUnionMask(
         use_mask_alpha);
 }
 
-bool TVPGodotApplyAlphaUnionMask(
+bool TVPSdlApplyAlphaUnionMask(
     iTVPBaseBitmap *dst_bitmap, iTVPBaseBitmap *mask_scratch_bitmap,
     iTVPBaseBitmap *const *mask_bitmaps,
     const tTVPRect *mask_dst_rects,
@@ -1832,13 +1832,13 @@ bool TVPGodotApplyAlphaUnionMask(
         return false;
     }
 
-    auto *dst = dynamic_cast<GodotTexture2D *>(
+    auto *dst = dynamic_cast<SDLTexture2D *>(
         dst_bitmap->GetTextureForRender(true, &full_rect));
-    auto *mask_scratch = dynamic_cast<GodotTexture2D *>(
+    auto *mask_scratch = dynamic_cast<SDLTexture2D *>(
         mask_scratch_bitmap->GetTextureForRender(true, &full_rect));
     if(dst == nullptr || mask_scratch == nullptr ||
        !dst->EnsureGpuHandle() || !mask_scratch->EnsureGpuHandle() ||
-       !dst->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) ||
+       !dst->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) ||
        !mask_scratch->ClearGpu(0x00000000u, full_rect)) {
         return false;
     }
@@ -1854,10 +1854,10 @@ bool TVPGodotApplyAlphaUnionMask(
                mask_src_rects[i].get_height()) {
             return false;
         }
-        auto *mask = dynamic_cast<GodotTexture2D *>(
+        auto *mask = dynamic_cast<SDLTexture2D *>(
             mask_bitmaps[i]->GetTexture());
         if(mask == nullptr || !mask->EnsureGpuHandle() ||
-           !mask->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) ||
+           !mask->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) ||
            !mask_scratch->BlendGpuFrom(
                mask, mask_dst_rects[i], mask_src_rects[i],
                TVP_GODOT_GPU_BLEND_ALPHA_D, 255, 0)) {
@@ -1877,7 +1877,7 @@ bool TVPGodotApplyAlphaUnionMask(
     return true;
 }
 
-bool TVPGodotApplyAlphaMask(
+bool TVPSdlApplyAlphaMask(
     iTVPBaseBitmap *dst_bitmap, iTVPBaseBitmap *src_bitmap,
     const tTVPRect &dst_rect, const tTVPRect &src_rect,
     int threshold, bool threshold_mask_mode, int item_flags) {
@@ -1887,15 +1887,15 @@ bool TVPGodotApplyAlphaMask(
        dst_rect.get_height() != src_rect.get_height()) {
         return false;
     }
-    auto *dst = dynamic_cast<GodotTexture2D *>(
+    auto *dst = dynamic_cast<SDLTexture2D *>(
         dst_bitmap->GetTextureForRender(true, &dst_rect));
-    auto *src = dynamic_cast<GodotTexture2D *>(src_bitmap->GetTexture());
+    auto *src = dynamic_cast<SDLTexture2D *>(src_bitmap->GetTexture());
     if(dst == nullptr || src == nullptr ||
        !RectBoundsInsideTexture(dst_rect, dst) ||
        !RectBoundsInsideTexture(src_rect, src) ||
        !dst->EnsureGpuHandle() || !src->EnsureGpuHandle() ||
-       !dst->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) ||
-       !src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled())) {
+       !dst->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) ||
+       !src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled())) {
         return false;
     }
     const uint32_t color =
@@ -1911,7 +1911,7 @@ bool TVPGodotApplyAlphaMask(
     return true;
 }
 
-bool TVPGodotBlendAlphaDWithMask(
+bool TVPSdlBlendAlphaDWithMask(
     iTVPBaseBitmap *dst_bitmap, iTVPBaseBitmap *src_bitmap,
     iTVPBaseBitmap *mask_bitmap, const tTVPRect &dst_rect,
     const tTVPRect &src_rect, const tTVPRect &mask_rect, int opacity,
@@ -1926,19 +1926,19 @@ bool TVPGodotBlendAlphaDWithMask(
        dst_rect.get_height() != mask_rect.get_height()) {
         return false;
     }
-    auto *dst = dynamic_cast<GodotTexture2D *>(
+    auto *dst = dynamic_cast<SDLTexture2D *>(
         dst_bitmap->GetTextureForRender(true, &dst_rect));
-    auto *src = dynamic_cast<GodotTexture2D *>(src_bitmap->GetTexture());
-    auto *mask = dynamic_cast<GodotTexture2D *>(mask_bitmap->GetTexture());
+    auto *src = dynamic_cast<SDLTexture2D *>(src_bitmap->GetTexture());
+    auto *mask = dynamic_cast<SDLTexture2D *>(mask_bitmap->GetTexture());
     if(dst == nullptr || src == nullptr || mask == nullptr ||
        !RectBoundsInsideTexture(dst_rect, dst) ||
        !RectBoundsInsideTexture(src_rect, src) ||
        !RectBoundsInsideTexture(mask_rect, mask) ||
        !dst->EnsureGpuHandle() || !src->EnsureGpuHandle() ||
        !mask->EnsureGpuHandle() ||
-       !dst->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) ||
-       !src->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled()) ||
-       !mask->UploadCpuToGpu(!DeferredGodotGpuDrainEnabled())) {
+       !dst->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) ||
+       !src->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled()) ||
+       !mask->UploadCpuToGpu(!DeferredSdlGpuDrainEnabled())) {
         return false;
     }
     const uint32_t mode = threshold_mask_mode
@@ -1953,7 +1953,7 @@ bool TVPGodotBlendAlphaDWithMask(
     return true;
 }
 
-std::string TVPGetGodotRenderManagerFallbackStats() {
+std::string TVPGetSDLRenderManagerFallbackStats() {
     std::vector<std::pair<std::string, uint64_t>> entries;
     uint64_t texture_creates = 0;
     uint64_t texture_clones = 0;
@@ -2020,20 +2020,20 @@ std::string TVPGetGodotRenderManagerFallbackStats() {
 }
 
 namespace {
-iTVPRenderManager *CreateGodotRenderManager() { return new GodotRenderManager(); }
+iTVPRenderManager *CreateSDLRenderManager() { return new SDLRenderManager(); }
 
-class GodotRenderManagerAutoRegister {
+class SDLRenderManagerAutoRegister {
 public:
-    GodotRenderManagerAutoRegister() {
-        TVPRegisterRenderManager("godot_native", CreateGodotRenderManager);
-        TVPRegisterRenderManager("gpu_bridge", CreateGodotRenderManager);
-        TVPRegisterRenderManager("debug_cpu", CreateGodotRenderManager);
+    SDLRenderManagerAutoRegister() {
+        TVPRegisterRenderManager("godot_native", CreateSDLRenderManager);
+        TVPRegisterRenderManager("gpu_bridge", CreateSDLRenderManager);
+        TVPRegisterRenderManager("debug_cpu", CreateSDLRenderManager);
     }
 } godot_render_manager_auto_register;
 } // namespace
 
-void TVPForceRegisterGodotRenderManager() {}
+void TVPForceRegisterSdlRenderManager() {}
 
-void TVPSetGodotRenderManagerGpuFastPathEnabled(bool enabled) {
+void TVPSetSDLRenderManagerGpuFastPathEnabled(bool enabled) {
     g_gpu_fastpath_enabled.store(enabled, std::memory_order_relaxed);
 }

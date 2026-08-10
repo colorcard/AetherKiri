@@ -6,8 +6,7 @@
 #include "ConfigManager/IndividualConfigManager.h"
 #include "TickCount.h"
 #include "ThreadIntf.h"
-#include "godot/GodotGpuBridge.h"
-#include "godot/GodotRenderManager.h"
+#include "sdl3/SdlRenderManager.h"
 #include <algorithm>
 #include <cctype>
 #include <chrono>
@@ -6994,7 +6993,7 @@ namespace {
         if(!image) {
             return false;
         }
-        if(!TVPGodotClearMotionScratchInPlace(
+        if(!TVPSdlClearMotionScratchInPlace(
                image, rect, clearColor)) {
             image->Fill(rect, clearColor);
         }
@@ -7391,7 +7390,7 @@ namespace {
         const bool thresholdMaskMode = playerStencilType == 0;
         const tTVPRect dstMaskRect(dstX, dstY, dstX + width, dstY + height);
         const tTVPRect srcMaskRect(srcX, srcY, srcX + width, srcY + height);
-        const bool gpuMaskApplied = TVPGodotApplyAlphaMask(
+        const bool gpuMaskApplied = TVPSdlApplyAlphaMask(
             dstBmp, srcBmp, dstMaskRect, srcMaskRect,
             threshold, thresholdMaskMode, itemFlags);
         if(!gpuMaskApplied) {
@@ -8714,9 +8713,6 @@ namespace motion {
             }
             return false;
         }
-        TVPGodotGpuBatchScope gpuBatch(
-            _runtime->isEmoteMode && _runtime->renderCommands.size() > 1);
-
         struct RenderProfileStats {
             int baseHits = 0;
             int baseMisses = 0;
@@ -9603,7 +9599,7 @@ namespace motion {
                                 worldBottom - surface.clipRect[1]);
                         }
                         if(!maskBitmaps.empty()) {
-                            gpuMaskApplied = TVPGodotApplyAlphaUnionMask(
+                            gpuMaskApplied = TVPSdlApplyAlphaUnionMask(
                                 destinationBitmap,
                                 unionMaskLayer->GetMainImage(),
                                 maskBitmaps.data(), maskDstRects.data(),
@@ -10378,7 +10374,7 @@ namespace motion {
                                     maskOriginX + localRight,
                                     maskOriginY + localBottom);
                                 fusedImplicitStencilBlend =
-                                    TVPGodotBlendAlphaDWithMask(
+                                    TVPSdlBlendAlphaDWithMask(
                                         composedLayer->GetMainImage(),
                                         childOutputLayer->GetMainImage(),
                                         implicitStencilLayer->GetMainImage(),
@@ -10573,7 +10569,7 @@ namespace motion {
                         }
                         if(!maskBitmaps.empty()) {
                             gpuMaskApplied =
-                                TVPGodotApplyAlphaUnionMask(
+                                TVPSdlApplyAlphaUnionMask(
                                     composedLayer->GetMainImage(),
                                     maskScratchLayer->GetMainImage(),
                                     maskBitmaps.data(), maskDstRects.data(),
@@ -11058,7 +11054,7 @@ namespace motion {
                 profileStats.tintApplyUs, profileStats.psbMetadataUs,
                 profileStats.psbDecodeUs, profileStats.psbConvertUs);
         }
-        return gpuBatch.finish();
+        return true;
     }
 
     iTJSDispatch2 *Player::resolveSeparateLayerRenderTarget(
@@ -11305,8 +11301,6 @@ namespace motion {
         if(!renderLayerObject) {
             return false;
         }
-        TVPGodotGpuBatchScope d3dGpuBatch(
-            _runtime->isEmoteMode && _runtime->renderCommands.size() > 1);
         if(!prepareLayerForRender(renderLayerObject, adaptor->getWidth(),
                                   adaptor->getHeight(), 0x00000000)) {
             return false;
@@ -11379,7 +11373,7 @@ namespace motion {
         } else {
             adaptor->setRenderedLayer(renderLayerObject);
         }
-        return d3dGpuBatch.finish();
+        return true;
     }
 
     bool Player::renderToRgba(std::uint8_t *pixels, int width, int height,
@@ -11613,7 +11607,7 @@ namespace motion {
         auto *layer = resolveNativeLayer(renderLayerSlot.AsObjectNoAddRef());
         auto *image = layer ? layer->GetMainImage() : nullptr;
         auto *texture = image
-            ? dynamic_cast<GodotTexture2D *>(image->GetTexture())
+            ? dynamic_cast<SDLTexture2D *>(image->GetTexture())
             : nullptr;
         if(!texture) return false;
         const uint64_t request = texture->BeginGpuReadback();
@@ -11679,7 +11673,7 @@ namespace motion {
         auto *layer = resolveNativeLayer(renderLayerSlot.AsObjectNoAddRef());
         auto *image = layer ? layer->GetMainImage() : nullptr;
         auto *texture = image
-            ? dynamic_cast<GodotTexture2D *>(image->GetTexture())
+            ? dynamic_cast<SDLTexture2D *>(image->GetTexture())
             : nullptr;
         if(!texture) return false;
         bool completed = false;
@@ -11727,13 +11721,28 @@ namespace motion {
 
     void Player::discardRenderToRgbaReadback() {
         if(!_runtime) return;
-        const auto *bridge = TVPGodotGpuBridgeGet();
         for(size_t index = 0;
             index < _runtime->headlessRgbaReadbackRequests.size(); ++index) {
             uint64_t &request =
                 _runtime->headlessRgbaReadbackRequests[index];
-            if(request != 0 && bridge && bridge->discard_read_rgba) {
-                bridge->discard_read_rgba(request);
+            if(request != 0) {
+                // The engine's SDL texture owns the readback slot; discard it
+                // through the texture (the bridge-based discard is gone).
+                const auto renderLayerSlot =
+                    _runtime->headlessRgbaReadbackFullStage[index]
+                        ? _runtime->headlessRgbaRenderLayer
+                        : (_runtime->headlessRgbaReadbackSlots[index] == 0
+                               ? _runtime->headlessRgbaRegionRenderLayer
+                               : _runtime->headlessRgbaRegionRenderLayer2);
+                auto *layer =
+                    resolveNativeLayer(renderLayerSlot.AsObjectNoAddRef());
+                auto *image = layer ? layer->GetMainImage() : nullptr;
+                auto *texture = image
+                    ? dynamic_cast<SDLTexture2D *>(image->GetTexture())
+                    : nullptr;
+                if(texture) {
+                    texture->DiscardGpuReadback(request);
+                }
             }
             request = 0;
             _runtime->headlessRgbaReadbackSequences[index] = 0;

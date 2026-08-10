@@ -82,8 +82,8 @@ void krkr_GetSurfaceDimensions(uint32_t*, uint32_t*);
 #include "visual/impl/WindowImpl.h"
 #include "visual/WindowIntf.h"
 #include "visual/RenderManager.h"
-#include "visual/godot/GodotRenderManager.h"
-#include "visual/godot/GodotGpuBridge.h"
+#include "visual/sdl3/SdlRenderManager.h"
+#include "visual/sdl3/SdlRenderManager.h"
 #include "psbfile/PSBMedia.h"
 #include "sound/win32/WaveImpl.h"
 #include "sound/win32/WaveMixer.h"
@@ -130,7 +130,7 @@ extern "C" bool TVPHostCopyLatestFrameRGBA(void* out_pixels,
                                             uint32_t* height,
                                             uint32_t* stride_bytes,
                                             uint64_t* serial);
-extern "C" bool TVPHostGetLatestGodotGpuFrame(uint64_t* texture,
+extern "C" bool TVPHostGetLatestHostGpuFrame(uint64_t* texture,
                                                uint32_t* width,
                                                uint32_t* height,
                                                uint64_t* serial);
@@ -785,7 +785,7 @@ bool EnvFlagEnabled(const char* name) {
          std::strcmp(value, "no") != 0;
 }
 
-bool ShouldUseGodotGpuFrameForRenderer(const std::string& renderer) {
+bool ShouldUseHostGpuFrameForRenderer(const std::string& renderer) {
   if (renderer == ENGINE_RENDERER_DEBUG_CPU) {
     return false;
   }
@@ -1576,7 +1576,7 @@ bool CopyHostFrameLocked(engine_handle_s* impl) {
   return true;
 }
 
-bool CaptureGodotNativeGpuFrameLocked(engine_handle_s* impl) {
+bool CaptureHostGpuFrameLocked(engine_handle_s* impl) {
   if (impl == nullptr ||
       (impl->render.renderer != ENGINE_RENDERER_GODOT_NATIVE &&
        impl->render.renderer != ENGINE_RENDERER_GPU_BRIDGE)) {
@@ -1586,7 +1586,7 @@ bool CaptureGodotNativeGpuFrameLocked(engine_handle_s* impl) {
   uint32_t width = 0;
   uint32_t height = 0;
   uint64_t serial = 0;
-  if (!TVPHostGetLatestGodotGpuFrame(&texture, &width, &height, &serial) ||
+  if (!TVPHostGetLatestHostGpuFrame(&texture, &width, &height, &serial) ||
       texture == 0 || width == 0 || height == 0) {
     return false;
   }
@@ -2030,11 +2030,11 @@ engine_result_t OpenGameCore(engine_handle_t handle,
   }
 
   const bool prefer_gpu_after_startup =
-      ShouldUseGodotGpuFrameForRenderer(impl->render.renderer);
-  TVPSetGodotRenderManagerGpuFastPathEnabled(false);
+      ShouldUseHostGpuFrameForRenderer(impl->render.renderer);
+  TVPSetSDLRenderManagerGpuFastPathEnabled(false);
   TVPHostSetPreferGpuFrame(false);
   auto restore_startup_gpu_path = [&]() {
-    TVPSetGodotRenderManagerGpuFastPathEnabled(prefer_gpu_after_startup);
+    TVPSetSDLRenderManagerGpuFastPathEnabled(prefer_gpu_after_startup);
     TVPHostSetPreferGpuFrame(prefer_gpu_after_startup);
   };
 
@@ -2978,7 +2978,7 @@ engine_result_t engine_tick(engine_handle_t handle, uint32_t delta_ms) {
     // GodotNative/DebugCpu host path: BasicDrawDevice handed the final
     // composited texture to HostWindowLayer::UpdateDrawBuffer().
     const uint64_t previous_serial = impl->frame.serial;
-    if (CaptureGodotNativeGpuFrameLocked(impl)) {
+    if (CaptureHostGpuFrameLocked(impl)) {
       impl->frame.rendered_this_tick = impl->frame.serial != previous_serial;
       log_tick_spike("godot_native_gpu");
       ClearHandleErrorLocked(impl);
@@ -3187,9 +3187,9 @@ engine_result_t engine_set_option(engine_handle_t handle,
                    "restart current game session to apply");
     }
     impl->render.renderer = renderer;
-    const bool prefer_gpu = ShouldUseGodotGpuFrameForRenderer(impl->render.renderer);
+    const bool prefer_gpu = ShouldUseHostGpuFrameForRenderer(impl->render.renderer);
     TVPHostSetPreferGpuFrame(prefer_gpu);
-    TVPSetGodotRenderManagerGpuFastPathEnabled(prefer_gpu);
+    TVPSetSDLRenderManagerGpuFastPathEnabled(prefer_gpu);
     TVPSetCommandLine(TJS_W("renderer"), ttstr(renderer).c_str());
     spdlog::info("engine_set_option: renderer={} prefer_gpu_frame={}",
                  renderer, prefer_gpu);
@@ -3438,7 +3438,7 @@ engine_result_t engine_set_sdl_renderer(engine_handle_t handle,
     return result;
   }
 
-  // The engine's built-in SDL3 render backend (core/visual GodotRenderManager
+  // The engine's built-in SDL3 render backend (core/visual SDLRenderManager
   // SDL path) creates its own textures on the injected renderer; the host
   // keeps presentation. Pass nullptr to detach.
   TVPSetSdlRenderer(static_cast<SDL_Renderer*>(sdl_renderer_ptr));
@@ -3871,7 +3871,7 @@ static engine_result_t EngineGetGpuFrameTextureImpl(
   uint32_t width = 0;
   uint32_t height = 0;
   uint64_t serial = 0;
-  if (!TVPHostGetLatestGodotGpuFrame(&texture, &width, &height, &serial) ||
+  if (!TVPHostGetLatestHostGpuFrame(&texture, &width, &height, &serial) ||
       texture == 0 || width == 0 || height == 0) {
     return SetHandleErrorAndReturnLocked(
         impl, ENGINE_RESULT_NOT_SUPPORTED,
@@ -4451,7 +4451,7 @@ engine_result_t engine_get_renderer_info(engine_handle_t handle,
 
   const std::string& selected_renderer = impl->render.renderer;
   const bool prefer_gpu_frame =
-      ShouldUseGodotGpuFrameForRenderer(selected_renderer);
+      ShouldUseHostGpuFrameForRenderer(selected_renderer);
   const bool native_frame_renderer =
       selected_renderer == ENGINE_RENDERER_GODOT_NATIVE ||
       selected_renderer == ENGINE_RENDERER_GPU_BRIDGE;
@@ -4485,13 +4485,13 @@ engine_result_t engine_get_renderer_info(engine_handle_t handle,
                      " fallback=" + fallback +
                      " gpu_fastpath=" + (prefer_gpu_frame ? "1" : "0") +
                      gpu_info +
-                     TVPGetGodotRenderManagerFallbackStats();
+                     TVPGetSDLRenderManagerFallbackStats();
 #else
   std::string info = "backend=" + selected_renderer +
                      " path=godot_rendering_device host_frame=" + host_frame +
                      " fallback=" + fallback +
                      " gpu_fastpath=" + (prefer_gpu_frame ? "1" : "0") +
-                     TVPGetGodotRenderManagerFallbackStats();
+                     TVPGetSDLRenderManagerFallbackStats();
 #endif
   std::strncpy(out_buffer, info.c_str(), buffer_size - 1);
   out_buffer[buffer_size - 1] = '\0';

@@ -39,7 +39,7 @@
 #include "TVPWindow.h"
 #include "Application.h"
 #include "RenderManager.h"
-#include "GodotRenderManager.h"
+#include "sdl3/SdlRenderManager.h"
 #include "StorageImpl.h"
 #if defined(KRKR_ENABLE_GPU_BRIDGE)
 #include "krkr_egl_context.h"
@@ -801,7 +801,7 @@ extern "C" void TVPHostClearVideoOverlayFrame() {
     g_host_video_overlay_height = 0;
 }
 
-extern "C" bool TVPHostGetLatestGodotGpuFrame(uint64_t *texture,
+extern "C" bool TVPHostGetLatestHostGpuFrame(uint64_t *texture,
                                                uint32_t *width,
                                                uint32_t *height,
                                                uint64_t *serial) {
@@ -1036,11 +1036,11 @@ public:
         tTVPRect surface_rect(0, 0, surface_w, surface_h);
 
         if(g_host_prefer_gpu_frame && !HasHostVideoOverlayFrame()) {
-        if(auto *godot_tex = dynamic_cast<GodotTexture2D *>(tex);
+        if(auto *godot_tex = dynamic_cast<SDLTexture2D *>(tex);
            godot_tex != nullptr && godot_tex->EnsureGpuHandle() &&
            godot_tex->UploadCpuToGpu(false)) {
-            GodotTexture2D *output_tex =
-                PrepareGodotSurfaceTexture(godot_tex, tw, th, surface_w,
+            SDLTexture2D *output_tex =
+                PrepareHostSurfaceTexture(godot_tex, tw, th, surface_w,
                                            surface_h);
             if (output_tex == nullptr) output_tex = godot_tex;
             if (HostRenderTraceEnabled() && ShouldLogHostRenderTrace()) {
@@ -1049,7 +1049,7 @@ public:
                     tw, th, surface_w, surface_h, output_tex->GetWidth(),
                     output_tex->GetHeight());
             }
-            PublishHostGpuFrame(output_tex->GetGodotGpuHandle(),
+            PublishHostGpuFrame(output_tex->GetSdlTextureHandle(),
                                 static_cast<uint32_t>(output_tex->GetWidth()),
                                 static_cast<uint32_t>(output_tex->GetHeight()));
 
@@ -1106,12 +1106,12 @@ public:
             }
         }
 
-        if (auto *godot_tex = dynamic_cast<GodotTexture2D *>(tex)) {
+        if (auto *godot_tex = dynamic_cast<SDLTexture2D *>(tex)) {
             if (g_host_prefer_gpu_frame && !HasHostVideoOverlayFrame() &&
                 godot_tex->EnsureGpuHandle() &&
                 godot_tex->UploadCpuToGpu(false)) {
-                GodotTexture2D *output_tex =
-                    PrepareGodotSurfaceTexture(godot_tex, tw, th, surface_w,
+                SDLTexture2D *output_tex =
+                    PrepareHostSurfaceTexture(godot_tex, tw, th, surface_w,
                                                surface_h);
                 if (output_tex == nullptr) output_tex = godot_tex;
                 if (HostRenderTraceEnabled() && ShouldLogHostRenderTrace()) {
@@ -1121,7 +1121,7 @@ public:
                         output_tex->GetHeight());
                 }
                 PublishHostGpuFrame(
-                    output_tex->GetGodotGpuHandle(),
+                    output_tex->GetSdlTextureHandle(),
                     static_cast<uint32_t>(output_tex->GetWidth()),
                     static_cast<uint32_t>(output_tex->GetHeight()));
             } else {
@@ -1443,7 +1443,7 @@ private:
         dd->SetWindowSize(surf_w, surf_h);
     }
 
-    GodotTexture2D *PrepareGodotSurfaceTexture(GodotTexture2D *source,
+    SDLTexture2D *PrepareHostSurfaceTexture(SDLTexture2D *source,
                                                tjs_uint source_w,
                                                tjs_uint source_h,
                                                tjs_int surface_w,
@@ -1459,7 +1459,7 @@ private:
             surface_texture_->GetWidth() != surface_w ||
             surface_texture_->GetHeight() != surface_h) {
             delete surface_texture_;
-            surface_texture_ = new GodotTexture2D(
+            surface_texture_ = new SDLTexture2D(
                 nullptr, 0, static_cast<unsigned int>(surface_w),
                 static_cast<unsigned int>(surface_h), TVPTextureFormat::RGBA);
         }
@@ -1488,7 +1488,7 @@ private:
                                                     src_pt)) {
             return nullptr;
         }
-        // The Godot host copies the published texture through a synchronous
+        // The host copies the published texture through a synchronous
         // bridge operation before presenting it. Keep the scale copy on the
         // same ordered queue; flushing here split every animated frame into
         // several Metal submissions without making the frame any safer.
@@ -1607,7 +1607,7 @@ private:
     // Updated by EngineLoop on pointer events, read by GetCursorPos().
     tjs_int last_mouse_x_ = 0;
     tjs_int last_mouse_y_ = 0;
-    GodotTexture2D *surface_texture_ = nullptr;
+    SDLTexture2D *surface_texture_ = nullptr;
 
 #if defined(KRKR_ENABLE_GPU_BRIDGE)
     // Blit resources for rendering to external GPU targets.

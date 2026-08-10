@@ -6,9 +6,9 @@
 #include <unordered_map>
 #include <vector>
 
-class GodotRenderMethod final : public iTVPRenderMethod {
+class SDLRenderMethod final : public iTVPRenderMethod {
 public:
-    explicit GodotRenderMethod(iTVPRenderMethod *delegate);
+    explicit SDLRenderMethod(iTVPRenderMethod *delegate);
     int EnumParameterID(const char *name) override;
     void SetParameterUInt(int id, unsigned int Value) override;
     void SetParameterInt(int id, int Value) override;
@@ -36,12 +36,12 @@ private:
     int vague_ = 0;
 };
 
-class GodotTexture2D final : public iTVPTexture2D {
+class SDLTexture2D final : public iTVPTexture2D {
 public:
-    GodotTexture2D(const void *pixel, int pitch, unsigned int w,
+    SDLTexture2D(const void *pixel, int pitch, unsigned int w,
                    unsigned int h, TVPTextureFormat::e format,
                    int create_flags = RENDER_CREATE_TEXTURE_FLAG_ANY);
-    ~GodotTexture2D() override;
+    ~SDLTexture2D() override;
 
     TVPTextureFormat::e GetFormat() const override { return format_; }
     const void *GetScanLineForRead(tjs_uint l) override;
@@ -58,8 +58,8 @@ public:
     krkr::Texture2D *GetAdapterTexture(krkr::Texture2D *origTex) override {
         return origTex;
     }
-    uint64_t GetGodotGpuHandle() const { return gpu_handle_; }
-    bool HasGodotGpuHandle() const { return gpu_handle_ != 0; }
+    uint64_t GetSdlTextureHandle() const { return gpu_handle_; }
+    bool HasSdlTextureHandle() const { return gpu_handle_ != 0; }
     bool HasPendingGpuWrites() const { return gpu_dirty_ && !cpu_dirty_; }
     bool RequiresGpuReadback() const {
         return gpu_handle_ != 0 && !cpu_dirty_ && pixels_.empty();
@@ -71,37 +71,37 @@ public:
     void DiscardGpuReadback(uint64_t request) const;
     bool EnsureGpuHandle();
     bool ClearGpu(uint32_t rgba, const tTVPRect &rc);
-    bool CopyGpuFrom(GodotTexture2D *src, const tTVPRect &dst_rc,
+    bool CopyGpuFrom(SDLTexture2D *src, const tTVPRect &dst_rc,
                      const tTVPRect &src_rc);
-    bool CopyTrianglesGpuFrom(GodotTexture2D *src, uint32_t triangle_count,
+    bool CopyTrianglesGpuFrom(SDLTexture2D *src, uint32_t triangle_count,
                               const tTVPRect &clip_rc,
                               const tTVPPointD *dst_points,
                               const tTVPPointD *src_points);
-    bool BlendTrianglesGpuFrom(GodotTexture2D *src, uint32_t triangle_count,
+    bool BlendTrianglesGpuFrom(SDLTexture2D *src, uint32_t triangle_count,
                                const tTVPRect &clip_rc,
                                const tTVPPointD *dst_points,
                                const tTVPPointD *src_points, uint32_t mode,
                                int opacity);
-    bool DrawTrianglesGpuFrom(GodotTexture2D *src, uint32_t triangle_count,
+    bool DrawTrianglesGpuFrom(SDLTexture2D *src, uint32_t triangle_count,
                               const tTVPRect &clip_rc,
                               const tTVPPointD *dst_points,
                               const tTVPPointD *src_points, int opacity,
                               uint32_t blend_mode);
     bool DrawMaskedTrianglesGpuFrom(
-        GodotTexture2D *src, GodotTexture2D *mask,
+        SDLTexture2D *src, SDLTexture2D *mask,
         uint32_t triangle_count, const tTVPRect &clip_rc,
         const tTVPPointD *dst_points, const tTVPPointD *src_points,
         const tTVPPointD *mask_points, int opacity, uint32_t blend_mode,
         bool use_mask_alpha);
-    bool BlendGpuFrom(GodotTexture2D *src, const tTVPRect &dst_rc,
+    bool BlendGpuFrom(SDLTexture2D *src, const tTVPRect &dst_rc,
                       const tTVPRect &src_rc, uint32_t mode, int opacity,
                       uint32_t color);
-    bool BlendGpuFrom2(GodotTexture2D *src1, GodotTexture2D *src2,
+    bool BlendGpuFrom2(SDLTexture2D *src1, SDLTexture2D *src2,
                        const tTVPRect &dst_rc, const tTVPRect &src1_rc,
                        const tTVPRect &src2_rc, uint32_t mode, int opacity,
                        uint32_t color);
-    bool BlendGpuFrom3(GodotTexture2D *src1, GodotTexture2D *src2,
-                       GodotTexture2D *src3, const tTVPRect &dst_rc,
+    bool BlendGpuFrom3(SDLTexture2D *src1, SDLTexture2D *src2,
+                       SDLTexture2D *src3, const tTVPRect &dst_rc,
                        const tTVPRect &src1_rc, const tTVPRect &src2_rc,
                        const tTVPRect &src3_rc, uint32_t mode, int opacity,
                        uint32_t color);
@@ -131,9 +131,9 @@ private:
     bool discard_unwritten_on_partial_update_ = false;
 };
 
-class GodotRenderManager final : public iTVPRenderManager {
+class SDLRenderManager final : public iTVPRenderManager {
 public:
-    GodotRenderManager() = default;
+    SDLRenderManager() = default;
 
     iTVPTexture2D *CreateTexture2D(const void *pixel, int pitch, unsigned int w,
                                    unsigned int h, TVPTextureFormat::e format,
@@ -173,14 +173,14 @@ private:
     unsigned int draw_count_ = 0;
     uint64_t vmem_size_ = 0;
     iTVPRenderManager *software_delegate_ = nullptr;
-    std::unordered_map<uint32_t, GodotRenderMethod *> method_wrappers_;
+    std::unordered_map<uint32_t, SDLRenderMethod *> method_wrappers_;
     int stretch_parameter_id_ = -1;
     int stretch_type_ = 0;
 };
 
-void TVPForceRegisterGodotRenderManager();
-void TVPSetGodotRenderManagerGpuFastPathEnabled(bool enabled);
-std::string TVPGetGodotRenderManagerFallbackStats();
+void TVPForceRegisterSDLRenderManager();
+void TVPSetSDLRenderManagerGpuFastPathEnabled(bool enabled);
+std::string TVPGetSDLRenderManagerFallbackStats();
 
 class iTVPBaseBitmap;
 
@@ -189,14 +189,14 @@ class iTVPBaseBitmap;
 // the generic bitmap path would otherwise copy the old texture just to clear
 // it. Detach a shared scratch texture without copying its old pixels, then
 // clear the private texture on the ordered GPU queue.
-bool TVPGodotClearMotionScratchInPlace(
+bool TVPSdlClearMotionScratchInPlace(
     iTVPBaseBitmap *bitmap, const tTVPRect &rect, uint32_t argb);
 
 // Compose a source bitmap through the alpha union of one or more mask
 // bitmaps without synchronously reading Metal textures back to the CPU.
 // Destination rectangles are local to mask_scratch/dst; source rectangles
 // are local to the corresponding mask bitmap.
-bool TVPGodotCompositeAlphaUnionMask(
+bool TVPSdlCompositeAlphaUnionMask(
     iTVPBaseBitmap *dst, iTVPBaseBitmap *src,
     iTVPBaseBitmap *mask_scratch,
     iTVPBaseBitmap *const *masks,
@@ -209,7 +209,7 @@ bool TVPGodotCompositeAlphaUnionMask(
 
 // Build the alpha union of one or more mask bitmaps on the GPU, then apply it
 // to an existing destination while preserving destination RGB.
-bool TVPGodotApplyAlphaUnionMask(
+bool TVPSdlApplyAlphaUnionMask(
     iTVPBaseBitmap *dst, iTVPBaseBitmap *mask_scratch,
     iTVPBaseBitmap *const *masks,
     const tTVPRect *mask_dst_rects,
@@ -222,7 +222,7 @@ bool TVPGodotApplyAlphaUnionMask(
 
 // Preserve destination RGB and combine only its alpha with source alpha.
 // This is the GPU equivalent of E-mote's sub_6AC4E4 mask loop.
-bool TVPGodotApplyAlphaMask(
+bool TVPSdlApplyAlphaMask(
     iTVPBaseBitmap *dst, iTVPBaseBitmap *src,
     const tTVPRect &dst_rect, const tTVPRect &src_rect,
     int threshold, bool threshold_mask_mode, int item_flags);
@@ -230,7 +230,7 @@ bool TVPGodotApplyAlphaMask(
 // Fuse E-mote's positive-alpha stencil and the immediately following
 // AlphaBlend_d composition. This preserves the exact integer alpha formula
 // while avoiding a temporary texture write and a second compute dispatch.
-bool TVPGodotBlendAlphaDWithMask(
+bool TVPSdlBlendAlphaDWithMask(
     iTVPBaseBitmap *dst, iTVPBaseBitmap *src, iTVPBaseBitmap *mask,
     const tTVPRect &dst_rect, const tTVPRect &src_rect,
     const tTVPRect &mask_rect, int opacity, bool threshold_mask_mode);

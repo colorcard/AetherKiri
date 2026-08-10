@@ -59,7 +59,7 @@
 #include "ConfigManager/IndividualConfigManager.h"
 #include "vkdefine.h"
 #include "RenderManager.h"
-#include "godot/GodotRenderManager.h"
+#include "sdl3/SdlRenderManager.h"
 #include "FontImpl.h"
 #include "LayerCompletionCoordinates.h"
 #include "PimgCompositeBounds.h"
@@ -4806,7 +4806,7 @@ void tTJSNI_BaseLayer::AssignImages(tTJSNI_BaseLayer *src) {
         // though Assign() correctly reports that the object did not change.
         if(MainImage && MainImage->GetTexture() == src->MainImage->GetTexture()) {
             if(auto *texture =
-                   dynamic_cast<GodotTexture2D *>(MainImage->GetTexture())) {
+                   dynamic_cast<SDLTexture2D *>(MainImage->GetTexture())) {
                 shared_gpu_frame_updated = texture->HasPendingGpuWrites();
             }
         }

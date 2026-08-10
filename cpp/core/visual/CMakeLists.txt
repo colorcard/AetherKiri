@@ -46,8 +46,7 @@ set(VISUAL_SOURCE_FILES
     ${VISUAL_PATH}/ogl/etcpak.cpp
     ${VISUAL_PATH}/ogl/PVRTDecompress.cpp
 
-    ${VISUAL_PATH}/godot/GodotGpuBridge.cpp
-    ${VISUAL_PATH}/godot/GodotRenderManager.cpp
+    ${VISUAL_PATH}/sdl3/SdlRenderManager.cpp
 
     ${VISUAL_PATH}/impl/BasicDrawDevice.cpp
     ${VISUAL_PATH}/impl/BitmapBitsAlloc.cpp
@@ -72,7 +71,7 @@ set(VISUAL_HEADERS_DIR
     ${VISUAL_PATH}/
     ${VISUAL_PATH}/gl
     ${VISUAL_PATH}/ogl
-    ${VISUAL_PATH}/godot
+    ${VISUAL_PATH}/sdl3
     ${VISUAL_PATH}/impl
 )
 
