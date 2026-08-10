@@ -70,8 +70,78 @@ static bool isKnownNonUtf8GameEncoding(const std::string &encoding) {
            encoding == "GB18030" || encoding == "Big5";
 }
 
+// Strict structural validation for encodings whose boost.locale conversion is
+// too lenient. EUC-JP: JIS X 0208/0212 double/triple byte ranges (0xA1-0xFE)
+// and 0x8E half-width kana; any other high byte (e.g. 0x84) is invalid.
+// GBK: lead 0x81-0xFE, trail 0x40-0xFE except 0x7F.
+static bool isStrictEucJp(const unsigned char *raw, size_t size) {
+    size_t i = 0;
+    while(i < size) {
+        const unsigned char c = raw[i];
+        if(c < 0x80) {
+            i++;
+            continue;
+        }
+        if(c == 0x8E) { // half-width kana
+            if(i + 1 >= size) return false;
+            const unsigned char c2 = raw[i + 1];
+            if(c2 < 0xA1 || c2 > 0xDF) return false;
+            i += 2;
+            continue;
+        }
+        if(c == 0x8F) { // JIS X 0212 (3 bytes)
+            if(i + 2 >= size) return false;
+            for(int k = 1; k <= 2; ++k) {
+                const unsigned char ck = raw[i + k];
+                if(ck < 0xA1 || ck > 0xFE) return false;
+            }
+            i += 3;
+            continue;
+        }
+        if(c >= 0xA1 && c <= 0xFE) { // double byte
+            if(i + 1 >= size) return false;
+            const unsigned char c2 = raw[i + 1];
+            if(c2 < 0xA1 || c2 > 0xFE) return false;
+            i += 2;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+static bool isStrictGbk(const unsigned char *raw, size_t size) {
+    size_t i = 0;
+    while(i < size) {
+        const unsigned char c = raw[i];
+        if(c < 0x80) {
+            i++;
+            continue;
+        }
+        if(c >= 0x81 && c <= 0xFE) {
+            if(i + 1 >= size) return false;
+            const unsigned char c2 = raw[i + 1];
+            if(c2 < 0x40 || c2 > 0xFE || c2 == 0x7F) return false;
+            i += 2;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
 static bool isStrictlyDecodable(const unsigned char *raw, size_t size,
                                 const std::string &encoding) {
+    // boost.locale's EUC-JP conversion accepts structurally invalid bytes
+    // (e.g. 0x84 0x49), so GBK text rich in Japanese glyphs is misdetected
+    // as EUC-JP. Validate the two encodings involved in that confusion with
+    // strict structural checks; keep boost.locale for the rest.
+    if(encoding == "EUC-JP") {
+        return isStrictEucJp(raw, size);
+    }
+    if(encoding == "GBK") {
+        return isStrictGbk(raw, size);
+    }
     try {
         boost::locale::conv::to_utf<wchar_t>(
             reinterpret_cast<const char *>(raw),
