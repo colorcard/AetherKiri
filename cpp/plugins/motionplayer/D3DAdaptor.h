@@ -68,10 +68,9 @@ namespace motion {
         void registerCaption() {}
         void unloadUnusedTextures() {}
 
-        // GPU compositing batches were provided by the removed Godot GPU
-        // bridge; the engine now renders in-engine via SDL3. Keep the
-        // begin/end pairing semantics (depth counting) so callers behave the
-        // same, but the operations are no-ops.
+        // Keep one explicit bridge batch open across the complete D3DEmote
+        // transaction (draw, capture, redraw, and final layer assignment).
+        // Player's own render scopes nest inside this one without draining.
         bool beginGpuBatch() {
             ++_gpuBatchDepth;
             return true;

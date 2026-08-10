@@ -837,6 +837,12 @@ tTVPBaseTexture *tTVPLayerManager::EnsureDrawBufferSize(
         if(clear_on_resize)
             DrawBuffer->Fill(tTVPRect(0, 0, w, h), 0xFF000000);
         static_cast<tTVPDestTexture *>(DrawBuffer)->SetHoldAlpha(HoldAlpha);
+        // The resized buffer was cleared/reallocated: every layer must be
+        // recomposited, not just the ones that happened to invalidate this
+        // frame. Without this, static background layers (whose content did
+        // not change across the resize) never repaint and the frame stays
+        // black apart from regions touched by active child layers.
+        AddUpdateRegion(tTVPRect(0, 0, target_w, target_h));
     }
     return DrawBuffer;
 }

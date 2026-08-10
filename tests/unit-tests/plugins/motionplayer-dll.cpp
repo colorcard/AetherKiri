@@ -2282,4 +2282,41 @@ TEST_CASE("motionplayer ignores empty legacy stencil base branches") {
     REQUIRE_FALSE(nodes[1].implicitVisibleStencilGroup);
     REQUIRE_FALSE(nodes[2].implicitVisibleStencilBase);
     REQUIRE(nodes[2].implicitVisibleStencilGroupNodeIndex == -1);
+namespace motion {
+    struct PlayerTestAccess {
+        static void enableAutoProgress(Player &player, iTJSDispatch2 *dispatch) {
+            player.enableAutoProgress(dispatch);
+        }
+    };
+}
+
+TEST_CASE("manual Motion.Player progress owns the playback clock") {
+    motion::Player player;
+    auto *dispatch = new tTJSDispatch();
+    motion::PlayerTestAccess::enableAutoProgress(player, dispatch);
+    CHECK(player.getAutoProgressDispatchForCompat() == dispatch);
+
+    // Even an initial zero-delta refresh means that the script owns this
+    // player's wall clock.  Leaving the continuous callback registered here
+    // double-counts a slow frame when the next script delta arrives.
+    player.frameProgressManually(0.0);
+    CHECK(player.getAutoProgressDispatchForCompat() == nullptr);
+    dispatch->Release();
+}
+
+TEST_CASE("resource managers reuse the most recent exact motion module") {
+    setEmoteSeed();
+
+    motion::ResourceManager first;
+    const auto firstModule = first.load(motionFixturePath());
+    REQUIRE(firstModule.Type() == tvtObject);
+
+    motion::ResourceManager second;
+    const auto secondModule = second.load(motionFixturePath());
+    REQUIRE(secondModule.Type() == tvtObject);
+    REQUIRE(secondModule.AsObjectNoAddRef() ==
+            firstModule.AsObjectNoAddRef());
+    REQUIRE(second.uniqueCachedModuleCount() == 1);
+}
+
 }
