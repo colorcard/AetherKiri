@@ -1000,30 +1000,6 @@ engine_result_t engine_read_frame_rgba(engine_handle_t public_handle,
                });
 }
 
-engine_result_t engine_get_godot_native_frame_texture(
-    engine_handle_t public_handle, uint64_t* out_texture_id,
-    uint32_t* out_width, uint32_t* out_height, uint64_t* out_frame_serial) {
-  return Route(public_handle, "get_godot_native_frame_texture",
-               [&](engine_handle_t legacy) {
-#if defined(ENGINE_API_USE_KRKR2_RUNTIME)
-                 return engine_legacy_get_godot_native_frame_texture(
-                     legacy, out_texture_id, out_width, out_height,
-                     out_frame_serial);
-#else
-                 (void)legacy;
-                 return ENGINE_RESULT_NOT_SUPPORTED;
-#endif
-               },
-               [&](DispatchHandle* handle) {
-                 return PROVIDER_HAS(handle->provider,
-                                     get_godot_native_frame_texture)
-                            ? handle->provider->get_godot_native_frame_texture(
-                                  handle->runtime, out_texture_id, out_width,
-                                  out_height, out_frame_serial)
-                            : ENGINE_RESULT_NOT_SUPPORTED;
-               });
-}
-
 engine_result_t engine_set_sdl_renderer(engine_handle_t public_handle,
                                         void* sdl_renderer_ptr) {
   return Route(public_handle, "set_sdl_renderer",

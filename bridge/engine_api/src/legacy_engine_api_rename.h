@@ -29,8 +29,6 @@
   engine_legacy_media_get_subtitle_tracks_json
 #define engine_media_extract_subtitle engine_legacy_media_extract_subtitle
 #define engine_media_read_frame_rgba engine_legacy_media_read_frame_rgba
-#define engine_get_godot_native_frame_texture \
-  engine_legacy_get_godot_native_frame_texture
 #define engine_get_gpu_frame_texture \
   engine_legacy_get_gpu_frame_texture
 #define engine_get_host_native_window engine_legacy_get_host_native_window

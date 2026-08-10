@@ -18,7 +18,6 @@
 #include "engine_api.h"
 #include "engine_options.h"
 #include "host_input.h"
-#include "gpu/gpu_bridge.h"
 
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
@@ -201,21 +200,10 @@ bool CreatePresentation(HostState &state) {
     }
     SDL_SetTextureScaleMode(state.screen, SDL_SCALEMODE_NEAREST);
     SDL_SetTextureBlendMode(state.screen, SDL_BLENDMODE_NONE);
-
-    // Register the SDL_Renderer GPU bridge so the engine can publish frames
-    // as SDL_Texture* for zero-copy presentation (render_backend gpu_bridge).
-    aetherkiri::GpuBridgeSetRenderer(state.renderer);
-    engine_register_godot_gpu_bridge(aetherkiri::GpuBridgeCallbacks());
-    engine_register_godot_gpu_batch_bridge(
-        aetherkiri::GpuBridgeBatchCallbacks());
     return true;
 }
 
 void DestroyPresentation(HostState &state) {
-    engine_register_godot_gpu_bridge(nullptr);
-    engine_register_godot_gpu_batch_bridge(nullptr);
-    aetherkiri::GpuBridgeSetRenderer(nullptr);
-    aetherkiri::GpuBridgeFlushReleasedTextures();
     if(state.screen != nullptr) {
         SDL_DestroyTexture(state.screen);
         state.screen = nullptr;
@@ -1013,7 +1001,6 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
         if(state.engine != nullptr) {
             engine_flush_released_textures(state.engine);
         }
-        aetherkiri::GpuBridgeFlushReleasedTextures();
 
         if(state.benchmark_seconds > 0 && state.benchmark_start_ms != 0 &&
            SDL_GetTicks() - state.benchmark_start_ms >=

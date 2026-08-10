@@ -61,9 +61,6 @@ engine_result_t engine_legacy_media_read_frame_rgba(
     engine_media_handle_t media, void* out_pixels, size_t out_pixels_size,
     engine_frame_desc_t* out_frame_desc);
 #if defined(ENGINE_API_USE_KRKR2_RUNTIME)
-engine_result_t engine_legacy_get_godot_native_frame_texture(
-    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
-    uint32_t* out_height, uint64_t* out_frame_serial);
 engine_result_t engine_legacy_get_gpu_frame_texture(
     engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
     uint32_t* out_height, uint64_t* out_frame_serial);

@@ -8,7 +8,6 @@ find_package(imgui CONFIG REQUIRED)
 add_executable(aetherkiri_sdl
     src/main.cpp
     src/host_input.cpp
-    src/gpu/gpu_bridge.cpp
     src/ui/ui_launcher.cpp
     src/ui/ui_overlay.cpp
 )

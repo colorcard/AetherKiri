@@ -2128,16 +2128,6 @@ extern void TVPEngineApi_SetGlobalException(const std::string& msg);
 
 extern "C" {
 
-void engine_register_godot_gpu_bridge(const void* callbacks) {
-  TVPGodotGpuBridgeRegister(
-      static_cast<const TVPGodotGpuBridgeCallbacks*>(callbacks));
-}
-
-void engine_register_godot_gpu_batch_bridge(const void* callbacks) {
-  TVPGodotGpuBatchRegister(
-      static_cast<const TVPGodotGpuBatchCallbacks*>(callbacks));
-}
-
 void TVPEngineApiNotifyWebStartupReady() {
 #if defined(__EMSCRIPTEN__)
   engine_handle_t handle = nullptr;
@@ -3895,14 +3885,6 @@ static engine_result_t EngineGetGpuFrameTextureImpl(
   ClearHandleErrorLocked(impl);
   SetThreadError(nullptr);
   return ENGINE_RESULT_OK;
-}
-
-engine_result_t engine_get_godot_native_frame_texture(
-    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
-    uint32_t* out_height, uint64_t* out_frame_serial) {
-  return EngineGetGpuFrameTextureImpl(handle, out_texture_id, out_width,
-                                      out_height, out_frame_serial,
-                                      "engine_get_godot_native_frame_texture");
 }
 
 engine_result_t engine_get_gpu_frame_texture(
