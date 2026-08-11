@@ -1035,6 +1035,39 @@ bool SdlGpuRenderManager::DrawRect(SdlGpuTexture2D *dst,
     if (cmd == nullptr) return false;
     TVPEnsureSdlGpuRenderPassReady();
 
+    // Self-copy / self-blend (dst==src, e.g. internal region scroll): the
+    // texture would be simultaneously a color target and a fragment sampler,
+    // which SDL_GPU forbids (and the Vulkan backend's layout transition does
+    // not cover it). Copy the destination to the scratch texture first and
+    // sample the scratch instead.
+    SDL_GPUTexture *sample_src = src;
+    if (dst->GpuTexture() == src) {
+        SDL_GPUTexture *scratch =
+            EnsureScratch(p, dst->GetWidth(), dst->GetHeight());
+        if (scratch == nullptr) return false;
+        SDL_GPUCopyPass *cp = TVPGetSdlGpuFrameCopyPass();
+        if (cp == nullptr) return false;
+        SDL_GPUTextureLocation ssrc{};
+        ssrc.texture = dst->GpuTexture();
+        ssrc.mip_level = 0;
+        ssrc.layer = 0;
+        ssrc.x = 0;
+        ssrc.y = 0;
+        ssrc.z = 0;
+        SDL_GPUTextureLocation sdst{};
+        sdst.texture = scratch;
+        sdst.mip_level = 0;
+        sdst.layer = 0;
+        sdst.x = 0;
+        sdst.y = 0;
+        sdst.z = 0;
+        SDL_CopyGPUTextureToTexture(
+            cp, &ssrc, &sdst, static_cast<Uint32>(dst->GetWidth()),
+            static_cast<Uint32>(dst->GetHeight()), 1, false);
+        sample_src = scratch;
+        TVPEnsureSdlGpuRenderPassReady();
+    }
+
     // Begin a render pass targeting dst. Each OperateRect gets its own pass
     // because targets change arbitrarily between calls.
     SDL_GPUColorTargetInfo tgt{};
@@ -1057,9 +1090,9 @@ bool SdlGpuRenderManager::DrawRect(SdlGpuTexture2D *dst,
     ibind.offset = 0;
     SDL_BindGPUIndexBuffer(rp, &ibind, SDL_GPU_INDEXELEMENTSIZE_32BIT);
 
-    // Sampler slot 0: source texture.
+    // Sampler slot 0: source texture (scratch when dst==src self-copy).
     SDL_GPUTextureSamplerBinding sampler_bind{};
-    sampler_bind.texture = src;
+    sampler_bind.texture = sample_src;
     sampler_bind.sampler = p->sampler;
     SDL_BindGPUFragmentSamplers(rp, 0, &sampler_bind, 1);
 
