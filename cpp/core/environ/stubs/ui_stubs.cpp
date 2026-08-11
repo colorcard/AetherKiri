@@ -625,6 +625,9 @@ bool StoreLatestCpuFrameFromTexture(iTVPTexture2D *tex) {
         g_host_gpu_texture = 0;
         g_host_gpu_width = 0;
         g_host_gpu_height = 0;
+        g_host_gpu_texture_v2 = 0;
+        g_host_gpu_v2_width = 0;
+        g_host_gpu_v2_height = 0;
     }
     return true;
 }
@@ -656,6 +659,9 @@ void PublishHostGpuFrame(uint64_t texture, uint32_t width, uint32_t height) {
     g_host_frame_height = height;
     g_host_frame_stride = width * 4u;
     g_host_frame_serial = g_host_gpu_serial;
+    g_host_gpu_texture_v2 = 0;
+    g_host_gpu_v2_width = 0;
+    g_host_gpu_v2_height = 0;
 }
 
 // Publishes the composited frame as an SDL_GPUTexture handle (sdl3_gpu
@@ -671,6 +677,13 @@ void PublishHostGpuFrameSdl(uint64_t texture, uint32_t width, uint32_t height) {
     g_host_frame_height = height;
     g_host_frame_stride = width * 4u;
     g_host_frame_serial = g_host_gpu_v2_serial;
+    g_host_gpu_texture = 0;
+    g_host_gpu_width = 0;
+    g_host_gpu_height = 0;
+    if (HostRenderTraceEnabled() && ShouldLogHostRenderTrace()) {
+        spdlog::info("host final frame: source=sdl_gpu serial={} size={}x{}",
+                     g_host_gpu_v2_serial, width, height);
+    }
 }
 
 extern "C" bool TVPHostGetLatestHostGpuFrameSdl(uint64_t *texture,
@@ -791,6 +804,9 @@ extern "C" void TVPHostSetPreferGpuFrame(bool prefer_gpu_frame) {
         g_host_gpu_texture = 0;
         g_host_gpu_width = 0;
         g_host_gpu_height = 0;
+        g_host_gpu_texture_v2 = 0;
+        g_host_gpu_v2_width = 0;
+        g_host_gpu_v2_height = 0;
     }
 }
 
@@ -862,10 +878,16 @@ extern "C" bool TVPHostGetLatestFrameDesc(uint32_t *width, uint32_t *height,
     std::lock_guard<std::mutex> lock(g_host_frame_mutex);
     if(g_host_frame_rgba.empty() || g_host_frame_width == 0 ||
        g_host_frame_height == 0 || g_host_frame_stride == 0) {
-        if(g_host_gpu_texture == 0 || g_host_gpu_width == 0 ||
-           g_host_gpu_height == 0) {
-            return false;
+        if(g_host_gpu_texture_v2 != 0 && g_host_gpu_v2_width != 0 &&
+           g_host_gpu_v2_height != 0) {
+            if(width) *width = g_host_gpu_v2_width;
+            if(height) *height = g_host_gpu_v2_height;
+            if(stride_bytes) *stride_bytes = g_host_gpu_v2_width * 4u;
+            if(serial) *serial = g_host_gpu_v2_serial;
+            return true;
         }
+        if(g_host_gpu_texture == 0 || g_host_gpu_width == 0 ||
+           g_host_gpu_height == 0) return false;
         if(width) *width = g_host_gpu_width;
         if(height) *height = g_host_gpu_height;
         if(stride_bytes) *stride_bytes = g_host_gpu_width * 4u;
@@ -886,9 +908,26 @@ extern "C" bool TVPHostCopyLatestFrameRGBA(void *out_pixels,
                                             uint64_t *serial) {
     if(!out_pixels) return false;
     std::lock_guard<std::mutex> lock(g_host_frame_mutex);
-    if(g_host_frame_rgba.empty() || out_pixels_size < g_host_frame_rgba.size()) {
-        return false;
+    if(g_host_frame_rgba.empty()) {
+        if(g_host_gpu_texture_v2 == 0 || g_host_gpu_v2_width == 0 ||
+           g_host_gpu_v2_height == 0) return false;
+        const size_t required = static_cast<size_t>(g_host_gpu_v2_width) *
+                                g_host_gpu_v2_height * 4u;
+        if(out_pixels_size < required ||
+           !TVPReadSdlGpuTextureRgba(
+               reinterpret_cast<SDL_GPUTexture *>(static_cast<uintptr_t>(
+                   g_host_gpu_texture_v2)),
+               g_host_gpu_v2_width, g_host_gpu_v2_height, out_pixels,
+               out_pixels_size)) {
+            return false;
+        }
+        if(width) *width = g_host_gpu_v2_width;
+        if(height) *height = g_host_gpu_v2_height;
+        if(stride_bytes) *stride_bytes = g_host_gpu_v2_width * 4u;
+        if(serial) *serial = g_host_gpu_v2_serial;
+        return true;
     }
+    if(out_pixels_size < g_host_frame_rgba.size()) return false;
     std::memcpy(out_pixels, g_host_frame_rgba.data(), g_host_frame_rgba.size());
     if(width) *width = g_host_frame_width;
     if(height) *height = g_host_frame_height;
@@ -1062,11 +1101,40 @@ public:
     }
 
     void UpdateDrawBuffer(iTVPTexture2D *tex) override {
-#if !defined(KRKR_ENABLE_GPU_BRIDGE)
         if (!tex || !owner_) return;
         const tjs_uint tw = tex->GetWidth();
         const tjs_uint th = tex->GetHeight();
         if(tw == 0 || th == 0) return;
+
+        // The SDL_GPU compositor is independent of the legacy OpenGL bridge.
+        // Publish its native texture before entering either compile-time host
+        // path so BUILD_GPU_BRIDGE configurations behave identically.
+        if(g_host_prefer_gpu_frame && !HasHostVideoOverlayFrame()) {
+            if (auto *gpu_tex = dynamic_cast<SdlGpuTexture2D *>(tex);
+                gpu_tex != nullptr && TVPIsSdlGpuActive()) {
+                // Hybrid fallback operations may leave the final texture's
+                // CPU copy authoritative. Synchronize it before handing the
+                // native texture to the host; this is a GPU upload only when
+                // software composition actually changed the frame.
+                gpu_tex->UploadCpuToGpu();
+                if (gpu_tex->GpuTexture() != nullptr) {
+                    PublishHostGpuFrameSdl(
+                        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                            gpu_tex->GpuTexture())),
+                        static_cast<uint32_t>(tw), static_cast<uint32_t>(th));
+                    auto *dd = owner_->GetDrawDevice();
+                    if (!dd) return;
+                    tTVPRect dest(0, 0, static_cast<tjs_int>(tw),
+                                  static_cast<tjs_int>(th));
+                    ApplyDrawDeviceSurfaceRect(dd, dest, dest.get_width(),
+                                               dest.get_height());
+                    if (g_postDrawHook) g_postDrawHook();
+                    return;
+                }
+            }
+        }
+
+#if !defined(KRKR_ENABLE_GPU_BRIDGE)
 
         tjs_int surface_w = 0;
         tjs_int surface_h = 0;
@@ -1075,24 +1143,6 @@ public:
         tTVPRect surface_rect(0, 0, surface_w, surface_h);
 
         if(g_host_prefer_gpu_frame && !HasHostVideoOverlayFrame()) {
-        // sdl3_gpu backend: publish the composited frame's SDL_GPUTexture so
-        // the host can blit it into the swapchain (zero-copy present).
-        if (auto *gpu_tex = dynamic_cast<SdlGpuTexture2D *>(tex);
-            gpu_tex != nullptr && TVPIsSdlGpuActive() &&
-            gpu_tex->GpuTexture() != nullptr) {
-            PublishHostGpuFrameSdl(
-                static_cast<uint64_t>(
-                    reinterpret_cast<uintptr_t>(gpu_tex->GpuTexture())),
-                static_cast<uint32_t>(tw), static_cast<uint32_t>(th));
-            auto *dd = owner_->GetDrawDevice();
-            if (!dd) return;
-            tTVPRect dest(0, 0, static_cast<tjs_int>(tw),
-                          static_cast<tjs_int>(th));
-            ApplyDrawDeviceSurfaceRect(dd, dest, dest.get_width(),
-                                       dest.get_height());
-            if (g_postDrawHook) g_postDrawHook();
-            return;
-        }
         if(auto *godot_tex = dynamic_cast<SDLTexture2D *>(tex);
            godot_tex != nullptr && godot_tex->EnsureGpuHandle() &&
            godot_tex->UploadCpuToGpu(false)) {
@@ -1133,12 +1183,6 @@ public:
         // When an IOSurface is attached, this goes directly to the shared
         // IOSurface (zero-copy to Application host). Otherwise, falls back to
         // the EGL Pbuffer for glReadPixels-based retrieval.
-        if (!tex) return;
-
-        const tjs_uint tw = tex->GetWidth();
-        const tjs_uint th = tex->GetHeight();
-        if (tw == 0 || th == 0) return;
-
         tjs_int surface_w = 0;
         tjs_int surface_h = 0;
         GetHostSurfaceSize(static_cast<tjs_int>(tw), static_cast<tjs_int>(th),

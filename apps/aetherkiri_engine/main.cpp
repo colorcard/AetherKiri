@@ -169,6 +169,8 @@ bool CreatePresentation() {
         if (!SDL_ClaimWindowForGPUDevice(g.gpu_device, g.window)) {
             fprintf(stderr, "SDL_ClaimWindowForGPUDevice failed: %s\n",
                     SDL_GetError());
+            SDL_DestroyGPUDevice(g.gpu_device);
+            g.gpu_device = nullptr;
             return false;
         }
         fprintf(stderr, "sdl3_gpu: SDL_GPUDevice created\n");
@@ -444,6 +446,16 @@ void PresentShell() {
         }
         if (!SDL_SubmitGPUCommandBuffer(cmd)) {
             fprintf(stderr, "SubmitGPUCommandBuffer: %s\n", SDL_GetError());
+        } else {
+            static bool logged_swapchain_present = false;
+            if (!logged_swapchain_present) {
+                fprintf(stderr,
+                        "sdl3_gpu: presenting native frame via swapchain\n");
+                logged_swapchain_present = true;
+            }
+        }
+        if (g.engine != nullptr) {
+            engine_flush_released_textures(g.engine);
         }
         return;
     }
@@ -572,6 +584,9 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         // present so the engine's GPU resources are released while the device
         // is still alive.
         SDL_WaitForGPUIdle(g.gpu_device);
+        if (g.window != nullptr) {
+            SDL_ReleaseWindowFromGPUDevice(g.gpu_device, g.window);
+        }
         SDL_DestroyGPUDevice(g.gpu_device);
         g.gpu_device = nullptr;
     }

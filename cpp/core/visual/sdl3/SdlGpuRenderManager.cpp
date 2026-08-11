@@ -14,6 +14,7 @@
 #include <mutex>
 #include <sstream>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "shaders/quad.vert.spv.h"
 #include "shaders/quad.frag.spv.h"
@@ -22,6 +23,19 @@
 #include "shaders/blend_d.frag.spv.h"
 
 namespace {
+std::mutex g_live_texture_mutex;
+std::unordered_set<SdlGpuTexture2D *> g_live_textures;
+
+void RegisterLiveTexture(SdlGpuTexture2D *texture) {
+    std::lock_guard<std::mutex> lock(g_live_texture_mutex);
+    g_live_textures.insert(texture);
+}
+
+void UnregisterLiveTexture(SdlGpuTexture2D *texture) {
+    std::lock_guard<std::mutex> lock(g_live_texture_mutex);
+    g_live_textures.erase(texture);
+}
+
 
 // Blend-mode tags shared with the SDL_Renderer backend.
 enum : uint32_t {
@@ -203,9 +217,13 @@ SdlGpuTexture2D::SdlGpuTexture2D(const void *pixel, int pitch, unsigned int w,
     }
     cpu_dirty_ = true;
     gpu_dirty_ = false;
+    RegisterLiveTexture(this);
 }
 
-SdlGpuTexture2D::~SdlGpuTexture2D() { ReleaseGpuTexture(); }
+SdlGpuTexture2D::~SdlGpuTexture2D() {
+    ReleaseGpuTexture();
+    UnregisterLiveTexture(this);
+}
 
 void SdlGpuTexture2D::ReleaseGpuTexture() {
     if (gpu_tex_ != nullptr) {
@@ -1375,3 +1393,14 @@ void TVPForceRegisterSdlGpuRenderManager() {}
 // SDL_GPUDevice is detached or the engine is destroyed (the device must still
 // be alive).
 void TVPReleaseSdlGpuPipelines() { ReleasePipelines(); }
+
+void TVPReleaseAllSdlGpuTextures() {
+    std::vector<SdlGpuTexture2D *> textures;
+    {
+        std::lock_guard<std::mutex> lock(g_live_texture_mutex);
+        textures.assign(g_live_textures.begin(), g_live_textures.end());
+    }
+    for (SdlGpuTexture2D *texture : textures) {
+        if (texture != nullptr) texture->ReleaseGpuTexture();
+    }
+}

@@ -796,10 +796,9 @@ bool ShouldUseHostGpuFrameForRenderer(const std::string& renderer) {
     return false;
   }
   if (renderer == ENGINE_RENDERER_SDL3_GPU) {
-    // The sdl3_gpu backend composites on an SDL_GPU device and publishes
-    // frames via CPU readback (SDL_GPUTexture handles are not host-presentable
-    // through the SDL_Renderer present path).
-    return false;
+    // SDL_GPU hosts consume the compositor's native frame texture directly.
+    // Explicit readback remains available for screenshots and diagnostics.
+    return true;
   }
 #if defined(__APPLE__) && TARGET_OS_IPHONE
   return !EnvFlagEnabled("AETHERKIRI_IOS_DISABLE_GODOT_GPU_FASTPATH");
@@ -2321,11 +2320,16 @@ engine_result_t engine_destroy(engine_handle_t handle) {
     TVPEngineApi_SetGlobalException("");
     g_runtime_started_once = false;
 
-    // Flush the engine's SDL_GPU released-texture queue while the injected
-    // SDL_GPUDevice is still alive (the host destroys it after engine_destroy).
+    // Release every engine-owned SDL_GPU resource while the injected device
+    // is still alive. Some texture objects outlive a game session, so merely
+    // flushing the deferred-release queue is insufficient.
+    TVPSubmitSdlGpuFrameAndWait();
+    TVPReleaseAllSdlGpuTextures();
     TVPReleaseSdlGpuPipelines();
     TVPFlushReleasedSdlGpuTextures();
     TVPFlushReleasedSdlTextures();
+    TVPHostSetPreferGpuFrame(false);
+    TVPSetSdlGpuDevice(nullptr);
 
     // Reset the bootstrap state so the next engine_create runs the full
     // runtime initialization (graphics backend, render manager registry,

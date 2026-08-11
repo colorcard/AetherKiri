@@ -196,6 +196,8 @@ bool CreatePresentation(HostState &state) {
         if(!SDL_ClaimWindowForGPUDevice(state.gpu_device, state.window)) {
             fprintf(stderr, "SDL_ClaimWindowForGPUDevice failed: %s\n",
                     SDL_GetError());
+            SDL_DestroyGPUDevice(state.gpu_device);
+            state.gpu_device = nullptr;
             return false;
         }
         fprintf(stderr, "[host] sdl3_gpu: SDL_GPUDevice created\n");
@@ -222,6 +224,9 @@ bool CreatePresentation(HostState &state) {
 void DestroyPresentation(HostState &state) {
     if(state.gpu_device != nullptr) {
         SDL_WaitForGPUIdle(state.gpu_device);
+        if(state.window != nullptr) {
+            SDL_ReleaseWindowFromGPUDevice(state.gpu_device, state.window);
+        }
         SDL_DestroyGPUDevice(state.gpu_device);
         state.gpu_device = nullptr;
     }

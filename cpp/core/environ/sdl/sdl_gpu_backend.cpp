@@ -1,5 +1,8 @@
 #include "sdl_gpu_backend.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <cstring>
 #include <mutex>
 #include <vector>
 
@@ -30,6 +33,61 @@ void TVPSetSdlGpuDevice(SDL_GPUDevice *device) {
 SDL_GPUDevice *TVPGetSdlGpuDevice() { return g_sdl_gpu_device; }
 
 bool TVPIsSdlGpuActive() { return g_sdl_gpu_device != nullptr; }
+
+bool TVPReadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
+                             uint32_t height, void *out_pixels,
+                             size_t out_pixels_size) {
+    if (g_sdl_gpu_device == nullptr || texture == nullptr ||
+        out_pixels == nullptr || width == 0 || height == 0) {
+        return false;
+    }
+    const size_t required = static_cast<size_t>(width) * height * 4u;
+    if (out_pixels_size < required || required > UINT32_MAX) {
+        return false;
+    }
+
+    TVPSubmitSdlGpuFrameAndWait();
+    SDL_GPUTransferBufferCreateInfo tb_info{};
+    tb_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
+    tb_info.size = static_cast<Uint32>(required);
+    SDL_GPUTransferBuffer *tb =
+        SDL_CreateGPUTransferBuffer(g_sdl_gpu_device, &tb_info);
+    if (tb == nullptr) return false;
+
+    bool ok = false;
+    SDL_GPUCommandBuffer *cmd =
+        SDL_AcquireGPUCommandBuffer(g_sdl_gpu_device);
+    if (cmd != nullptr) {
+        SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
+        if (cp != nullptr) {
+            SDL_GPUTextureRegion src{};
+            src.texture = texture;
+            src.w = width;
+            src.h = height;
+            src.d = 1;
+            SDL_GPUTextureTransferInfo dst{};
+            dst.transfer_buffer = tb;
+            dst.pixels_per_row = width;
+            dst.rows_per_layer = height;
+            SDL_DownloadFromGPUTexture(cp, &src, &dst);
+            SDL_EndGPUCopyPass(cp);
+            if (SDL_SubmitGPUCommandBuffer(cmd)) {
+                SDL_WaitForGPUIdle(g_sdl_gpu_device);
+                const void *mapped =
+                    SDL_MapGPUTransferBuffer(g_sdl_gpu_device, tb, false);
+                if (mapped != nullptr) {
+                    std::memcpy(out_pixels, mapped, required);
+                    SDL_UnmapGPUTransferBuffer(g_sdl_gpu_device, tb);
+                    ok = true;
+                }
+            }
+        } else {
+            SDL_CancelGPUCommandBuffer(cmd);
+        }
+    }
+    SDL_ReleaseGPUTransferBuffer(g_sdl_gpu_device, tb);
+    return ok;
+}
 
 void TVPQueueSdlGpuTextureRelease(SDL_GPUTexture *tex) {
     if (tex == nullptr) {

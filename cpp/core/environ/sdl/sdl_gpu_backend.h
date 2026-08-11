@@ -2,6 +2,7 @@
 
 #include <SDL3/SDL_gpu.h>
 
+#include <cstddef>
 #include <cstdint>
 
 // SDL_GPU device/command-buffer backend for the engine's in-engine GPU
@@ -44,3 +45,9 @@ void TVPEndSdlGpuComposite();
 
 // Whether a GPU device is currently injected.
 bool TVPIsSdlGpuActive();
+
+// Synchronously downloads an SDL_GPU texture into tightly packed RGBA8.
+// This is reserved for explicit host readback paths such as screenshots.
+bool TVPReadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
+                             uint32_t height, void *out_pixels,
+                             size_t out_pixels_size);

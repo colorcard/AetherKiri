@@ -55,6 +55,7 @@ public:
     void SetOpacityKnown(bool opaque);
 
 private:
+    friend void TVPReleaseAllSdlGpuTextures();
     void ReleaseGpuTexture();
     void EnsureCpuStorage();
     void DiscardCpuStorage();
@@ -135,3 +136,4 @@ void TVPForceRegisterSdlGpuRenderManager();
 // Releases the cached SDL_GPU pipelines/geometry; call while the injected
 // SDL_GPUDevice is still alive (engine teardown).
 void TVPReleaseSdlGpuPipelines();
+void TVPReleaseAllSdlGpuTextures();
