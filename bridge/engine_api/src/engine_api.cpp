@@ -65,6 +65,7 @@ void krkr_GetSurfaceDimensions(uint32_t*, uint32_t*);
 #include "environ/combase.h"
 #include "environ/Platform.h"
 #include "environ/sdl/sdl_render_backend.h"
+#include "environ/sdl/sdl_gpu_backend.h"
 #include "environ/EngineBootstrap.h"
 #include "environ/EngineLoop.h"
 #include "environ/MainScene.h"
@@ -787,6 +788,12 @@ bool EnvFlagEnabled(const char* name) {
 
 bool ShouldUseHostGpuFrameForRenderer(const std::string& renderer) {
   if (renderer == ENGINE_RENDERER_DEBUG_CPU) {
+    return false;
+  }
+  if (renderer == ENGINE_RENDERER_SDL3_GPU) {
+    // The sdl3_gpu backend composites on an SDL_GPU device and publishes
+    // frames via CPU readback (SDL_GPUTexture handles are not host-presentable
+    // through the SDL_Renderer present path).
     return false;
   }
 #if defined(__APPLE__) && TARGET_OS_IPHONE
@@ -3177,6 +3184,9 @@ engine_result_t engine_set_option(engine_handle_t handle,
     const char *renderer = ENGINE_RENDERER_GODOT_NATIVE;
     if (value == ENGINE_RENDER_BACKEND_GPU_BRIDGE || value == ENGINE_RENDERER_GPU_BRIDGE) {
       renderer = ENGINE_RENDERER_GPU_BRIDGE;
+    } else if (value == ENGINE_RENDER_BACKEND_SDL3_GPU ||
+               value == ENGINE_RENDERER_SDL3_GPU) {
+      renderer = ENGINE_RENDERER_SDL3_GPU;
     } else if (value == ENGINE_RENDER_BACKEND_DEBUG_CPU || value == ENGINE_RENDERER_DEBUG_CPU ||
                value == ENGINE_RENDERER_SOFTWARE) {
       renderer = ENGINE_RENDERER_DEBUG_CPU;
@@ -3442,6 +3452,50 @@ engine_result_t engine_set_sdl_renderer(engine_handle_t handle,
   // SDL path) creates its own textures on the injected renderer; the host
   // keeps presentation. Pass nullptr to detach.
   TVPSetSdlRenderer(static_cast<SDL_Renderer*>(sdl_renderer_ptr));
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t engine_set_sdl_gpu_device(engine_handle_t handle,
+                                          void* sdl_gpu_device_ptr) {
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  result = ValidateHandleThreadLocked(impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  // The engine's SDL_GPU compositor (sdl3_gpu backend) records per-frame
+  // commands on the injected device; the host keeps presentation. Pass
+  // nullptr to detach.
+  TVPSetSdlGpuDevice(static_cast<SDL_GPUDevice*>(sdl_gpu_device_ptr));
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t engine_submit_sdl_gpu_frame(engine_handle_t handle) {
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  result = ValidateHandleThreadLocked(impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  TVPSubmitSdlGpuFrame();
   ClearHandleErrorLocked(impl);
   SetThreadError(nullptr);
   return ENGINE_RESULT_OK;

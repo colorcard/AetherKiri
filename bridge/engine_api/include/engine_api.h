@@ -359,6 +359,26 @@ ENGINE_API_EXPORT engine_result_t engine_set_sdl_renderer(
     engine_handle_t handle, void* sdl_renderer_ptr);
 
 /*
+ * Injects the host's SDL_GPUDevice into the engine's built-in SDL_GPU render
+ * backend (sdl3_gpu). The engine then records compositing operations onto a
+ * per-frame command buffer on this device (krkrz-style in-engine GPU
+ * rendering); presentation stays with the host. Pass NULL to detach.
+ *
+ * sdl_gpu_device_ptr: opaque pointer; interpreted as SDL_GPUDevice* by the
+ * engine. Returns ENGINE_RESULT_OK on success.
+ */
+ENGINE_API_EXPORT engine_result_t engine_set_sdl_gpu_device(
+    engine_handle_t handle, void* sdl_gpu_device_ptr);
+
+/*
+ * Submits the engine's pending SDL_GPU frame command buffer (if any). The
+ * host calls this before acquiring its swapchain texture so in-engine
+ * compositing commands are visible to the host present.
+ */
+ENGINE_API_EXPORT engine_result_t engine_submit_sdl_gpu_frame(
+    engine_handle_t handle);
+
+/*
  * Destroys textures the engine released since the previous call. The host
  * calls this after its present so a frame still being presented is never
  * destroyed mid-frame.

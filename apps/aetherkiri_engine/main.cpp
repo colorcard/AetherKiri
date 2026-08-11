@@ -30,10 +30,12 @@ constexpr uint32_t kDefaultSurfaceHeight = 480;
 struct ShellState {
     SDL_Window *window = nullptr;
     SDL_Renderer *renderer = nullptr;
+    SDL_GPUDevice *gpu_device = nullptr;
     engine_handle_t engine = nullptr;
 
     std::string game_path;
     bool use_gpu = true;
+    bool use_sdl3_gpu = false;
     uint32_t fps_limit = 0;
 
     std::string screenshot_path;
@@ -86,8 +88,11 @@ void ParseArgs(int argc, char *argv[]) {
             const std::string backend = argv[++i];
             if (backend == "software") {
                 g.use_gpu = false;
-            } else if (backend == "gpu_bridge" || backend == "sdl3_gpu") {
+            } else if (backend == "gpu_bridge") {
                 g.use_gpu = true;
+            } else if (backend == "sdl3_gpu") {
+                g.use_gpu = true;
+                g.use_sdl3_gpu = true;
             } else {
                 fprintf(stderr, "unknown --render-backend '%s'\n",
                         backend.c_str());
@@ -153,12 +158,35 @@ bool CreatePresentation() {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return false;
     }
-    g.renderer = SDL_CreateRenderer(g.window, nullptr);
-    if (g.renderer == nullptr) {
-        fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
-        return false;
+    if (g.use_sdl3_gpu) {
+        g.gpu_device = SDL_CreateGPUDevice(
+            SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_MSL, true,
+            nullptr);
+        if (g.gpu_device == nullptr) {
+            fprintf(stderr, "SDL_CreateGPUDevice failed: %s\n", SDL_GetError());
+            return false;
+        }
+        if (!SDL_ClaimWindowForGPUDevice(g.gpu_device, g.window)) {
+            fprintf(stderr, "SDL_ClaimWindowForGPUDevice failed: %s\n",
+                    SDL_GetError());
+            return false;
+        }
+        fprintf(stderr, "sdl3_gpu: SDL_GPUDevice created\n");
+        // Present uses the same SDL_Renderer readback path as software; the
+        // GPU compositing happens in-engine on the SDL_GPU device.
+        g.renderer = SDL_CreateRenderer(g.window, nullptr);
+        if (g.renderer == nullptr) {
+            fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+            return false;
+        }
+    } else {
+        g.renderer = SDL_CreateRenderer(g.window, nullptr);
+        if (g.renderer == nullptr) {
+            fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+            return false;
+        }
     }
-    if (!g.use_gpu) {
+    if (!g.use_gpu || g.use_sdl3_gpu) {
         g.screen = SDL_CreateTexture(
             g.renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
             static_cast<int>(g.surface_width),
@@ -188,11 +216,20 @@ bool StartupEngine() {
     engine_option_t option;
     std::memset(&option, 0, sizeof(option));
     option.key_utf8 = ENGINE_OPTION_RENDERER;
-    option.value_utf8 =
-        g.use_gpu ? ENGINE_RENDERER_GPU_BRIDGE : ENGINE_RENDERER_SOFTWARE;
+    option.value_utf8 = g.use_sdl3_gpu
+                            ? "sdl3_gpu"
+                            : (g.use_gpu ? ENGINE_RENDERER_GPU_BRIDGE
+                                         : ENGINE_RENDERER_SOFTWARE);
     engine_set_option(g.engine, &option);
 
-    if (g.use_gpu) {
+    if (g.use_sdl3_gpu) {
+        if (engine_set_sdl_gpu_device(g.engine, g.gpu_device) !=
+            ENGINE_RESULT_OK) {
+            fprintf(stderr, "engine_set_sdl_gpu_device failed\n");
+            return false;
+        }
+        fprintf(stderr, "sdl3_gpu: engine_set_sdl_gpu_device OK\n");
+    } else if (g.use_gpu) {
         // Inject the renderer: the engine creates/paints its own SDL
         // textures on it; the shell keeps presentation.
         if (engine_set_sdl_renderer(g.engine, g.renderer) != ENGINE_RESULT_OK) {
@@ -294,7 +331,7 @@ void TickShell(uint32_t delta_ms) {
         return;
     }
 
-    if (g.use_gpu) {
+    if (g.use_gpu && !g.use_sdl3_gpu) {
         uint64_t texture = 0;
         uint32_t width = 0;
         uint32_t height = 0;
@@ -309,6 +346,8 @@ void TickShell(uint32_t delta_ms) {
             g.gpu_frame_texture = 0;
         }
     } else {
+        // sdl3_gpu and software both present via CPU readback; sdl3_gpu
+        // performs compositing on the SDL_GPU device then reads back.
         UploadSoftwareFrame(frame_desc);
         g.surface_width = frame_desc.width;
         g.surface_height = frame_desc.height;
@@ -317,7 +356,7 @@ void TickShell(uint32_t delta_ms) {
     if (!g.screenshot_path.empty()) {
         ++g.frame_count_since_start;
         if (g.frame_count_since_start >= g.screenshot_after_frames) {
-            if (g.use_gpu) {
+            if (g.use_gpu && !g.use_sdl3_gpu) {
                 SaveGpuFramePpm();
             } else if (!g.frame_pixels.empty()) {
                 SavePpm(g.screenshot_path, g.frame_pixels.data(),
@@ -330,11 +369,14 @@ void TickShell(uint32_t delta_ms) {
 }
 
 void PresentShell() {
+    if (g.renderer == nullptr) {
+        return;
+    }
     SDL_SetRenderDrawColor(g.renderer, 0, 0, 0, 255);
     SDL_RenderClear(g.renderer);
 
     SDL_Texture *frame = nullptr;
-    if (g.use_gpu) {
+    if (g.use_gpu && !g.use_sdl3_gpu) {
         frame = reinterpret_cast<SDL_Texture *>(
             static_cast<uintptr_t>(g.gpu_frame_texture));
     } else {
@@ -443,6 +485,14 @@ void SDL_AppQuit(void *appstate, SDL_AppResult result) {
         engine_flush_released_textures(g.engine);
         engine_destroy(g.engine);
         g.engine = nullptr;
+    }
+    if (g.gpu_device != nullptr) {
+        // Detach the GPU device before tearing down the SDL_Renderer used for
+        // present so the engine's GPU resources are released while the device
+        // is still alive.
+        SDL_WaitForGPUIdle(g.gpu_device);
+        SDL_DestroyGPUDevice(g.gpu_device);
+        g.gpu_device = nullptr;
     }
     if (g.screen != nullptr) {
         SDL_DestroyTexture(g.screen);

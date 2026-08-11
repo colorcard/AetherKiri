@@ -1006,7 +1006,41 @@ engine_result_t engine_set_sdl_renderer(engine_handle_t public_handle,
                [&](engine_handle_t legacy) {
 #if defined(ENGINE_API_USE_KRKR2_RUNTIME)
                  return engine_legacy_set_sdl_renderer(legacy,
-                                                        sdl_renderer_ptr);
+                                                         sdl_renderer_ptr);
+#else
+                 (void)legacy;
+                 return ENGINE_RESULT_NOT_SUPPORTED;
+#endif
+               },
+               [&](DispatchHandle* handle) {
+                 (void)handle;
+                 return ENGINE_RESULT_NOT_SUPPORTED;
+               });
+}
+
+engine_result_t engine_set_sdl_gpu_device(engine_handle_t public_handle,
+                                          void* sdl_gpu_device_ptr) {
+  return Route(public_handle, "set_sdl_gpu_device",
+               [&](engine_handle_t legacy) {
+#if defined(ENGINE_API_USE_KRKR2_RUNTIME)
+                 return engine_legacy_set_sdl_gpu_device(legacy,
+                                                          sdl_gpu_device_ptr);
+#else
+                 (void)legacy;
+                 return ENGINE_RESULT_NOT_SUPPORTED;
+#endif
+               },
+               [&](DispatchHandle* handle) {
+                 (void)handle;
+                 return ENGINE_RESULT_NOT_SUPPORTED;
+               });
+}
+
+engine_result_t engine_submit_sdl_gpu_frame(engine_handle_t public_handle) {
+  return Route(public_handle, "submit_sdl_gpu_frame",
+               [&](engine_handle_t legacy) {
+#if defined(ENGINE_API_USE_KRKR2_RUNTIME)
+                 return engine_legacy_submit_sdl_gpu_frame(legacy);
 #else
                  (void)legacy;
                  return ENGINE_RESULT_NOT_SUPPORTED;

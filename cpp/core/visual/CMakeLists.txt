@@ -47,6 +47,7 @@ set(VISUAL_SOURCE_FILES
     ${VISUAL_PATH}/ogl/PVRTDecompress.cpp
 
     ${VISUAL_PATH}/sdl3/SdlRenderManager.cpp
+    ${VISUAL_PATH}/sdl3/SdlGpuRenderManager.cpp
 
     ${VISUAL_PATH}/impl/BasicDrawDevice.cpp
     ${VISUAL_PATH}/impl/BitmapBitsAlloc.cpp

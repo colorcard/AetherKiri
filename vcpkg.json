@@ -95,7 +95,8 @@
         "wayland",
         "x11",
         "ibus",
-        "alsa"
+        "alsa",
+        "vulkan"
       ]
     },
     "spdlog",

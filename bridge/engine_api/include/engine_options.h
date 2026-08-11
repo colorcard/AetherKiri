@@ -80,10 +80,12 @@
 #define ENGINE_RENDERER_GPU_BRIDGE        "gpu_bridge"
 #define ENGINE_RENDERER_DEBUG_CPU         "debug_cpu"
 #define ENGINE_RENDERER_SOFTWARE          "software"
+#define ENGINE_RENDERER_SDL3_GPU          "sdl3_gpu"
 
 #define ENGINE_RENDER_BACKEND_GODOT_NATIVE "GodotNative"
 #define ENGINE_RENDER_BACKEND_GPU_BRIDGE   "GpuBridge"
 #define ENGINE_RENDER_BACKEND_DEBUG_CPU    "DebugCpu"
+#define ENGINE_RENDER_BACKEND_SDL3_GPU     "Sdl3Gpu"
 
 #define ENGINE_MEMORY_PROFILE_BALANCED    "balanced"
 #define ENGINE_MEMORY_PROFILE_AGGRESSIVE  "aggressive"

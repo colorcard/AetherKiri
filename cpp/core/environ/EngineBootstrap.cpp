@@ -23,6 +23,7 @@
 void TVPInitUIExtension();
 
 extern void TVPForceRegisterSdlRenderManager();
+extern void TVPForceRegisterSdlGpuRenderManager();
 #if defined(KRKR_ENABLE_GPU_BRIDGE)
 extern void TVPForceRegisterOpenGLRenderManager();
 #endif
@@ -59,6 +60,7 @@ bool TVPEngineBootstrap::Initialize(uint32_t width, uint32_t height,
     spdlog::default_logger()->flush();
 
     TVPForceRegisterSdlRenderManager();
+    TVPForceRegisterSdlGpuRenderManager();
 #if defined(KRKR_ENABLE_GPU_BRIDGE)
     TVPForceRegisterOpenGLRenderManager();
 #endif
