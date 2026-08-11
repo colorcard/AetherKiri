@@ -49,6 +49,7 @@ struct HostState {
     uint32_t surface_height = kDefaultSurfaceHeight;
     uint32_t window_width = kDefaultSurfaceWidth;
     uint32_t window_height = kDefaultSurfaceHeight;
+    bool window_auto_sized = false;
 
     uint32_t frame_stride = 0;
     std::vector<uint8_t> frame_pixels;
@@ -260,8 +261,12 @@ void PresentGameTexture(HostState &state) {
     }
     if(frame == nullptr)
         return;
-    SDL_FRect dst{0.0f, 0.0f, static_cast<float>(state.window_width),
-                  static_cast<float>(state.window_height)};
+    const PresentationTransform viewport = CalculatePresentationTransform(
+        state.surface_width, state.surface_height,
+        static_cast<float>(state.window_width),
+        static_cast<float>(state.window_height));
+    SDL_FRect dst{viewport.offset_x, viewport.offset_y, viewport.width,
+                  viewport.height};
     SDL_RenderTexture(state.renderer, frame, nullptr, &dst);
 }
 
@@ -310,6 +315,9 @@ void TickEngine(HostState &state) {
 
     const auto tick_start = std::chrono::steady_clock::now();
     engine_tick(state.engine, delta_ms);
+    if(g_ui_state.settings.render_backend == "sdl3_gpu") {
+        engine_submit_sdl_gpu_frame(state.engine);
+    }
     const auto tick_end = std::chrono::steady_clock::now();
 
     engine_frame_desc_t frame_desc;
@@ -333,6 +341,25 @@ void TickEngine(HostState &state) {
         state.surface_height = frame_desc.height;
         engine_set_surface_size(state.engine, frame_desc.width,
                                 frame_desc.height);
+        if(!state.window_auto_sized && state.window != nullptr) {
+            SDL_Rect usable{};
+            const SDL_DisplayID display = SDL_GetDisplayForWindow(state.window);
+            if(display != 0 && SDL_GetDisplayUsableBounds(display, &usable)) {
+                const float scale = std::min(
+                    1.0f,
+                    std::min(usable.w * 0.9f / frame_desc.width,
+                             usable.h * 0.9f / frame_desc.height));
+                state.window_width = std::max(
+                    1u, static_cast<uint32_t>(frame_desc.width * scale));
+                state.window_height = std::max(
+                    1u, static_cast<uint32_t>(frame_desc.height * scale));
+                SDL_SetWindowSize(state.window, state.window_width,
+                                  state.window_height);
+                SDL_SetWindowPosition(state.window, SDL_WINDOWPOS_CENTERED,
+                                      SDL_WINDOWPOS_CENTERED);
+            }
+            state.window_auto_sized = true;
+        }
         if(state.screen != nullptr) {
             SDL_DestroyTexture(state.screen);
             state.screen = nullptr;
@@ -343,7 +370,7 @@ void TickEngine(HostState &state) {
             state.surface_height);
         if(state.screen != nullptr) {
             SDL_SetTextureScaleMode(state.screen, SDL_SCALEMODE_NEAREST);
-    SDL_SetTextureBlendMode(state.screen, SDL_BLENDMODE_NONE);
+            SDL_SetTextureBlendMode(state.screen, SDL_BLENDMODE_NONE);
         } else {
             fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
             state.exit_requested = true;
@@ -644,13 +671,12 @@ void PollInput(HostState &state) {
             io.WantCaptureKeyboard;
         if(state.engine != nullptr && state.startup_complete &&
            !capture_mouse && !capture_key) {
-            const float scale_x =
-                static_cast<float>(state.surface_width) /
-                static_cast<float>(state.window_width);
-            const float scale_y =
-                static_cast<float>(state.surface_height) /
-                static_cast<float>(state.window_height);
-            ForwardSdlEventToEngine(state.engine, &event, scale_x, scale_y);
+            const PresentationTransform viewport =
+                CalculatePresentationTransform(
+                    state.surface_width, state.surface_height,
+                    static_cast<float>(state.window_width),
+                    static_cast<float>(state.window_height));
+            ForwardSdlEventToEngine(state.engine, &event, viewport);
         }
     }
 }
@@ -1174,6 +1200,7 @@ void StopEngine(HostState &state) {
     state.gpu_frame_texture = 0;
     state.surface_width = kDefaultSurfaceWidth;
     state.surface_height = kDefaultSurfaceHeight;
+    state.window_auto_sized = false;
     state.last_frame_serial = 0;
     state.no_frame_since_ms = 0;
     state.screenshot_path.clear();

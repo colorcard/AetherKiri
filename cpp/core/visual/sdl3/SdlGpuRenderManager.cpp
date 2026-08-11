@@ -215,8 +215,7 @@ SdlGpuTexture2D::SdlGpuTexture2D(const void *pixel, int pitch, unsigned int w,
                         static_cast<size_t>(std::min(pitch_, src_pitch)));
         }
     }
-    cpu_dirty_ = true;
-    gpu_dirty_ = false;
+    authority_ = Authority::Cpu;
     RegisterLiveTexture(this);
 }
 
@@ -268,67 +267,22 @@ bool SdlGpuTexture2D::EnsureGpuTexture() {
         return false;
     }
     gpu_tex_ = tex;
-    gpu_dirty_ = false;
     return true;
 }
 
 void SdlGpuTexture2D::UploadCpuToGpu() {
-    if (!cpu_dirty_) return;
+    if (authority_ != Authority::Cpu) return;
     if (format_ != TVPTextureFormat::RGBA || pixels_.empty()) return;
     if (!EnsureGpuTexture()) return;
-    SDL_GPUDevice *dev = TVPGetSdlGpuDevice();
-    if (dev == nullptr) return;
-
-    SDL_GPUCommandBuffer *cmd = TVPGetSdlGpuFrameCommandBuffer();
-    if (cmd == nullptr) return;
-    SDL_GPUCopyPass *cp = TVPGetSdlGpuFrameCopyPass();
-    if (cp == nullptr) return;
-
     const uint32_t w = static_cast<uint32_t>(Width);
     const uint32_t h = static_cast<uint32_t>(Height);
-    const uint32_t tight_pitch = w * 4u;
-    SDL_GPUTransferBufferCreateInfo tb_info{};
-    tb_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
-    tb_info.size = static_cast<uint32_t>(pixels_.size());
-    SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(dev, &tb_info);
-    if (tb == nullptr) return;
-    void *mapped = SDL_MapGPUTransferBuffer(dev, tb, false);
-    if (mapped != nullptr) {
-        if (pitch_ == static_cast<int>(tight_pitch)) {
-            std::memcpy(mapped, pixels_.data(), pixels_.size());
-        } else {
-            auto *dst = static_cast<uint8_t *>(mapped);
-            for (uint32_t y = 0; y < h; ++y) {
-                std::memcpy(dst + static_cast<size_t>(y) * tight_pitch,
-                            pixels_.data() + static_cast<size_t>(y) * pitch_,
-                            tight_pitch);
-            }
-        }
-    }
-    SDL_UnmapGPUTransferBuffer(dev, tb);
-
-    SDL_GPUTextureTransferInfo src_info{};
-    src_info.transfer_buffer = tb;
-    src_info.offset = 0;
-    src_info.pixels_per_row = w;
-    src_info.rows_per_layer = h;
-    SDL_GPUTextureRegion dst_region{};
-    dst_region.texture = gpu_tex_;
-    dst_region.mip_level = 0;
-    dst_region.layer = 0;
-    dst_region.x = 0;
-    dst_region.y = 0;
-    dst_region.z = 0;
-    dst_region.w = w;
-    dst_region.h = h;
-    dst_region.d = 1;
-    SDL_UploadToGPUTexture(cp, &src_info, &dst_region, false);
-    SDL_ReleaseGPUTransferBuffer(dev, tb);
-    cpu_dirty_ = false;
+    if(TVPUploadSdlGpuTextureRgba(gpu_tex_, w, h, pixels_.data(), pitch_))
+        authority_ = Authority::Synchronized;
 }
 
 bool SdlGpuTexture2D::EnsureCpuReadable() {
-    if (cpu_dirty_) {
+    if (authority_ == Authority::Cpu ||
+        authority_ == Authority::Synchronized) {
         EnsureCpuStorage();
         return true;
     }
@@ -337,68 +291,35 @@ bool SdlGpuTexture2D::EnsureCpuReadable() {
         return true;
     }
     if (pixels_.size() == static_cast<size_t>(pitch_) * Height &&
-        !gpu_dirty_) {
+        authority_ != Authority::Gpu) {
         return true;
     }
-    // Synchronous readback: submit pending frame commands, download, wait.
-    SDL_GPUDevice *dev = TVPGetSdlGpuDevice();
-    if (dev == nullptr) return false;
-    TVPSubmitSdlGpuFrameAndWait();
-
     const uint32_t w = static_cast<uint32_t>(Width);
     const uint32_t h = static_cast<uint32_t>(Height);
     const uint32_t tight_pitch = w * 4u;
-    SDL_GPUTransferBufferCreateInfo tb_info{};
-    tb_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_DOWNLOAD;
-    tb_info.size = tight_pitch * h;
-    SDL_GPUTransferBuffer *tb = SDL_CreateGPUTransferBuffer(dev, &tb_info);
-    if (tb == nullptr) return false;
-    SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
-    SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
-    SDL_GPUTextureRegion src_region{};
-    src_region.texture = gpu_tex_;
-    src_region.mip_level = 0;
-    src_region.layer = 0;
-    src_region.x = 0;
-    src_region.y = 0;
-    src_region.z = 0;
-    src_region.w = w;
-    src_region.h = h;
-    src_region.d = 1;
-    SDL_GPUTextureTransferInfo dst_info{};
-    dst_info.transfer_buffer = tb;
-    dst_info.offset = 0;
-    dst_info.pixels_per_row = w;
-    dst_info.rows_per_layer = h;
-    SDL_DownloadFromGPUTexture(cp, &src_region, &dst_info);
-    SDL_EndGPUCopyPass(cp);
-    SDL_SubmitGPUCommandBuffer(cmd);
-    SDL_WaitForGPUIdle(dev);
-
     EnsureCpuStorage();
-    const void *mapped = SDL_MapGPUTransferBuffer(dev, tb, false);
-    if (mapped != nullptr) {
-        const auto *src = static_cast<const uint8_t *>(mapped);
-        if (pitch_ == static_cast<int>(tight_pitch)) {
-            std::memcpy(pixels_.data(), src, pixels_.size());
-        } else {
-            auto *dst = pixels_.data();
-            for (uint32_t y = 0; y < h; ++y) {
-                std::memcpy(dst + static_cast<size_t>(y) * pitch_,
-                            src + static_cast<size_t>(y) * tight_pitch,
-                            tight_pitch);
-            }
+    if (pitch_ == static_cast<int>(tight_pitch)) {
+        if(!TVPReadSdlGpuTextureRgba(gpu_tex_, w, h, pixels_.data(),
+                                    pixels_.size()))
+            return false;
+    } else {
+        std::vector<uint8_t> tight(static_cast<size_t>(tight_pitch) * h);
+        if(!TVPReadSdlGpuTextureRgba(gpu_tex_, w, h, tight.data(),
+                                    tight.size()))
+            return false;
+        for (uint32_t y = 0; y < h; ++y) {
+            std::memcpy(pixels_.data() + static_cast<size_t>(y) * pitch_,
+                        tight.data() + static_cast<size_t>(y) * tight_pitch,
+                        tight_pitch);
         }
     }
-    SDL_UnmapGPUTransferBuffer(dev, tb);
-    SDL_ReleaseGPUTransferBuffer(dev, tb);
-    gpu_dirty_ = false;
+    authority_ = Authority::Synchronized;
     return true;
 }
 
 const void *SdlGpuTexture2D::GetScanLineForRead(tjs_uint l) {
     if (static_cast<tjs_uint>(Height) <= l) return nullptr;
-    if (gpu_dirty_) EnsureCpuReadable();
+    if (authority_ == Authority::Gpu) EnsureCpuReadable();
     if (pixels_.empty()) EnsureCpuStorage();
     return pixels_.data() + static_cast<size_t>(l) * pitch_;
 }
@@ -407,18 +328,15 @@ void *SdlGpuTexture2D::GetScanLineForWrite(tjs_uint l) {
     if (static_cast<tjs_uint>(Height) <= l) return nullptr;
     // Any pending GPU draw to this texture must be flushed before CPU writes
     // so the CPU path becomes the new source of truth.
-    if (gpu_dirty_) {
-        TVPSubmitSdlGpuFrameAndWait();
-        gpu_dirty_ = false;
-    }
+    if (authority_ == Authority::Gpu && !EnsureCpuReadable()) return nullptr;
     if (pixels_.empty()) EnsureCpuStorage();
-    cpu_dirty_ = true;
+    authority_ = Authority::Cpu;
     return pixels_.data() + static_cast<size_t>(l) * pitch_;
 }
 
 uint32_t SdlGpuTexture2D::GetPoint(int x, int y) {
     if (x < 0 || y < 0 || x >= Width || y >= Height) return 0;
-    if (gpu_dirty_) EnsureCpuReadable();
+    if (authority_ == Authority::Gpu) EnsureCpuReadable();
     if (pixels_.empty()) EnsureCpuStorage();
     const uint8_t *p = pixels_.data() + static_cast<size_t>(y) * pitch_ +
                        static_cast<size_t>(x) * 4u;
@@ -429,10 +347,7 @@ uint32_t SdlGpuTexture2D::GetPoint(int x, int y) {
 
 void SdlGpuTexture2D::SetPoint(int x, int y, uint32_t clr) {
     if (x < 0 || y < 0 || x >= Width || y >= Height) return;
-    if (gpu_dirty_) {
-        TVPSubmitSdlGpuFrameAndWait();
-        gpu_dirty_ = false;
-    }
+    if (authority_ == Authority::Gpu && !EnsureCpuReadable()) return;
     if (pixels_.empty()) EnsureCpuStorage();
     uint8_t *p = pixels_.data() + static_cast<size_t>(y) * pitch_ +
                  static_cast<size_t>(x) * 4u;
@@ -440,8 +355,7 @@ void SdlGpuTexture2D::SetPoint(int x, int y, uint32_t clr) {
     p[1] = static_cast<uint8_t>(clr >> 8u);
     p[2] = static_cast<uint8_t>(clr >> 16u);
     p[3] = static_cast<uint8_t>(clr >> 24u);
-    cpu_dirty_ = true;
-    gpu_dirty_ = false;
+    authority_ = Authority::Cpu;
 }
 
 void SdlGpuTexture2D::Update(const void *pixel, TVPTextureFormat::e format,
@@ -456,10 +370,7 @@ void SdlGpuTexture2D::Update(const void *pixel, TVPTextureFormat::e format,
     const int right = std::min(Width, rc.right);
     const int bottom = std::min(Height, rc.bottom);
     if (left >= right || top >= bottom) return;
-    if (gpu_dirty_) {
-        TVPSubmitSdlGpuFrameAndWait();
-        gpu_dirty_ = false;
-    }
+    if (authority_ == Authority::Gpu && !EnsureCpuReadable()) return;
     if (pixels_.empty()) EnsureCpuStorage();
     const int src_pitch = pitch > 0 ? pitch : pitch_;
     const auto *src = static_cast<const uint8_t *>(pixel);
@@ -481,8 +392,7 @@ void SdlGpuTexture2D::Update(const void *pixel, TVPTextureFormat::e format,
                         static_cast<size_t>(width) * 4u);
         }
     }
-    cpu_dirty_ = true;
-    gpu_dirty_ = false;
+    authority_ = Authority::Cpu;
 }
 
 void SdlGpuTexture2D::SetSize(unsigned int w, unsigned int h) {
@@ -496,8 +406,7 @@ void SdlGpuTexture2D::SetSize(unsigned int w, unsigned int h) {
     Height = static_cast<tjs_int>(h);
     pitch_ = static_cast<int>(w) * BytesPerPixel(format_);
     EnsureCpuStorage();
-    cpu_dirty_ = true;
-    gpu_dirty_ = false;
+    authority_ = Authority::Cpu;
 }
 
 // --- pipeline/resource cache ----------------------------------------------
@@ -1307,13 +1216,23 @@ void SdlGpuRenderManager::OperateRect(iTVPRenderMethod *method,
 
     // FillARGB has no source texture.
     bool handled = false;
-    if (dst != nullptr && TVPIsSdlGpuActive() &&
+    static const bool disable_gpu_draws = []() {
+        const char *v = std::getenv("AETHERKIRI_SDL_GPU_DISABLE_DRAWS");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    if (disable_gpu_draws) {
+        handled = false;
+    } else if (dst != nullptr && TVPIsSdlGpuActive() &&
         method_name == "FillARGB") {
         // GPU fill via clear is not precise for sub-rects; route FillARGB to
         // the software delegate for now (it is rare on the hot path).
         handled = false;
     } else if (dst != nullptr && src != nullptr && dst->GpuTexture() != nullptr &&
                src->EnsureGpuTexture() && method_name != "FillARGB") {
+        // Fixed-function blending reads the existing render target. A prior
+        // software operation may have made the CPU copy authoritative, so
+        // synchronize both operands before recording the GPU draw.
+        dst->UploadCpuToGpu();
         src->UploadCpuToGpu();
         uint32_t mode = ModeForMethodName(method_name);
         // Debug: force all ops through the opaque Copy blend to isolate
@@ -1338,6 +1257,18 @@ void SdlGpuRenderManager::OperateRect(iTVPRenderMethod *method,
         SoftwareDelegate()->OperateRect(delegate_method, tar, reftar, rctar,
                                         textures);
         if (dst != nullptr) dst->MarkCpuDirty();
+    }
+    static const bool trace_methods = []() {
+        const char *v = std::getenv("AETHERKIRI_SDL_GPU_TRACE_METHODS");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    if(trace_methods) {
+        static std::unordered_set<std::string> seen;
+        const std::string key = method_name + (handled ? ":gpu" : ":software");
+        if(seen.insert(key).second) {
+            std::fprintf(stderr, "sdl3_gpu method %s path=%s\n",
+                         method_name.c_str(), handled ? "gpu" : "software");
+        }
     }
 }
 

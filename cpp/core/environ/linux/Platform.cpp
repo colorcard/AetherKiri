@@ -88,9 +88,16 @@ tjs_int TVPGetSystemFreeMemory() {
 
 tjs_int TVPGetSelfUsedMemory() {
     std::ifstream statm{ "/proc/self/statm" };
-    tjs_int pages = 0;
-    statm >> pages; // 第一个字段是总内存页数
-    return (pages * sysconf(_SC_PAGESIZE)) / (1024 * 1024); // 转换为 MB
+    uint64_t virtual_pages = 0;
+    uint64_t resident_pages = 0;
+    if(!(statm >> virtual_pages >> resident_pages))
+        return -1;
+    // statm's first field is virtual address space. Vulkan drivers reserve
+    // large address ranges there, so using it as process memory causes false
+    // multi-gigabyte pressure reports. The second field is resident pages.
+    return static_cast<tjs_int>(
+        (resident_pages * static_cast<uint64_t>(sysconf(_SC_PAGESIZE))) /
+        (1024ULL * 1024ULL));
 }
 
 std::string TVPGetPackageVersionString() { return "linux"; }

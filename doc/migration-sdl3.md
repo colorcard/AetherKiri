@@ -244,3 +244,16 @@ out/linux/debug/apps/sdl_host/aetherkiri_sdl --game demos/aetherkiri-test/data -
 - bridge/engine_api/include/engine_options.h（选项 key）
 - cpp/core/visual/godot/GodotGpuBridge.h（GPU 回调契约）
 - apps/godot_app/scripts/main.gd（输入/按键语义参考）
+
+## 11. SDL_GPU UI 壳比例与内存修复（2026-08-11）
+
+- standalone 与 UI 壳共用等比 `PresentationTransform`：首个真实帧按桌面可用区
+  自动定窗，resize 使用 letterbox/pillarbox，输入通过同一 viewport 逆变换。
+- `SdlGpuTexture2D` 改用显式 CPU/GPU authority 状态；CPU fallback 前先 readback，
+  后续 GPU blend 前同步 source 与 destination，避免两份纹理内容分叉。
+- SDL_GPU upload/download transfer buffer 按最大容量复用；upload 串行提交，避免
+  `cycle=true` 在资源密集场景为单帧保留大量 Vulkan backing allocation。
+- Linux 内存统计改读 `/proc/self/statm` resident 字段，不再把 Vulkan 虚拟地址空间
+  当成 RSS。
+- 验证：demo software/sdl3_gpu PPM SHA-256 相同；千恋万花 UI 壳 10 秒基准
+  56.8 fps，最大 RSS 约 954 MiB（修复前约 12 GiB），静态运行 RSS 保持稳定。

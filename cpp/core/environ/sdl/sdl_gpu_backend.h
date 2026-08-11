@@ -51,3 +51,6 @@ bool TVPIsSdlGpuActive();
 bool TVPReadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
                              uint32_t height, void *out_pixels,
                              size_t out_pixels_size);
+bool TVPUploadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
+                               uint32_t height, const void *pixels,
+                               uint32_t pitch);

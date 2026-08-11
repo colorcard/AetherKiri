@@ -49,6 +49,7 @@ struct ShellState {
     uint32_t surface_height = kDefaultSurfaceHeight;
     uint32_t window_width = kDefaultSurfaceWidth;
     uint32_t window_height = kDefaultSurfaceHeight;
+    bool window_auto_sized = false;
 
     uint64_t last_ticks = 0;
     uint64_t last_frame_serial = 0;
@@ -153,7 +154,8 @@ void SaveGpuFramePpm() {
 
 bool CreatePresentation() {
     g.window = SDL_CreateWindow("AetherKiri", static_cast<int>(g.window_width),
-                                static_cast<int>(g.window_height), 0);
+                                static_cast<int>(g.window_height),
+                                SDL_WINDOW_RESIZABLE);
     if (g.window == nullptr) {
         fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
         return false;
@@ -198,6 +200,29 @@ bool CreatePresentation() {
         SDL_SetTextureBlendMode(g.screen, SDL_BLENDMODE_NONE);
     }
     return true;
+}
+
+void AutoSizeWindowForSurface(uint32_t width, uint32_t height) {
+    if(g.window_auto_sized || g.window == nullptr || width == 0 || height == 0)
+        return;
+    SDL_DisplayID display = SDL_GetDisplayForWindow(g.window);
+    SDL_Rect usable{};
+    if(display == 0 || !SDL_GetDisplayUsableBounds(display, &usable)) {
+        g.window_auto_sized = true;
+        return;
+    }
+    const float max_w = static_cast<float>(usable.w) * 0.9f;
+    const float max_h = static_cast<float>(usable.h) * 0.9f;
+    const float scale = std::min(
+        1.0f, std::min(max_w / static_cast<float>(width),
+                       max_h / static_cast<float>(height)));
+    g.window_width = std::max(1u, static_cast<uint32_t>(width * scale));
+    g.window_height = std::max(1u, static_cast<uint32_t>(height * scale));
+    SDL_SetWindowSize(g.window, static_cast<int>(g.window_width),
+                      static_cast<int>(g.window_height));
+    SDL_SetWindowPosition(g.window, SDL_WINDOWPOS_CENTERED,
+                          SDL_WINDOWPOS_CENTERED);
+    g.window_auto_sized = true;
 }
 
 bool StartupEngine() {
@@ -272,8 +297,22 @@ void RunStartup() {
 }
 
 void UploadSoftwareFrame(const engine_frame_desc_t &frame_desc) {
-    if (g.screen == nullptr) {
+    if(g.renderer == nullptr) {
         return;
+    }
+    if(g.screen == nullptr || g.screen->w != static_cast<int>(frame_desc.width) ||
+       g.screen->h != static_cast<int>(frame_desc.height)) {
+        if(g.screen != nullptr) SDL_DestroyTexture(g.screen);
+        g.screen = SDL_CreateTexture(
+            g.renderer, SDL_PIXELFORMAT_ABGR8888,
+            SDL_TEXTUREACCESS_STREAMING, static_cast<int>(frame_desc.width),
+            static_cast<int>(frame_desc.height));
+        if(g.screen == nullptr) {
+            fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
+            return;
+        }
+        SDL_SetTextureScaleMode(g.screen, SDL_SCALEMODE_NEAREST);
+        SDL_SetTextureBlendMode(g.screen, SDL_BLENDMODE_NONE);
     }
     const size_t frame_bytes =
         static_cast<size_t>(frame_desc.stride_bytes) * frame_desc.height;
@@ -306,6 +345,11 @@ void UploadSoftwareFrame(const engine_frame_desc_t &frame_desc) {
 
 void TickShell(uint32_t delta_ms) {
     engine_tick(g.engine, delta_ms);
+    if(g.use_sdl3_gpu) {
+        // Finish every compositor command before the published texture is
+        // consumed by the swapchain command buffer below.
+        engine_submit_sdl_gpu_frame(g.engine);
+    }
 
     engine_frame_desc_t frame_desc;
     std::memset(&frame_desc, 0, sizeof(frame_desc));
@@ -372,6 +416,7 @@ void TickShell(uint32_t delta_ms) {
         g.surface_width = frame_desc.width;
         g.surface_height = frame_desc.height;
     }
+    AutoSizeWindowForSurface(g.surface_width, g.surface_height);
 
     if (!g.screenshot_path.empty()) {
         ++g.frame_count_since_start;
@@ -434,9 +479,15 @@ void PresentShell() {
             blit.destination.mip_level = 0;
             blit.destination.layer_or_depth_plane = 0;
             blit.destination.x = 0;
-            blit.destination.y = 0;
-            blit.destination.w = sw;
-            blit.destination.h = sh;
+            const PresentationTransform viewport =
+                CalculatePresentationTransform(g.surface_width,
+                                               g.surface_height,
+                                               static_cast<float>(sw),
+                                               static_cast<float>(sh));
+            blit.destination.x = static_cast<Uint32>(viewport.offset_x);
+            blit.destination.y = static_cast<Uint32>(viewport.offset_y);
+            blit.destination.w = static_cast<Uint32>(viewport.width);
+            blit.destination.h = static_cast<Uint32>(viewport.height);
             blit.load_op = SDL_GPU_LOADOP_CLEAR;
             blit.clear_color = (SDL_FColor){0, 0, 0, 1};
             blit.flip_mode = SDL_FLIP_NONE;
@@ -474,8 +525,12 @@ void PresentShell() {
     }
     // sdl3_gpu without a swapchain frame: nothing to present this tick.
     if (g.startup_complete && frame != nullptr && g.renderer != nullptr) {
-        SDL_FRect dst{0.0f, 0.0f, static_cast<float>(g.window_width),
-                      static_cast<float>(g.window_height)};
+        const PresentationTransform viewport = CalculatePresentationTransform(
+            g.surface_width, g.surface_height,
+            static_cast<float>(g.window_width),
+            static_cast<float>(g.window_height));
+        SDL_FRect dst{viewport.offset_x, viewport.offset_y, viewport.width,
+                      viewport.height};
         SDL_RenderTexture(g.renderer, frame, nullptr, &dst);
         SDL_RenderPresent(g.renderer);
     } else if (g.renderer != nullptr) {
@@ -527,13 +582,11 @@ SDL_AppResult SDL_AppEvent(void *appstate, SDL_Event *event) {
         return SDL_APP_SUCCESS;
     }
     if (g.engine != nullptr && g.startup_complete) {
-        const float scale_x =
-            static_cast<float>(g.surface_width) /
-            static_cast<float>(std::max(g.window_width, 1u));
-        const float scale_y =
-            static_cast<float>(g.surface_height) /
-            static_cast<float>(std::max(g.window_height, 1u));
-        ForwardSdlEventToEngine(g.engine, event, scale_x, scale_y);
+        const PresentationTransform viewport = CalculatePresentationTransform(
+            g.surface_width, g.surface_height,
+            static_cast<float>(g.window_width),
+            static_cast<float>(g.window_height));
+        ForwardSdlEventToEngine(g.engine, event, viewport);
     }
     return SDL_APP_CONTINUE;
 }

@@ -21,6 +21,12 @@
 
 class SdlGpuTexture2D final : public iTVPTexture2D {
 public:
+    enum class Authority : uint8_t {
+        Uninitialized,
+        Cpu,
+        Gpu,
+        Synchronized,
+    };
     SdlGpuTexture2D(const void *pixel, int pitch, unsigned int w,
                     unsigned int h, TVPTextureFormat::e format,
                     int create_flags = RENDER_CREATE_TEXTURE_FLAG_ANY);
@@ -46,11 +52,11 @@ public:
     bool EnsureGpuTexture();
     void UploadCpuToGpu();
     bool EnsureCpuReadable();
-    void MarkCpuDirty() { cpu_dirty_ = true; }
-    void MarkGpuDirty() { gpu_dirty_ = true; cpu_dirty_ = false; }
-    bool HasPendingGpu() const { return gpu_dirty_ && !cpu_dirty_; }
+    void MarkCpuDirty() { authority_ = Authority::Cpu; }
+    void MarkGpuDirty() { authority_ = Authority::Gpu; }
+    bool HasPendingGpu() const { return authority_ == Authority::Gpu; }
     bool RequiresGpuReadback() const {
-        return gpu_tex_ != nullptr && !cpu_dirty_ && pixels_.empty();
+        return gpu_tex_ != nullptr && authority_ == Authority::Gpu;
     }
     void SetOpacityKnown(bool opaque);
 
@@ -64,8 +70,7 @@ private:
     int pitch_ = 0;
     std::vector<uint8_t> pixels_;
     SDL_GPUTexture *gpu_tex_ = nullptr;
-    bool gpu_dirty_ = false;
-    bool cpu_dirty_ = false;
+    Authority authority_ = Authority::Uninitialized;
     bool opacity_known_ = false;
     bool opaque_ = false;
 };
