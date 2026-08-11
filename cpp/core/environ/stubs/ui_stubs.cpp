@@ -40,6 +40,8 @@
 #include "Application.h"
 #include "RenderManager.h"
 #include "sdl3/SdlRenderManager.h"
+#include "sdl3/SdlGpuRenderManager.h"
+#include "sdl_gpu_backend.h"
 #include "StorageImpl.h"
 #if defined(KRKR_ENABLE_GPU_BRIDGE)
 #include "krkr_egl_context.h"
@@ -68,6 +70,12 @@ uint64_t g_host_gpu_texture = 0;
 uint32_t g_host_gpu_width = 0;
 uint32_t g_host_gpu_height = 0;
 uint64_t g_host_gpu_serial = 0;
+// SDL_GPU frame slot (sdl3_gpu backend): holds the composited frame's
+// SDL_GPUTexture handle for zero-copy swapchain present.
+uint64_t g_host_gpu_texture_v2 = 0;
+uint32_t g_host_gpu_v2_width = 0;
+uint32_t g_host_gpu_v2_height = 0;
+uint64_t g_host_gpu_v2_serial = 0;
 uint32_t g_host_surface_width = 1920;
 uint32_t g_host_surface_height = 1080;
 bool g_host_prefer_gpu_frame = true;
@@ -650,6 +658,37 @@ void PublishHostGpuFrame(uint64_t texture, uint32_t width, uint32_t height) {
     g_host_frame_serial = g_host_gpu_serial;
 }
 
+// Publishes the composited frame as an SDL_GPUTexture handle (sdl3_gpu
+// backend). The host blits this into its swapchain for zero-copy present.
+void PublishHostGpuFrameSdl(uint64_t texture, uint32_t width, uint32_t height) {
+    std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+    g_host_gpu_texture_v2 = texture;
+    g_host_gpu_v2_width = width;
+    g_host_gpu_v2_height = height;
+    g_host_gpu_v2_serial += 1;
+    g_host_frame_rgba.clear();
+    g_host_frame_width = width;
+    g_host_frame_height = height;
+    g_host_frame_stride = width * 4u;
+    g_host_frame_serial = g_host_gpu_v2_serial;
+}
+
+extern "C" bool TVPHostGetLatestHostGpuFrameSdl(uint64_t *texture,
+                                                uint32_t *width,
+                                                uint32_t *height,
+                                                uint64_t *serial) {
+    std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+    if (g_host_gpu_texture_v2 == 0 || g_host_gpu_v2_width == 0 ||
+        g_host_gpu_v2_height == 0) {
+        return false;
+    }
+    if (texture) *texture = g_host_gpu_texture_v2;
+    if (width) *width = g_host_gpu_v2_width;
+    if (height) *height = g_host_gpu_v2_height;
+    if (serial) *serial = g_host_gpu_v2_serial;
+    return true;
+}
+
 void ApplyDrawDeviceSurfaceRect(iTVPDrawDevice *dd, const tTVPRect &rect,
                                 tjs_int surface_w, tjs_int surface_h) {
     if (dd == nullptr) return;
@@ -1036,6 +1075,24 @@ public:
         tTVPRect surface_rect(0, 0, surface_w, surface_h);
 
         if(g_host_prefer_gpu_frame && !HasHostVideoOverlayFrame()) {
+        // sdl3_gpu backend: publish the composited frame's SDL_GPUTexture so
+        // the host can blit it into the swapchain (zero-copy present).
+        if (auto *gpu_tex = dynamic_cast<SdlGpuTexture2D *>(tex);
+            gpu_tex != nullptr && TVPIsSdlGpuActive() &&
+            gpu_tex->GpuTexture() != nullptr) {
+            PublishHostGpuFrameSdl(
+                static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(gpu_tex->GpuTexture())),
+                static_cast<uint32_t>(tw), static_cast<uint32_t>(th));
+            auto *dd = owner_->GetDrawDevice();
+            if (!dd) return;
+            tTVPRect dest(0, 0, static_cast<tjs_int>(tw),
+                          static_cast<tjs_int>(th));
+            ApplyDrawDeviceSurfaceRect(dd, dest, dest.get_width(),
+                                       dest.get_height());
+            if (g_postDrawHook) g_postDrawHook();
+            return;
+        }
         if(auto *godot_tex = dynamic_cast<SDLTexture2D *>(tex);
            godot_tex != nullptr && godot_tex->EnsureGpuHandle() &&
            godot_tex->UploadCpuToGpu(false)) {

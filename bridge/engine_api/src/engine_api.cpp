@@ -66,6 +66,7 @@ void krkr_GetSurfaceDimensions(uint32_t*, uint32_t*);
 #include "environ/Platform.h"
 #include "environ/sdl/sdl_render_backend.h"
 #include "environ/sdl/sdl_gpu_backend.h"
+#include "visual/sdl3/SdlGpuRenderManager.h"
 #include "environ/EngineBootstrap.h"
 #include "environ/EngineLoop.h"
 #include "environ/MainScene.h"
@@ -135,6 +136,10 @@ extern "C" bool TVPHostGetLatestHostGpuFrame(uint64_t* texture,
                                                uint32_t* width,
                                                uint32_t* height,
                                                uint64_t* serial);
+extern "C" bool TVPHostGetLatestHostGpuFrameSdl(uint64_t* texture,
+                                                uint32_t* width,
+                                                uint32_t* height,
+                                                uint64_t* serial);
 extern "C" void TVPHostActivateMainWindow();
 extern "C" void TVPHostSetSurfaceSize(uint32_t width, uint32_t height);
 extern "C" void TVPHostSetPreferGpuFrame(bool prefer_gpu_frame);
@@ -2316,6 +2321,12 @@ engine_result_t engine_destroy(engine_handle_t handle) {
     TVPEngineApi_SetGlobalException("");
     g_runtime_started_once = false;
 
+    // Flush the engine's SDL_GPU released-texture queue while the injected
+    // SDL_GPUDevice is still alive (the host destroys it after engine_destroy).
+    TVPReleaseSdlGpuPipelines();
+    TVPFlushReleasedSdlGpuTextures();
+    TVPFlushReleasedSdlTextures();
+
     // Reset the bootstrap state so the next engine_create runs the full
     // runtime initialization (graphics backend, render manager registry,
     // UI extensions, locale) instead of silently skipping it.
@@ -3941,12 +3952,75 @@ static engine_result_t EngineGetGpuFrameTextureImpl(
   return ENGINE_RESULT_OK;
 }
 
+static engine_result_t EngineGetSdlGpuFrameTextureImpl(
+    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
+    uint32_t* out_height, uint64_t* out_frame_serial,
+    const char* api_name) {
+  if (out_texture_id == nullptr || out_width == nullptr ||
+      out_height == nullptr || out_frame_serial == nullptr) {
+    return SetThreadErrorAndReturn(
+        ENGINE_RESULT_INVALID_ARGUMENT,
+        "out_texture_id/out_width/out_height/out_frame_serial must be non-null");
+  }
+  *out_texture_id = 0;
+  *out_width = 0;
+  *out_height = 0;
+  *out_frame_serial = 0;
+
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  result = ValidateHandleThreadLocked(impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  if (impl->state != ToStateValue(EngineState::kOpened) &&
+      impl->state != ToStateValue(EngineState::kPaused)) {
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INVALID_STATE,
+        "engine_open_game must succeed before calling the SDL GPU frame API");
+  }
+
+  uint64_t texture = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint64_t serial = 0;
+  if (!TVPHostGetLatestHostGpuFrameSdl(&texture, &width, &height, &serial) ||
+      texture == 0 || width == 0 || height == 0) {
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_NOT_SUPPORTED,
+        "current frame is not backed by an SDL_GPU texture");
+  }
+
+  *out_texture_id = texture;
+  *out_width = width;
+  *out_height = height;
+  *out_frame_serial = serial;
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
 engine_result_t engine_get_gpu_frame_texture(
     engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
     uint32_t* out_height, uint64_t* out_frame_serial) {
   return EngineGetGpuFrameTextureImpl(handle, out_texture_id, out_width,
                                       out_height, out_frame_serial,
                                       "engine_get_gpu_frame_texture");
+}
+
+engine_result_t engine_get_sdl_gpu_frame_texture(
+    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
+    uint32_t* out_height, uint64_t* out_frame_serial) {
+  return EngineGetSdlGpuFrameTextureImpl(
+      handle, out_texture_id, out_width, out_height, out_frame_serial,
+      "engine_get_sdl_gpu_frame_texture");
 }
 
 engine_result_t engine_get_host_native_window(engine_handle_t handle,

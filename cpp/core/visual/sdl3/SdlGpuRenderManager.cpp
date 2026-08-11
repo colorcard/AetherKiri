@@ -1337,3 +1337,8 @@ public:
 }  // namespace
 
 void TVPForceRegisterSdlGpuRenderManager() {}
+
+// Releases the cached SDL_GPU pipelines/geometry. Called when the injected
+// SDL_GPUDevice is detached or the engine is destroyed (the device must still
+// be alive).
+void TVPReleaseSdlGpuPipelines() { ReleasePipelines(); }

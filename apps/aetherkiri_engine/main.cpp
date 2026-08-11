@@ -172,13 +172,8 @@ bool CreatePresentation() {
             return false;
         }
         fprintf(stderr, "sdl3_gpu: SDL_GPUDevice created\n");
-        // Present uses the same SDL_Renderer readback path as software; the
-        // GPU compositing happens in-engine on the SDL_GPU device.
-        g.renderer = SDL_CreateRenderer(g.window, nullptr);
-        if (g.renderer == nullptr) {
-            fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
-            return false;
-        }
+        // Swapchain present: no SDL_Renderer needed. g.renderer stays null;
+        // readback fallback (screenshots) uses the CPU frame path.
     } else {
         g.renderer = SDL_CreateRenderer(g.window, nullptr);
         if (g.renderer == nullptr) {
@@ -186,7 +181,9 @@ bool CreatePresentation() {
             return false;
         }
     }
-    if (!g.use_gpu || g.use_sdl3_gpu) {
+    if (g.use_sdl3_gpu) {
+        // Readback fallback only: no SDL streaming screen texture needed.
+    } else if (!g.use_gpu) {
         g.screen = SDL_CreateTexture(
             g.renderer, SDL_PIXELFORMAT_ABGR8888, SDL_TEXTUREACCESS_STREAMING,
             static_cast<int>(g.surface_width),
@@ -345,9 +342,30 @@ void TickShell(uint32_t delta_ms) {
         } else {
             g.gpu_frame_texture = 0;
         }
+    } else if (g.use_sdl3_gpu) {
+        // sdl3_gpu: try the zero-copy swapchain present path (engine publishes
+        // the composited SDL_GPUTexture); fall back to CPU readback if the
+        // frame is not yet GPU-backed.
+        uint64_t texture = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint64_t serial = 0;
+        if (engine_get_sdl_gpu_frame_texture(g.engine, &texture, &width,
+                                             &height, &serial) ==
+                ENGINE_RESULT_OK &&
+            texture != 0) {
+            g.gpu_frame_texture = texture;
+            g.surface_width = width;
+            g.surface_height = height;
+            g.frame_pixels.clear();
+        } else {
+            g.gpu_frame_texture = 0;
+            UploadSoftwareFrame(frame_desc);
+            g.surface_width = frame_desc.width;
+            g.surface_height = frame_desc.height;
+        }
     } else {
-        // sdl3_gpu and software both present via CPU readback; sdl3_gpu
-        // performs compositing on the SDL_GPU device then reads back.
+        // Software present via CPU readback.
         UploadSoftwareFrame(frame_desc);
         g.surface_width = frame_desc.width;
         g.surface_height = frame_desc.height;
@@ -356,11 +374,25 @@ void TickShell(uint32_t delta_ms) {
     if (!g.screenshot_path.empty()) {
         ++g.frame_count_since_start;
         if (g.frame_count_since_start >= g.screenshot_after_frames) {
-            if (g.use_gpu && !g.use_sdl3_gpu) {
+            if ((g.use_gpu && !g.use_sdl3_gpu) && g.gpu_frame_texture != 0) {
                 SaveGpuFramePpm();
-            } else if (!g.frame_pixels.empty()) {
-                SavePpm(g.screenshot_path, g.frame_pixels.data(),
-                        g.surface_width, g.surface_height, g.frame_stride);
+            } else {
+                // sdl3_gpu / software: screenshot via CPU readback.
+                engine_frame_desc_t shot_desc;
+                std::memset(&shot_desc, 0, sizeof(shot_desc));
+                shot_desc.struct_size = sizeof(shot_desc);
+                if (engine_get_frame_desc(g.engine, &shot_desc) ==
+                        ENGINE_RESULT_OK &&
+                    shot_desc.width > 0 && shot_desc.height > 0) {
+                    std::vector<uint8_t> px(static_cast<size_t>(
+                                                shot_desc.stride_bytes) *
+                                            shot_desc.height);
+                    if (engine_read_frame_rgba(g.engine, px.data(),
+                                               px.size()) == ENGINE_RESULT_OK) {
+                        SavePpm(g.screenshot_path, px.data(), shot_desc.width,
+                                shot_desc.height, shot_desc.stride_bytes);
+                    }
+                }
             }
             g.screenshot_path.clear();
             g.exit_requested = true;
@@ -369,6 +401,52 @@ void TickShell(uint32_t delta_ms) {
 }
 
 void PresentShell() {
+    if (g.use_sdl3_gpu && g.gpu_device != nullptr &&
+        g.gpu_frame_texture != 0) {
+        // Zero-copy swapchain present: blit the engine's composited
+        // SDL_GPUTexture into the swapchain and submit.
+        SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(g.gpu_device);
+        if (cmd == nullptr) {
+            fprintf(stderr, "AcquireGPUCommandBuffer: %s\n", SDL_GetError());
+            return;
+        }
+        SDL_GPUTexture *swap = nullptr;
+        Uint32 sw = 0, sh = 0;
+        if (!SDL_AcquireGPUSwapchainTexture(cmd, g.window, &swap, &sw, &sh)) {
+            fprintf(stderr, "AcquireGPUSwapchainTexture: %s\n", SDL_GetError());
+            SDL_SubmitGPUCommandBuffer(cmd);
+            return;
+        }
+        if (swap != nullptr) {
+            auto *frame = reinterpret_cast<SDL_GPUTexture *>(
+                static_cast<uintptr_t>(g.gpu_frame_texture));
+            SDL_GPUBlitInfo blit{};
+            blit.source.texture = frame;
+            blit.source.mip_level = 0;
+            blit.source.layer_or_depth_plane = 0;
+            blit.source.x = 0;
+            blit.source.y = 0;
+            blit.source.w = static_cast<Uint32>(g.surface_width);
+            blit.source.h = static_cast<Uint32>(g.surface_height);
+            blit.destination.texture = swap;
+            blit.destination.mip_level = 0;
+            blit.destination.layer_or_depth_plane = 0;
+            blit.destination.x = 0;
+            blit.destination.y = 0;
+            blit.destination.w = sw;
+            blit.destination.h = sh;
+            blit.load_op = SDL_GPU_LOADOP_CLEAR;
+            blit.clear_color = (SDL_FColor){0, 0, 0, 1};
+            blit.flip_mode = SDL_FLIP_NONE;
+            blit.filter = SDL_GPU_FILTER_NEAREST;
+            blit.cycle = false;
+            SDL_BlitGPUTexture(cmd, &blit);
+        }
+        if (!SDL_SubmitGPUCommandBuffer(cmd)) {
+            fprintf(stderr, "SubmitGPUCommandBuffer: %s\n", SDL_GetError());
+        }
+        return;
+    }
     if (g.renderer == nullptr) {
         return;
     }
@@ -379,15 +457,18 @@ void PresentShell() {
     if (g.use_gpu && !g.use_sdl3_gpu) {
         frame = reinterpret_cast<SDL_Texture *>(
             static_cast<uintptr_t>(g.gpu_frame_texture));
-    } else {
+    } else if (!g.use_sdl3_gpu) {
         frame = g.screen;
     }
-    if (g.startup_complete && frame != nullptr) {
+    // sdl3_gpu without a swapchain frame: nothing to present this tick.
+    if (g.startup_complete && frame != nullptr && g.renderer != nullptr) {
         SDL_FRect dst{0.0f, 0.0f, static_cast<float>(g.window_width),
                       static_cast<float>(g.window_height)};
         SDL_RenderTexture(g.renderer, frame, nullptr, &dst);
+        SDL_RenderPresent(g.renderer);
+    } else if (g.renderer != nullptr) {
+        SDL_RenderPresent(g.renderer);
     }
-    SDL_RenderPresent(g.renderer);
 
     // Destroy textures the engine released this frame only after the present
     // above no longer references them.

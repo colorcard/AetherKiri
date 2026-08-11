@@ -1088,6 +1088,26 @@ engine_result_t engine_get_gpu_frame_texture(
                });
 }
 
+engine_result_t engine_get_sdl_gpu_frame_texture(
+    engine_handle_t public_handle, uint64_t* out_texture_id,
+    uint32_t* out_width, uint32_t* out_height, uint64_t* out_frame_serial) {
+  return Route(public_handle, "get_sdl_gpu_frame_texture",
+               [&](engine_handle_t legacy) {
+#if defined(ENGINE_API_USE_KRKR2_RUNTIME)
+                 return engine_legacy_get_sdl_gpu_frame_texture(
+                     legacy, out_texture_id, out_width, out_height,
+                     out_frame_serial);
+#else
+                 (void)legacy;
+                 return ENGINE_RESULT_NOT_SUPPORTED;
+#endif
+               },
+               [&](DispatchHandle* handle) {
+                 (void)handle;
+                 return ENGINE_RESULT_NOT_SUPPORTED;
+               });
+}
+
 engine_result_t engine_get_host_native_window(engine_handle_t public_handle,
                                               void** out_window_handle) {
   return Route(public_handle, "get_host_native_window",

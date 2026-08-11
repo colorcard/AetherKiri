@@ -462,6 +462,16 @@ ENGINE_API_EXPORT engine_result_t engine_get_gpu_frame_texture(
     uint32_t* out_height, uint64_t* out_frame_serial);
 
 /*
+ * Gets the current frame descriptor when the sdl3_gpu backend is active. The
+ * returned handle is the composited frame's SDL_GPUTexture (opaque), for the
+ * host to blit into its swapchain (zero-copy present). Returns
+ * ENGINE_RESULT_NOT_SUPPORTED when no SDL_GPU frame is available.
+ */
+ENGINE_API_EXPORT engine_result_t engine_get_sdl_gpu_frame_texture(
+    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
+    uint32_t* out_height, uint64_t* out_frame_serial);
+
+/*
  * Gets host-native render window handle.
  * On macOS runtime build this is NSWindow*.
  * Returns ENGINE_RESULT_NOT_SUPPORTED on unsupported platforms/builds.
