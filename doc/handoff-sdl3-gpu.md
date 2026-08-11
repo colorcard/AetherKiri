@@ -10,14 +10,15 @@
 ## 1. 当前状况一句话
 
 sdl3_gpu 后端（SDL_GPU shader-pipeline GPU 合成）已完成并验证：demo 与 software
-渲染**逐像素 0.00% 一致**、千恋万花渲染画面正确，但**运行窗口全黑**（截图正常）。
-全黑根因已定位（见 §6）。
+渲染**逐像素 0.00% 一致**，`aetherkiri_engine` 已通过 swapchain 显示原生 GPU 帧，
+千恋万花 1920x1080 启动画面正确，退出无 Vulkan 子资源泄漏警告（见 §6）。
 
 ## 2. 已完成的工作（阶段 2 主线）
 
-### 2.1 六个已提交 commit（本地 main）
+### 2.1 七个已提交 commit（本地 main）
 
 ```
+57e1d7c5 fix(sdl3_gpu): present native frames and clean up GPU resources
 06424285 fix(sdl3_gpu): handle dst==src self-copy via scratch texture
 84956bd6 docs: record sdl3_gpu swapchain present + SDL_GPU shader layout pitfalls
 21ff6533 feat(sdl3_gpu): zero-copy swapchain present for the standalone engine shell
@@ -26,7 +27,7 @@ sdl3_gpu 后端（SDL_GPU shader-pipeline GPU 合成）已完成并验证：demo
 15e287e3 feat(sdl3_gpu): SDL_GPU shader-pipeline compositor backend (phase 2)
 ```
 
-工作区干净（无未提交改动）。未推送。
+tracked 工作区干净，存在未跟踪的本地字体、demo、存档与参考目录，均不得提交。未推送。
 
 ### 2.2 具体成果
 
@@ -111,9 +112,9 @@ export LD_LIBRARY_PATH=$PWD/out/linux/debug/vcpkg_installed/x64-linux/lib
   --render-backend sdl3_gpu --fps 0 --benchmark 8
 ```
 
-## 6. 当前阻塞问题：运行窗口全黑（重点）
+## 6. 已修复：运行窗口全黑与退出资源泄漏
 
-**现象**：
+**原现象**：
 - 千恋万花 / demo 用 `--render-backend sdl3_gpu` 运行，**窗口全黑**。
 - 但 `--screenshot` 生成的 PPM **内容正确**（截图走 `engine_read_frame_rgba`，
   读的是 CPU readback 帧，有内容）。
@@ -133,37 +134,35 @@ export LD_LIBRARY_PATH=$PWD/out/linux/debug/vcpkg_installed/x64-linux/lib
    （commit 21ff6533 改成 swapchain 专用）→ PresentShell 的 readback 分支
    `g.renderer == nullptr` 直接 return → **窗口什么都不画 → 全黑**。
 
-**修复方向（二选一，未实施）**：
-- **方案 A（推荐）**：让 sdl3_gpu 也发布 SDL_GPU 帧。改
-  `ShouldUseHostGpuFrameForRenderer` 对 `sdl3_gpu` 返回 true。确认 `UpdateDrawBuffer`
-  的 SdlGpuTexture2D 分支（`PublishHostGpuFrameSdl`）在 `TVPIsSdlGpuActive()` 时执行。
-  这样 `engine_get_sdl_gpu_frame_texture` 成功，swapchain present 生效（零拷贝）。
-  需验证 `PublishHostGpuFrameSdl` 的 SdlGpuTexture2D 分支条件正确（它要求
-  `dynamic_cast<SdlGpuTexture2D*>` 成功——sdl3_gpu 下最终合成纹理应是 SdlGpuTexture2D）。
-- **方案 B（稳妥兜底）**：sdl3_gpu 模式也创建 SDL_Renderer + g.screen，窗口走
-  readback present（牺牲性能但保证能显示）。当前 sdl_host 就是这种（readback）。
+**已实施修复**：
+- `ShouldUseHostGpuFrameForRenderer("sdl3_gpu")` 返回 true；SDL_GPU 发布路径移到
+  `KRKR_ENABLE_GPU_BRIDGE` 两个编译分支共用位置，并同步 hybrid CPU fallback 后的
+  最终纹理再发布。
+- `engine_read_frame_rgba` 在 CPU 帧缓存为空时按需下载已发布的 SDL_GPUTexture，
+  因此修复窗口后截图仍保持正确，正常 present 不发生 readback。
+- swapchain present 后刷新延迟纹理；退出时释放全部存活的 SdlGpuTexture2D、pipeline、
+  scratch 与延迟队列，清空全局 device；两个宿主在 DestroyGPUDevice 前 unclaim window。
 
-**验证修复**：修复后运行千恋万花，应看到 `source=gpu`（swapchain）且窗口有画面；
-demo 仍应 0.00% 像素一致。
+**验证结果**：demo 的 software/gpu_bridge/sdl3_gpu 三份 640x480 PPM SHA-256 完全
+相同（0/921600 通道差异）；千恋万花输出正确的 1920x1080 启动画面，日志显示
+`source=sdl_gpu` 与 `presenting native frame via swapchain`；demo、千恋万花及 sdl_host
+benchmark 退出均无 Vulkan validation 子资源泄漏。
 
 ## 7. 已知问题 / 待办
 
-1. **全黑（§6）**：当前阻塞项，优先修。
-2. **退出时 Vulkan 验证警告**：`VUID-vkDestroyDevice-device-05137`（设备销毁时
-   仍有 BUFFER 未释放，约 8 个固定 buffer）。不影响运行/画面，是 SDL_GPU 清理
-   瑕疵（怀疑是 SDL 内部 swapchain blit buffer 或 transfer buffer 异步释放）。
-   `engine_destroy` 已调 `TVPReleaseSdlGpuPipelines` + `TVPFlushReleasedSdlGpuTextures`。
-3. **`_d`（读目标）模式 GPU 化**：`DrawRectD` + `blend_d.frag` 已实现为参考但未启用。
+1. **`_d`（读目标）模式 GPU 化**：`DrawRectD` + `blend_d.frag` 已实现为参考但未启用。
    需全 GPU 合成管线（消除 GPU/CPU 目标内容分叉）才能像素一致启用。当前回退软件。
-4. **triangles / mask GPU 路径**：仍回退软件。
-5. **sdl_host 的 swapchain present**：sdl_host 用 ImGui + SDL_Renderer，swapchain
+2. **triangles / mask GPU 路径**：仍回退软件。
+3. **sdl_host 的 swapchain present**：sdl_host 用 ImGui + SDL_Renderer，swapchain
    present 需要 ImGui 改 SDL_GPU 后端（大工程）。当前 sdl_host 的 sdl3_gpu 走
    readback present（2421fps）。
-6. **benchmark 量化 swapchain present fps**：aetherkiri_engine 无 benchmark 命令，
+4. **benchmark 量化 swapchain present fps**：aetherkiri_engine 无 benchmark 命令，
    需加或临时脚本。
-7. **千恋万花截图后退出 SIGSEGV**：既有问题（软件/gpu_bridge 同样崩），NVIDIA GL
+5. **千恋万花截图后退出 SIGSEGV**：既有问题（软件/gpu_bridge 同样崩），NVIDIA GL
    驱动清理 bug，与 sdl3_gpu 无关。
-8. **推送**：6 个 commit 在本地 main，未 push。需要时 `git push fork main`（代理）。
+6. **BUILD_GPU_BRIDGE=ON 无 Godot 链接**：交叉编译能编译 SDL_GPU 改动，但最终
+   `engine_api` 链接存在既有 `TVPKrkrGLESCreateModuleObject` 重复定义，与本修复无关。
+7. **推送**：本地 main 未 push。需要时 `git push fork main`（代理）。
 
 ## 8. 环境备注
 
@@ -177,6 +176,6 @@ demo 仍应 0.00% 像素一致。
 
 ## 9. 交接给下一 AI 的建议起点
 
-1. 读本文档 §6 全黑根因，选方案 A 或 B 修复窗口显示。
-2. 修好后重跑 §5 的截图 + benchmark 验证（demo 0% 一致、千恋万花画面正常）。
-3. 再决定是否推进 §7 的 `_d` GPU 化 / triangles / sdl_host swapchain。
+1. 保持 §6 的 GPU 帧发布、按需 readback 与 teardown 生命周期回归测试。
+2. 修复 `BUILD_GPU_BRIDGE=ON` 无 Godot 构建的既有重复符号链接问题。
+3. 再决定是否推进 §7 的 `_d` GPU 化、triangles 或 sdl_host swapchain。

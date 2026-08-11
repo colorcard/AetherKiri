@@ -121,7 +121,9 @@ UI 壳 (aetherkiri_ui: ImGui Launcher/Overlay/诊断)   ── 可选
   这证明 GPU 合成（非 `_d`）完全正确。
 - **swapchain 零拷贝 present（aetherkiri_engine 已落地）**：`engine_get_sdl_gpu_frame_texture`
   发布合成帧的 SDL_GPUTexture，宿主 `SDL_BlitGPUTexture` 到 swapchain 直显（无 readback）。
-  截图走 `engine_read_frame_rgba`。千恋万花主菜单 87.8% 彩色正常。
+  截图通过 `engine_read_frame_rgba` 按需下载 GPU 纹理，不影响正常 present 热路径。
+  2026-08-11 修复 GPU 帧偏好与条件编译分支后，demo/software 截图 SHA-256 相同、
+  千恋万花 1920x1080 启动画面正确，日志确认 `source=sdl_gpu` 和 swapchain present。
 - **SDL3 升级 3.2.22 → 3.4.14**（vcpkg baseline 更新）：3.2.22 的 Vulkan backend 对
   自定义 fragment shader 的 descriptor set 布局要求不匹配（fragment 资源必须 set 2、
   fragment uniform set 3、vertex uniform set 1），导致离屏 render pass 无效。
@@ -141,8 +143,9 @@ UI 壳 (aetherkiri_ui: ImGui Launcher/Overlay/诊断)   ── 可选
   双 sampler）已实现为参考，但需全 GPU 合成管线（消除 GPU/CPU 目标内容分叉）才能
   像素一致启用。当前 `_d` 回退软件（0% 一致）。
 - **triangles / mask GPU 路径**（`SDL_RenderGeometry` 等价的 SDL_GPU 管线）。
-- **SDL_GPU 退出清理警告**：设备销毁时仍有 transfer buffer 未释放（验证层警告，
-  不影响运行），需在 teardown 完整 flush。
+- **SDL_GPU 退出清理（2026-08-11 完成）**：引擎销毁时统一释放仍存活的 GPU 纹理、
+  pipelines 和延迟队列并 detach device；宿主 unclaim swapchain 后再销毁 device。
+  demo、千恋万花和 sdl_host benchmark 退出均无 `VUID-vkDestroyDevice-device-05137`。
 - 软件路径 readback 最终移除（截图/诊断保留）。
 
 ### 阶段 3: 纹理导出 + UI 层接入（1-2 周）
