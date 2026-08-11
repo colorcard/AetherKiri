@@ -103,20 +103,42 @@ UI 壳 (aetherkiri_ui: ImGui Launcher/Overlay/诊断)   ── 可选
 - C ABI 增补：`engine_set_sdl_renderer`、`engine_flush_released_textures`、
   `engine_get_gpu_frame_texture`；移除 `engine_register_godot_gpu_bridge` 等回调表 API
 
-### 阶段 2: 渲染性能深化（后续，未启动）
+### 阶段 2: 渲染性能深化（进行中）
 
 原"SDL3 GPU 回调表"方案已废弃（D4 变更）。当前渲染：
 
 - **软件路径**：CPU 合成 → readback（保留，截图/诊断依赖）
 - **gpu_bridge**：引擎内嵌 SDL 纹理直写（ABGR8888 流式 + `SDL_LockTexture`），宿主
   `SDL_RenderTexture` 零拷贝直显（已落地）
+- **sdl3_gpu（2026-08-11 落地）**：SDL_GPU shader-pipeline 合成器。rect blend 操作
+  （Copy/AlphaBlend/PsScreen/PsAdd/PsSub/PsMul）记录到逐帧 SDL_GPU command buffer，
+  用自定义 SPIR-V pipeline 合成；`_d`（读目标）模式、triangles、mask 回退软件保证
+  像素一致。宿主注入 `SDL_GPUDevice`（`engine_set_sdl_gpu_device`）。
+
+关键结论（2026-08-11）：
+
+- **语义保真**：demo 逐像素 0.00% 差异（sdl3_gpu vs software），gpu_bridge 也 0%。
+  这证明 GPU 合成（非 `_d`）完全正确。
+- **SDL3 升级 3.2.22 → 3.4.14**（vcpkg baseline 更新）：3.2.22 的 Vulkan backend 对
+  自定义 fragment shader 的 descriptor set 布局要求不匹配（fragment 资源必须 set 2、
+  fragment uniform set 3、vertex uniform set 1），导致离屏 render pass 无效。
+- **benchmark 基线（demo, 2026-08-11 重测）**：
+  - software：2483 fps（tick 0.13ms，readback 0.02ms，upload 0.06ms）
+  - sdl3_gpu（readback present）：2421 fps（tick 0.14ms）
+  - gpu_bridge（零拷贝 present）：6787 fps（tick 0.00ms，无 upload）
+  - **结论：性能瓶颈是 present readback/upload，不是合成**。sdl3_gpu 下一步必须
+    实现 **swapchain 零拷贝 present**（AcquireGPUSwapchainTexture 直显），才能体现
+    GPU 合成价值。
 
 后续可深化项：
 
-- GPU 合成操作（blend/triangles/mask，当前返回 false 回退软件）——SDL TARGET 纹理
-  + `SDL_RenderGeometry` 实现非 PS 模式；PS 特效（SCREEN/MULTIPLY 等）需自定义管线
-- 软件路径 readback 最终移除（krkrz 式软件直写 SDL 纹理）
-- benchmark 对比基线：软件 1738fps / gpu_bridge 2325fps（引擎内嵌后重测）
+- **sdl3_gpu swapchain 零拷贝 present**（关键）：宿主 acquire swapchain → 引擎 GPU
+  帧纹理 blit 到 swapchain → submit。结合 GPU 合成应显著超越 gpu_bridge。
+- **`_d`（读目标）模式 GPU 化**：`DrawRectD` + `blend_d.frag`（scratch 复制 dst +
+  双 sampler）已实现为参考，但需全 GPU 合成管线（消除 GPU/CPU 目标内容分叉）才能
+  像素一致启用。
+- **triangles / mask GPU 路径**（`SDL_RenderGeometry` 等价的 SDL_GPU 管线）。
+- 软件路径 readback 最终移除（截图/诊断保留）。
 
 ### 阶段 3: 纹理导出 + UI 层接入（1-2 周）
 

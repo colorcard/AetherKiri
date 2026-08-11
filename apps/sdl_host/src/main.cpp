@@ -41,6 +41,7 @@ struct HostState {
     engine_handle_t engine = nullptr;
     SDL_Window *window = nullptr;
     SDL_Renderer *renderer = nullptr;
+    SDL_GPUDevice *gpu_device = nullptr;
     SDL_Texture *screen = nullptr;
     SDL_Texture *pixel_buffer = nullptr;
 
@@ -184,6 +185,21 @@ void UpdateWindowTitle(HostState &state) {
 }
 
 bool CreatePresentation(HostState &state) {
+    if(g_ui_state.settings.render_backend == "sdl3_gpu") {
+        state.gpu_device = SDL_CreateGPUDevice(
+            SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_MSL, true,
+            nullptr);
+        if(state.gpu_device == nullptr) {
+            fprintf(stderr, "SDL_CreateGPUDevice failed: %s\n", SDL_GetError());
+            return false;
+        }
+        if(!SDL_ClaimWindowForGPUDevice(state.gpu_device, state.window)) {
+            fprintf(stderr, "SDL_ClaimWindowForGPUDevice failed: %s\n",
+                    SDL_GetError());
+            return false;
+        }
+        fprintf(stderr, "[host] sdl3_gpu: SDL_GPUDevice created\n");
+    }
     state.renderer =
         SDL_CreateRenderer(state.window, nullptr);
     if(state.renderer == nullptr) {
@@ -204,6 +220,11 @@ bool CreatePresentation(HostState &state) {
 }
 
 void DestroyPresentation(HostState &state) {
+    if(state.gpu_device != nullptr) {
+        SDL_WaitForGPUIdle(state.gpu_device);
+        SDL_DestroyGPUDevice(state.gpu_device);
+        state.gpu_device = nullptr;
+    }
     if(state.screen != nullptr) {
         SDL_DestroyTexture(state.screen);
         state.screen = nullptr;
@@ -1175,14 +1196,30 @@ bool StartEngine(HostState &state, const std::string &base_dir,
     engine_option_t option;
     memset(&option, 0, sizeof(option));
     option.key_utf8 = ENGINE_OPTION_RENDERER;
+    const bool sdl3_gpu_backend =
+        g_ui_state.settings.render_backend == "sdl3_gpu";
     const bool gpu_backend =
         g_ui_state.settings.render_backend == "gpu_bridge" ||
-        g_ui_state.settings.render_backend == "sdl3_gpu";
-    option.value_utf8 =
-        gpu_backend ? ENGINE_RENDERER_GPU_BRIDGE : ENGINE_RENDERER_SOFTWARE;
+        sdl3_gpu_backend;
+    option.value_utf8 = sdl3_gpu_backend
+                            ? ENGINE_RENDERER_SDL3_GPU
+                            : (gpu_backend ? ENGINE_RENDERER_GPU_BRIDGE
+                                           : ENGINE_RENDERER_SOFTWARE);
     engine_set_option(state.engine, &option);
-    state.use_gpu_present = gpu_backend;
-    if(gpu_backend) {
+    // sdl3_gpu presents via CPU readback (SDL_GPU textures are not host
+    // presentable through the SDL_Renderer path).
+    state.use_gpu_present = gpu_backend && !sdl3_gpu_backend;
+    if(sdl3_gpu_backend) {
+        if(engine_set_sdl_gpu_device(state.engine, state.gpu_device) !=
+           ENGINE_RESULT_OK) {
+            fprintf(stderr, "[host] engine_set_sdl_gpu_device failed; "
+                            "falling back to software path\n");
+            state.use_gpu_present = false;
+        } else {
+            fprintf(stderr, "[host] render backend: sdl3_gpu (in-engine "
+                            "SDL_GPU compositor, readback present)\n");
+        }
+    } else if(gpu_backend) {
         // The engine's built-in SDL3 render backend creates its own
         // textures on the injected renderer; the host keeps presentation.
         if(engine_set_sdl_renderer(state.engine, state.renderer) !=
