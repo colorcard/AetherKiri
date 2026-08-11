@@ -19,6 +19,7 @@
 #include "shaders/quad.frag.spv.h"
 #include "shaders/fill.vert.spv.h"
 #include "shaders/fill.frag.spv.h"
+#include "shaders/blend_d.frag.spv.h"
 
 namespace {
 
@@ -60,11 +61,16 @@ struct GpuPipelines {
     SDL_GPUShader *quad_fs = nullptr;
     SDL_GPUShader *fill_vs = nullptr;
     SDL_GPUShader *fill_fs = nullptr;
+    SDL_GPUShader *blend_d_fs = nullptr;
     SDL_GPUSampler *sampler = nullptr;
     SDL_GPUBuffer *quad_vb = nullptr;
     SDL_GPUBuffer *quad_ib = nullptr;
     std::unordered_map<uint32_t, SDL_GPUGraphicsPipeline *> rect_pipes;
     std::unordered_map<uint32_t, SDL_GPUGraphicsPipeline *> fill_pipes;
+    SDL_GPUGraphicsPipeline *blend_d_pipe = nullptr;
+    SDL_GPUTexture *scratch = nullptr;
+    int scratch_w = 0;
+    int scratch_h = 0;
 };
 
 GpuPipelines *g_pipelines = nullptr;
@@ -516,8 +522,11 @@ GpuPipelines *EnsurePipelines() {
                               fill_vert_spv, fill_vert_spv_size, 0, 1);
     p->fill_fs = CreateShader(dev, SDL_GPU_SHADERSTAGE_FRAGMENT,
                               fill_frag_spv, fill_frag_spv_size, 0, 1);
+    p->blend_d_fs = CreateShader(dev, SDL_GPU_SHADERSTAGE_FRAGMENT,
+                                blend_d_frag_spv, blend_d_frag_spv_size, 2, 1);
     if (p->quad_vs == nullptr || p->quad_fs == nullptr ||
-        p->fill_vs == nullptr || p->fill_fs == nullptr) {
+        p->fill_vs == nullptr || p->fill_fs == nullptr ||
+        p->blend_d_fs == nullptr) {
         delete p;
         return nullptr;
     }
@@ -699,6 +708,94 @@ SDL_GPUGraphicsPipeline *GetFillPipeline(GpuPipelines *p, bool *ok) {
     return pipe;
 }
 
+// Creates the pipeline used by destination-read (_d) blend modes. The
+// fragment shader samples both the source and the destination (via a scratch
+// copy) and computes the final color entirely in the shader, so the color
+// target blend state is NONE.
+SDL_GPUGraphicsPipeline *GetBlendDPipeline(GpuPipelines *p, bool *ok) {
+    if (p->blend_d_pipe != nullptr) {
+        *ok = true;
+        return p->blend_d_pipe;
+    }
+    SDL_GPUVertexBufferDescription vdesc[1] = {{
+        .slot = 0,
+        .pitch = sizeof(QuadVertex),
+        .input_rate = SDL_GPU_VERTEXINPUTRATE_VERTEX,
+        .instance_step_rate = 0,
+    }};
+    SDL_GPUVertexAttribute vattr[2] = {
+        {.location = 0, .buffer_slot = 0,
+         .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 0},
+        {.location = 1, .buffer_slot = 0,
+         .format = SDL_GPU_VERTEXELEMENTFORMAT_FLOAT2, .offset = 8},
+    };
+    SDL_GPUColorTargetDescription color_target{};
+    color_target.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    color_target.blend_state.enable_blend = false;
+    color_target.blend_state.enable_color_write_mask = false;
+
+    SDL_GPUGraphicsPipelineCreateInfo pipe_info{};
+    pipe_info.vertex_shader = p->quad_vs;
+    pipe_info.fragment_shader = p->blend_d_fs;
+    pipe_info.vertex_input_state.vertex_buffer_descriptions = vdesc;
+    pipe_info.vertex_input_state.num_vertex_buffers = 1;
+    pipe_info.vertex_input_state.vertex_attributes = vattr;
+    pipe_info.vertex_input_state.num_vertex_attributes = 2;
+    pipe_info.primitive_type = SDL_GPU_PRIMITIVETYPE_TRIANGLELIST;
+    pipe_info.rasterizer_state.fill_mode = SDL_GPU_FILLMODE_FILL;
+    pipe_info.rasterizer_state.cull_mode = SDL_GPU_CULLMODE_NONE;
+    pipe_info.rasterizer_state.front_face = SDL_GPU_FRONTFACE_COUNTER_CLOCKWISE;
+    pipe_info.rasterizer_state.enable_depth_bias = false;
+    pipe_info.rasterizer_state.enable_depth_clip = false;
+    pipe_info.multisample_state.sample_count = SDL_GPU_SAMPLECOUNT_1;
+    pipe_info.multisample_state.sample_mask = 0;
+    pipe_info.multisample_state.enable_mask = false;
+    pipe_info.depth_stencil_state.enable_depth_test = false;
+    pipe_info.depth_stencil_state.enable_depth_write = false;
+    pipe_info.depth_stencil_state.enable_stencil_test = false;
+    pipe_info.target_info.color_target_descriptions = &color_target;
+    pipe_info.target_info.num_color_targets = 1;
+    pipe_info.target_info.has_depth_stencil_target = false;
+
+    SDL_GPUGraphicsPipeline *pipe =
+        SDL_CreateGPUGraphicsPipeline(TVPGetSdlGpuDevice(), &pipe_info);
+    if (pipe == nullptr) {
+        *ok = false;
+        return nullptr;
+    }
+    p->blend_d_pipe = pipe;
+    *ok = true;
+    return pipe;
+}
+
+// Ensures the scratch texture used to hold a copy of the destination for _d
+// blend modes is sized to at least (w, h) and returns it.
+SDL_GPUTexture *EnsureScratch(GpuPipelines *p, int w, int h) {
+    SDL_GPUDevice *dev = TVPGetSdlGpuDevice();
+    if (dev == nullptr) return nullptr;
+    if (p->scratch != nullptr && p->scratch_w >= w && p->scratch_h >= h) {
+        return p->scratch;
+    }
+    if (p->scratch != nullptr) {
+        SDL_ReleaseGPUTexture(dev, p->scratch);
+        p->scratch = nullptr;
+    }
+    SDL_GPUTextureCreateInfo info{};
+    info.type = SDL_GPU_TEXTURETYPE_2D;
+    info.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+    info.width = static_cast<Uint32>(std::max(w, 1));
+    info.height = static_cast<Uint32>(std::max(h, 1));
+    info.layer_count_or_depth = 1;
+    info.num_levels = 1;
+    info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
+    p->scratch = SDL_CreateGPUTexture(dev, &info);
+    if (p->scratch != nullptr) {
+        p->scratch_w = std::max(w, 1);
+        p->scratch_h = std::max(h, 1);
+    }
+    return p->scratch;
+}
+
 void ReleasePipelines() {
     SDL_GPUDevice *dev = TVPGetSdlGpuDevice();
     if (g_pipelines == nullptr) return;
@@ -707,13 +804,16 @@ void ReleasePipelines() {
     if (dev != nullptr) {
         for (auto &kv : p->rect_pipes) SDL_ReleaseGPUGraphicsPipeline(dev, kv.second);
         for (auto &kv : p->fill_pipes) SDL_ReleaseGPUGraphicsPipeline(dev, kv.second);
+        if (p->blend_d_pipe) SDL_ReleaseGPUGraphicsPipeline(dev, p->blend_d_pipe);
         if (p->quad_vs) SDL_ReleaseGPUShader(dev, p->quad_vs);
         if (p->quad_fs) SDL_ReleaseGPUShader(dev, p->quad_fs);
         if (p->fill_vs) SDL_ReleaseGPUShader(dev, p->fill_vs);
         if (p->fill_fs) SDL_ReleaseGPUShader(dev, p->fill_fs);
+        if (p->blend_d_fs) SDL_ReleaseGPUShader(dev, p->blend_d_fs);
         if (p->sampler) SDL_ReleaseGPUSampler(dev, p->sampler);
         if (p->quad_vb) SDL_ReleaseGPUBuffer(dev, p->quad_vb);
         if (p->quad_ib) SDL_ReleaseGPUBuffer(dev, p->quad_ib);
+        if (p->scratch) SDL_ReleaseGPUTexture(dev, p->scratch);
     }
     delete p;
 }
@@ -879,14 +979,28 @@ uint32_t ModeForMethodName(const std::string &name) {
     if (name == "Copy" || name == "CopyOpaqueImage") return TVP_GODOT_GPU_BLEND_COPY_RGBA;
     if (name == "CopyColor") return TVP_GODOT_GPU_BLEND_COPY_COLOR;
     if (name == "AlphaBlend") return TVP_GODOT_GPU_BLEND_ALPHA;
-    // AlphaBlend_d and other _d (destination-read) modes require reading the
-    // destination in the shader; the fixed-function blend state cannot express
-    // them. Fall back to software until a target-as-src shader path lands.
     if (name == "PsScreenBlend") return TVP_GODOT_GPU_BLEND_PS_SCREEN;
     if (name == "PsAddBlend") return TVP_GODOT_GPU_BLEND_PS_ADD;
     if (name == "PsSubBlend") return TVP_GODOT_GPU_BLEND_PS_SUBTRACT;
     if (name == "PsMulBlend") return TVP_GODOT_GPU_BLEND_PS_MULTIPLY;
     return 0;
+}
+
+bool IsDestinationReadMode(uint32_t mode) {
+    switch (mode) {
+        case TVP_GODOT_GPU_BLEND_ALPHA_D:
+            // Destination-read (_d) modes read the destination inside the
+            // fragment shader (dst.rgb = mix(dst, src, srcA/outA)). The
+            // fixed-function blend state cannot express this, and a shader
+            // reading a copy of the destination diverges from the software
+            // delegate once GPU and CPU dst content split across incremental
+            // composites. Fall back to the software delegate so results stay
+            // pixel-identical; a full GPU-only composite pipeline is the
+            // follow-up.
+            return true;
+        default:
+            return false;
+    }
 }
 }  // namespace
 
@@ -988,6 +1102,138 @@ bool SdlGpuRenderManager::DrawRect(SdlGpuTexture2D *dst,
     return true;
 }
 
+// Destination-read (_d) blend: the fragment shader samples the source and a
+// copy of the destination and computes the blended color in-shader. The
+// destination must be copied to a scratch texture first because a render pass
+// color target cannot also be sampled.
+//
+// NOTE: not currently dispatched from OperateRect (destination-read modes
+// fall back to the software delegate for pixel-identical output). This stays
+// as the reference implementation for a future full-GPU composite pipeline.
+bool SdlGpuRenderManager::DrawRectD(SdlGpuTexture2D *dst,
+                                    const tTVPRect &rctar,
+                                    const char *method_name, uint32_t mode,
+                                    int opacity, uint32_t color,
+                                    SDL_GPUTexture *src,
+                                    const tTVPRect &src_rc, int src_w,
+                                    int src_h) {
+    if (dst == nullptr || src == nullptr) return false;
+    if (!TVPIsSdlGpuActive()) return false;
+    if (rctar.is_empty()) return true;
+    GpuPipelines *p = EnsurePipelines();
+    if (p == nullptr) return false;
+    dst->UploadCpuToGpu();
+    if (!dst->EnsureGpuTexture()) return false;
+    if (mode == 0) return false;
+
+    bool ok = false;
+    SDL_GPUGraphicsPipeline *pipe = GetBlendDPipeline(p, &ok);
+    if (!ok || pipe == nullptr) return false;
+
+    SDL_GPUCommandBuffer *cmd = TVPGetSdlGpuFrameCommandBuffer();
+    if (cmd == nullptr) return false;
+
+    // Copy the destination to the scratch texture. Use a copy pass; the
+    // backend ensures any open render pass is ended first.
+    SDL_GPUCommandBuffer *save_cmd = cmd;
+    SDL_GPUTexture *scratch =
+        EnsureScratch(p, dst->GetWidth(), dst->GetHeight());
+    if (scratch == nullptr) return false;
+    TVPEnsureSdlGpuRenderPassReady();
+    SDL_GPUCopyPass *cp = TVPGetSdlGpuFrameCopyPass();
+    if (cp == nullptr) return false;
+    SDL_GPUTextureLocation src_loc{};
+    src_loc.texture = dst->GpuTexture();
+    src_loc.mip_level = 0;
+    src_loc.layer = 0;
+    src_loc.x = 0;
+    src_loc.y = 0;
+    src_loc.z = 0;
+    SDL_GPUTextureLocation dst_loc{};
+    dst_loc.texture = scratch;
+    dst_loc.mip_level = 0;
+    dst_loc.layer = 0;
+    dst_loc.x = 0;
+    dst_loc.y = 0;
+    dst_loc.z = 0;
+    const Uint32 copy_w = static_cast<Uint32>(dst->GetWidth());
+    const Uint32 copy_h = static_cast<Uint32>(dst->GetHeight());
+    SDL_CopyGPUTextureToTexture(cp, &src_loc, &dst_loc, copy_w, copy_h, 1,
+                                false);
+
+    // Now the render pass to dst, sampling both src and the scratch.
+    TVPEnsureSdlGpuRenderPassReady();
+    SDL_GPUColorTargetInfo tgt{};
+    tgt.texture = dst->GpuTexture();
+    tgt.mip_level = 0;
+    tgt.layer_or_depth_plane = 0;
+    tgt.clear_color = (SDL_FColor){0, 0, 0, 1};
+    tgt.load_op = SDL_GPU_LOADOP_LOAD;
+    tgt.store_op = SDL_GPU_STOREOP_STORE;
+    SDL_GPURenderPass *rp = SDL_BeginGPURenderPass(save_cmd, &tgt, 1, nullptr);
+    if (rp == nullptr) return false;
+
+    SDL_BindGPUGraphicsPipeline(rp, pipe);
+    SDL_GPUBufferBinding vbind{};
+    vbind.buffer = p->quad_vb;
+    vbind.offset = 0;
+    SDL_BindGPUVertexBuffers(rp, 0, &vbind, 1);
+    SDL_GPUBufferBinding ibind{};
+    ibind.buffer = p->quad_ib;
+    ibind.offset = 0;
+    SDL_BindGPUIndexBuffer(rp, &ibind, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+
+    // src at binding 0, dst-scratch at binding 1.
+    SDL_GPUTextureSamplerBinding sampler_binds[2] = {
+        {.texture = src, .sampler = p->sampler},
+        {.texture = scratch, .sampler = p->sampler},
+    };
+    SDL_BindGPUFragmentSamplers(rp, 0, sampler_binds, 2);
+
+    // Vertex uniform: dst rect, viewport, src uv rect.
+    const float viewport_w = static_cast<float>(dst->GetWidth());
+    const float viewport_h = static_cast<float>(dst->GetHeight());
+    const float src_w_f = static_cast<float>(std::max(src_w, 1));
+    const float src_h_f = static_cast<float>(std::max(src_h, 1));
+    const float src_uv_x = static_cast<float>(src_rc.left) / src_w_f;
+    const float src_uv_y = static_cast<float>(src_rc.top) / src_h_f;
+    const float src_uv_w = static_cast<float>(src_rc.get_width()) / src_w_f;
+    const float src_uv_h = static_cast<float>(src_rc.get_height()) / src_h_f;
+    const float vparams[10] = {
+        static_cast<float>(rctar.left), static_cast<float>(rctar.top),
+        static_cast<float>(rctar.get_width()),
+        static_cast<float>(rctar.get_height()),
+        viewport_w, viewport_h,
+        src_uv_x, src_uv_y,
+        src_uv_w, src_uv_h};
+    SDL_PushGPUVertexUniformData(save_cmd, 0, vparams, sizeof(vparams));
+
+    // Fragment uniform: tint color + opacity. Color is AARRGGBB; a value of 0
+    // means no tint (white).
+    const float a = static_cast<float>(opacity) / 255.0f;
+    const uint32_t tint = color != 0 ? color : 0xffffffffu;
+    const float fr = ((tint >> 16u) & 0xffu) / 255.0f;
+    const float fg = ((tint >> 8u) & 0xffu) / 255.0f;
+    const float fb = ((tint >> 0u) & 0xffu) / 255.0f;
+    const float fparams[4] = {fr, fg, fb, a};
+    SDL_PushGPUFragmentUniformData(save_cmd, 0, fparams, sizeof(fparams));
+
+    SDL_GPUViewport vp{};
+    vp.x = 0;
+    vp.y = 0;
+    vp.w = viewport_w;
+    vp.h = viewport_h;
+    vp.min_depth = 0;
+    vp.max_depth = 1;
+    SDL_SetGPUViewport(rp, &vp);
+
+    SDL_DrawGPUIndexedPrimitives(rp, 6, 1, 0, 0, 0);
+    SDL_EndGPURenderPass(rp);
+
+    dst->MarkGpuDirty();
+    return true;
+}
+
 void SdlGpuRenderManager::OperateRect(iTVPRenderMethod *method,
                                        iTVPTexture2D *tar,
                                        iTVPTexture2D *reftar,
@@ -1030,6 +1276,8 @@ void SdlGpuRenderManager::OperateRect(iTVPRenderMethod *method,
             godot_method != nullptr ? godot_method->Opacity() : 255;
         const uint32_t color =
             godot_method != nullptr ? godot_method->Color() : 0;
+        // _d modes resolve to mode==0 and fall back to the software delegate
+        // below (pixel-identical, see IsDestinationReadMode).
         handled = DrawRect(dst, rctar, method_name.c_str(), mode, opacity,
                            color, src->GpuTexture(), src_rc,
                            src->GetWidth(), src->GetHeight());

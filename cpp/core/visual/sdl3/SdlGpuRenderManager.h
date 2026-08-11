@@ -118,6 +118,10 @@ private:
                   const char *method_name, uint32_t mode, int opacity,
                   uint32_t color, SDL_GPUTexture *src,
                   const tTVPRect &src_rc, int src_w, int src_h);
+    bool DrawRectD(SdlGpuTexture2D *dst, const tTVPRect &rctar,
+                   const char *method_name, uint32_t mode, int opacity,
+                   uint32_t color, SDL_GPUTexture *src,
+                   const tTVPRect &src_rc, int src_w, int src_h);
 
     iTVPRenderManager *software_delegate_ = nullptr;
     std::unordered_map<uint32_t, SDLRenderMethod *> method_wrappers_;
