@@ -31,12 +31,121 @@
 #include "LayerTreeOwner.h"
 #include "WindowIntf.h"
 #include "EngineLoop.h"
+#include "RenderManager.h"
 #include "spdlog/spdlog.h"
 
 #include <cctype>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <string>
+#include <string_view>
 
 namespace {
+std::string TVPJsonEscape(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for(const unsigned char ch : value) {
+        switch(ch) {
+            case '"': escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if(ch < 0x20) {
+                    char buffer[7];
+                    std::snprintf(buffer, sizeof(buffer), "\\u%04x", ch);
+                    escaped += buffer;
+                } else {
+                    escaped.push_back(static_cast<char>(ch));
+                }
+        }
+    }
+    return escaped;
+}
+
+bool TVPLayerSnapshotSelectFrame(tjs_uint64 frame) {
+    const char *selection = std::getenv("AETHERKIRI_LAYER_SNAPSHOT_FRAMES");
+    if(!selection || !*selection || std::string_view(selection) == "all")
+        return true;
+
+    const char *cursor = selection;
+    while(*cursor) {
+        while(*cursor == ' ' || *cursor == ',') ++cursor;
+        if(!*cursor) break;
+        errno = 0;
+        char *end = nullptr;
+        const auto requested = std::strtoull(cursor, &end, 10);
+        if(end == cursor || errno == ERANGE) return false;
+        if(requested == frame) return true;
+        cursor = end;
+        while(*cursor == ' ') ++cursor;
+        if(*cursor && *cursor != ',') return false;
+    }
+    return false;
+}
+
+void TVPWriteLayerSnapshot(tTVPLayerManager *manager, tjs_uint64 frame,
+                           const tTVPRect &dirty, tjs_int dirty_count) {
+    const char *path = std::getenv("AETHERKIRI_LAYER_SNAPSHOT_JSONL");
+    if(!path || !*path || !TVPLayerSnapshotSelectFrame(frame)) return;
+
+    FILE *output = std::string_view(path) == "-" ? stderr : std::fopen(path, "ab");
+    if(!output) {
+        spdlog::warn("Cannot open layer snapshot JSONL '{}': {}", path,
+                     std::strerror(errno));
+        return;
+    }
+
+    auto *render_manager = TVPGetRenderManager();
+    const std::string render_name =
+        render_manager ? render_manager->GetName() : "unknown";
+    for(auto *layer : manager->GetAllNodes()) {
+        if(!layer) continue;
+        auto *parent = layer->GetParent();
+        const auto name = TVPJsonEscape(layer->GetName().AsStdString());
+        const auto parent_name = TVPJsonEscape(
+            parent ? parent->GetName().AsStdString() : std::string());
+        const auto type = TVPJsonEscape(
+            ttstr(layer->GetTypeNameString()).AsStdString());
+        const bool sdl_gpu = render_name == "SdlGpu";
+        const bool coherent_software_composite = sdl_gpu;
+        const char *authority =
+            (!sdl_gpu || coherent_software_composite) ? "cpu" : "gpu";
+        const char *final_method = coherent_software_composite
+            ? "software_delegate"
+            : (sdl_gpu ? "gpu_composite" : "software_composite");
+        const char *fallback_reason = coherent_software_composite
+            ? "\"coherent_software_composite\""
+            : "null";
+        std::fprintf(
+            output,
+            "{\"event\":\"layer_snapshot\",\"frame\":%llu,"
+            "\"name\":\"%s\",\"parent\":%s%s%s,\"order\":%u,"
+            "\"left\":%d,\"top\":%d,\"width\":%u,\"height\":%u,"
+            "\"type\":\"%s\",\"opacity\":%d,\"visible\":%s,"
+            "\"node_visible\":%s,\"update_region\":{\"count\":%d,"
+            "\"left\":%d,\"top\":%d,\"right\":%d,\"bottom\":%d},"
+            "\"texture_authority\":\"%s\",\"render_manager\":\"%s\","
+            "\"final_render_method\":\"%s\","
+            "\"fallback_reason\":%s}\n",
+            static_cast<unsigned long long>(frame), name.c_str(),
+            parent ? "\"" : "", parent ? parent_name.c_str() : "null",
+            parent ? "\"" : "", layer->GetOrderIndex(), layer->GetLeft(),
+            layer->GetTop(), layer->GetWidth(), layer->GetHeight(), type.c_str(),
+            layer->GetOpacity(), layer->GetVisible() ? "true" : "false",
+            layer->GetNodeVisible() ? "true" : "false", dirty_count,
+            dirty.left, dirty.top, dirty.right, dirty.bottom, authority,
+            TVPJsonEscape(render_name).c_str(), final_method,
+            fallback_reason);
+    }
+    std::fflush(output);
+    if(output != stderr) std::fclose(output);
+}
+
 bool TVPInputTraceEnabled() {
     const char *value = std::getenv("AETHERKIRI_INPUT_TRACE");
     return value && *value && *value != '0';
@@ -2184,7 +2293,22 @@ void tTVPLayerManager::UpdateToDrawDevice() {
         if(auto *loop = EngineLoop::GetInstance())
             loop->HandleInputEvent(event);
     }
+    const tjs_int snapshot_dirty_count = UpdateRegion.GetCount();
+    const tTVPRect snapshot_dirty = snapshot_dirty_count > 0
+        ? UpdateRegion.GetBound()
+        : tTVPRect(0, 0, 0, 0);
     Primary->CompleteForWindow(this);
+    const tjs_uint64 snapshot_tick = TVPGetRoughTickCount32();
+    // Completion may run repeatedly while a script builds a layer tree. Treat
+    // those same-tick completions as one diagnostic frame so selected frame
+    // numbers track the host's paced frame loop rather than layer count.
+    if(LayerSnapshotLastTick == 0 ||
+       snapshot_tick - LayerSnapshotLastTick >= 8) {
+        LayerSnapshotLastTick = snapshot_tick;
+        ++LayerSnapshotFrame;
+        TVPWriteLayerSnapshot(this, LayerSnapshotFrame, snapshot_dirty,
+                              snapshot_dirty_count);
+    }
     process_pending_enter(true);
     TVPTraceCgModeViewTransIdle(this, (tjs_int)Primary->GetWidth() / 2,
                                 (tjs_int)Primary->GetHeight() / 2);

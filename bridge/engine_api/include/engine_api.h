@@ -27,7 +27,7 @@ extern "C" {
 #endif
 
 /* ABI version: major(8bit), minor(8bit), patch(16bit). */
-#define ENGINE_API_VERSION 0x01050000u
+#define ENGINE_API_VERSION 0x01060000u
 #define ENGINE_API_MAKE_VERSION(major, minor, patch) \
   ((((uint32_t)(major)&0xFFu) << 24u) | (((uint32_t)(minor)&0xFFu) << 16u) | \
    ((uint32_t)(patch)&0xFFFFu))
@@ -76,6 +76,92 @@ typedef struct engine_frame_desc_t {
   uint64_t reserved_u64[4];
   void* reserved_ptr[4];
 } engine_frame_desc_t;
+
+/* Versioned optional interfaces keep platform-specific handles out of the
+ * base ABI. Interface names and vtable layouts are stable once published. */
+#define ENGINE_INTERFACE_RENDER_SDL_GPU_V1 "engine.render.sdl_gpu.v1"
+#define ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1 1u
+#define ENGINE_INTERFACE_RENDER_SDL_GPU_V2 "engine.render.sdl_gpu.v2"
+#define ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2 2u
+
+typedef struct engine_sdl_gpu_frame_v1_t {
+  uint32_t struct_size;
+  uint32_t width;
+  uint32_t height;
+  uint32_t format; /* SDL_GPUTextureFormat, kept opaque to the base ABI. */
+  uint64_t frame_serial;
+  void* texture;   /* SDL_GPUTexture*, owned by the engine. */
+  uint64_t lease_token;
+  uint64_t reserved_u64[4];
+  void* reserved_ptr[4];
+} engine_sdl_gpu_frame_v1_t;
+
+typedef struct engine_sdl_gpu_stats_v1_t {
+  uint32_t struct_size;
+  uint32_t reserved_u32;
+  uint64_t command_buffers_acquired;
+  uint64_t command_buffers_submitted;
+  uint64_t render_passes;
+  uint64_t copy_passes;
+  uint64_t wait_idle_calls;
+  uint64_t upload_calls;
+  uint64_t upload_bytes;
+  uint64_t readback_calls;
+  uint64_t readback_bytes;
+  uint64_t gpu_draw_calls;
+  uint64_t software_fallback_calls;
+  uint64_t fill_argb_gpu_calls;
+  uint64_t fill_color_gpu_calls;
+  uint64_t alpha_blend_d_gpu_calls;
+  uint64_t authority_barrier_calls;
+  uint64_t authority_barrier_bytes;
+  uint64_t full_upload_calls;
+  uint64_t full_upload_bytes;
+  uint64_t dirty_upload_calls;
+  uint64_t dirty_upload_bytes;
+  uint64_t const_color_alpha_blend_d_gpu_calls;
+  uint64_t reserved_u64[4];
+} engine_sdl_gpu_stats_v1_t;
+
+typedef struct engine_render_sdl_gpu_v1_t {
+  uint32_t struct_size;
+  uint32_t interface_version;
+  engine_result_t (*set_device)(engine_handle_t engine, void* device);
+  engine_result_t (*acquire_frame)(engine_handle_t engine,
+                                   engine_sdl_gpu_frame_v1_t* out_frame);
+  /* completion_fence is an SDL_GPUFence* returned by the host's present
+   * submission. Ownership transfers to the engine. NULL is allowed after a
+   * synchronous present or while draining during shutdown. */
+  engine_result_t (*release_frame)(engine_handle_t engine,
+                                   uint64_t lease_token,
+                                   void* completion_fence);
+  engine_result_t (*get_stats)(engine_handle_t engine,
+                               engine_sdl_gpu_stats_v1_t* out_stats);
+  engine_result_t (*reset_stats)(engine_handle_t engine);
+  uint64_t reserved_u64[4];
+  void* reserved_ptr[4];
+} engine_render_sdl_gpu_v1_t;
+
+/* v2 borrows the host command buffer for one engine_tick. The host calls
+ * begin_frame, engine_tick, end_frame, records presentation into the same
+ * command buffer, submits it, then releases the returned lease. */
+typedef struct engine_render_sdl_gpu_v2_t {
+  uint32_t struct_size;
+  uint32_t interface_version;
+  engine_result_t (*set_device)(engine_handle_t engine, void* device);
+  engine_result_t (*begin_frame)(engine_handle_t engine,
+                                 void* command_buffer);
+  engine_result_t (*end_frame)(engine_handle_t engine,
+                               engine_sdl_gpu_frame_v1_t* out_frame);
+  engine_result_t (*release_frame)(engine_handle_t engine,
+                                   uint64_t lease_token,
+                                   void* completion_fence);
+  engine_result_t (*get_stats)(engine_handle_t engine,
+                               engine_sdl_gpu_stats_v1_t* out_stats);
+  engine_result_t (*reset_stats)(engine_handle_t engine);
+  uint64_t reserved_u64[4];
+  void* reserved_ptr[4];
+} engine_render_sdl_gpu_v2_t;
 
 typedef enum engine_media_status_t {
   ENGINE_MEDIA_STATUS_IDLE = 0,
@@ -345,6 +431,13 @@ ENGINE_API_EXPORT engine_result_t engine_set_option(engine_handle_t handle,
 ENGINE_API_EXPORT engine_result_t engine_set_surface_size(engine_handle_t handle,
                                                           uint32_t width,
                                                           uint32_t height);
+
+/* Queries an optional versioned interface. out_interface receives a pointer
+ * to an immutable process-lifetime vtable. Exact name and version matching is
+ * required; unsupported interfaces return ENGINE_RESULT_NOT_SUPPORTED. */
+ENGINE_API_EXPORT engine_result_t engine_query_interface(
+    engine_handle_t handle, const char* name, uint32_t version,
+    const void** out_interface);
 
 /*
  * Injects the host's SDL_Renderer into the engine's built-in SDL3 render

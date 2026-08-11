@@ -52,8 +52,12 @@ public:
     bool EnsureGpuTexture();
     void UploadCpuToGpu();
     bool EnsureCpuReadable();
-    void MarkCpuDirty() { authority_ = Authority::Cpu; }
-    void MarkGpuDirty() { authority_ = Authority::Gpu; }
+    void MarkCpuDirty();
+    void MarkCpuDirty(const tTVPRect &rect);
+    void MarkGpuDirty() {
+        authority_ = Authority::Gpu;
+        cpu_dirty_valid_ = false;
+    }
     bool HasPendingGpu() const { return authority_ == Authority::Gpu; }
     bool RequiresGpuReadback() const {
         return gpu_tex_ != nullptr && authority_ == Authority::Gpu;
@@ -73,6 +77,8 @@ private:
     Authority authority_ = Authority::Uninitialized;
     bool opacity_known_ = false;
     bool opaque_ = false;
+    tTVPRect cpu_dirty_{};
+    bool cpu_dirty_valid_ = false;
 };
 
 class SdlGpuRenderManager final : public iTVPRenderManager {
@@ -128,6 +134,8 @@ private:
                    const char *method_name, uint32_t mode, int opacity,
                    uint32_t color, SDL_GPUTexture *src,
                    const tTVPRect &src_rc, int src_w, int src_h);
+    bool DrawFill(SdlGpuTexture2D *dst, const tTVPRect &rctar,
+                  uint32_t color, bool preserve_alpha);
 
     iTVPRenderManager *software_delegate_ = nullptr;
     std::unordered_map<uint32_t, SDLRenderMethod *> method_wrappers_;

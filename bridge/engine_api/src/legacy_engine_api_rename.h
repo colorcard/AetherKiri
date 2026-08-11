@@ -14,6 +14,7 @@
 #define engine_resume engine_legacy_resume
 #define engine_set_option engine_legacy_set_option
 #define engine_set_surface_size engine_legacy_set_surface_size
+#define engine_query_interface engine_legacy_query_interface
 #define engine_set_sdl_renderer engine_legacy_set_sdl_renderer
 #define engine_set_sdl_gpu_device engine_legacy_set_sdl_gpu_device
 #define engine_submit_sdl_gpu_frame engine_legacy_submit_sdl_gpu_frame

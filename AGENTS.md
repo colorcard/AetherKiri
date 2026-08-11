@@ -53,9 +53,11 @@ AetherKiri：Godot 宿主 + C ABI + C++17 KiriKiri2 引擎核心。
   必须同时接 **dispatch 层**（engine_api_dispatch.cpp Route 转发）——导出
   handle 是 dispatch 包装，直接调 legacy 层实现会收到无效 handle。
 - **sdl3_gpu 后端（阶段 2，已落地）**：`--render-backend sdl3_gpu` 用 SDL_GPU
-  （command-buffer API）shader-pipeline 合成器。rect blend（Copy/AlphaBlend/
-  Ps*）走 GPU（`cpp/core/visual/sdl3/SdlGpuRenderManager.*` + `sdl_gpu_backend.*`），
-  逐帧 command buffer；`_d`（读目标）、triangles、mask 回退软件保证像素一致
+  （command-buffer API）呈现并保留 shader-pipeline 合成器。默认整帧软件合成后
+  单次上传，避免 Copy/Fill GPU 与精确 AlphaBlend CPU 交替产生同步长帧；
+  `AETHERKIRI_SDL_GPU_ENABLE_MIXED_DRAWS=1` 仅用于实验 GPU Copy/Fill/Ps*
+  （`cpp/core/visual/sdl3/SdlGpuRenderManager.*` + `sdl_gpu_backend.*`），
+  逐帧 command buffer；`_d`（读目标）、triangles、mask 均走软件保证像素一致
   （demo 0.00% diff）。宿主注入 `engine_set_sdl_gpu_device`；aetherkiri_engine 已
   落地 swapchain 零拷贝 present（`engine_get_sdl_gpu_frame_texture` +
   `SDL_BlitGPUTexture`）。**踩坑**：(1) SDL_GPU 自定义 shader 的 descriptor set

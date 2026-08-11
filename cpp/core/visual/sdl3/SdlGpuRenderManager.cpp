@@ -21,6 +21,10 @@
 #include "shaders/fill.vert.spv.h"
 #include "shaders/fill.frag.spv.h"
 #include "shaders/blend_d.frag.spv.h"
+#include "shaders/blend_const_color_d.frag.spv.h"
+
+extern unsigned char TVPOpacityOnOpacityTable[256 * 256];
+extern unsigned char TVPNegativeMulTable[256 * 256];
 
 namespace {
 std::mutex g_live_texture_mutex;
@@ -76,15 +80,16 @@ struct GpuPipelines {
     SDL_GPUShader *fill_vs = nullptr;
     SDL_GPUShader *fill_fs = nullptr;
     SDL_GPUShader *blend_d_fs = nullptr;
+    SDL_GPUShader *blend_const_color_d_fs = nullptr;
     SDL_GPUSampler *sampler = nullptr;
     SDL_GPUBuffer *quad_vb = nullptr;
     SDL_GPUBuffer *quad_ib = nullptr;
     std::unordered_map<uint32_t, SDL_GPUGraphicsPipeline *> rect_pipes;
     std::unordered_map<uint32_t, SDL_GPUGraphicsPipeline *> fill_pipes;
     SDL_GPUGraphicsPipeline *blend_d_pipe = nullptr;
-    SDL_GPUTexture *scratch = nullptr;
-    int scratch_w = 0;
-    int scratch_h = 0;
+    SDL_GPUGraphicsPipeline *blend_const_color_d_pipe = nullptr;
+    SDL_GPUTexture *opacity_tables = nullptr;
+    std::unordered_map<uint64_t, SDL_GPUTexture *> scratch_pool;
 };
 
 GpuPipelines *g_pipelines = nullptr;
@@ -216,6 +221,8 @@ SdlGpuTexture2D::SdlGpuTexture2D(const void *pixel, int pitch, unsigned int w,
         }
     }
     authority_ = Authority::Cpu;
+    cpu_dirty_ = tTVPRect(0, 0, Width, Height);
+    cpu_dirty_valid_ = true;
     RegisterLiveTexture(this);
 }
 
@@ -248,6 +255,27 @@ void SdlGpuTexture2D::SetOpacityKnown(bool opaque) {
     opaque_ = opaque;
 }
 
+void SdlGpuTexture2D::MarkCpuDirty() {
+    MarkCpuDirty(tTVPRect(0, 0, Width, Height));
+}
+
+void SdlGpuTexture2D::MarkCpuDirty(const tTVPRect &rect) {
+    tTVPRect clipped(std::max(0, rect.left), std::max(0, rect.top),
+                     std::min(Width, rect.right), std::min(Height, rect.bottom));
+    if (clipped.is_empty()) return;
+    if (authority_ == Authority::Gpu && !EnsureCpuReadable()) return;
+    if (!cpu_dirty_valid_) {
+        cpu_dirty_ = clipped;
+        cpu_dirty_valid_ = true;
+    } else {
+        cpu_dirty_.left = std::min(cpu_dirty_.left, clipped.left);
+        cpu_dirty_.top = std::min(cpu_dirty_.top, clipped.top);
+        cpu_dirty_.right = std::max(cpu_dirty_.right, clipped.right);
+        cpu_dirty_.bottom = std::max(cpu_dirty_.bottom, clipped.bottom);
+    }
+    authority_ = Authority::Cpu;
+}
+
 bool SdlGpuTexture2D::EnsureGpuTexture() {
     SDL_GPUDevice *dev = TVPGetSdlGpuDevice();
     if (dev == nullptr) return false;
@@ -274,10 +302,29 @@ void SdlGpuTexture2D::UploadCpuToGpu() {
     if (authority_ != Authority::Cpu) return;
     if (format_ != TVPTextureFormat::RGBA || pixels_.empty()) return;
     if (!EnsureGpuTexture()) return;
-    const uint32_t w = static_cast<uint32_t>(Width);
-    const uint32_t h = static_cast<uint32_t>(Height);
-    if(TVPUploadSdlGpuTextureRgba(gpu_tex_, w, h, pixels_.data(), pitch_))
+    if (!cpu_dirty_valid_) return;
+    static const bool enable_dirty_upload = []() {
+        const char *v = std::getenv("AETHERKIRI_SDL_GPU_ENABLE_DIRTY_UPLOAD");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    // Some KiriKiri bitmap writers retain scanline pointers or update pixels
+    // outside the rectangle advertised to Update(). Until those contracts
+    // are represented explicitly, a sub-rectangle can omit fresh pixels and
+    // produce repeated bands/stale UI fragments. Prefer correctness; keep
+    // the optimization available only for focused diagnostics.
+    const tTVPRect dirty = enable_dirty_upload
+        ? cpu_dirty_ : tTVPRect(0, 0, Width, Height);
+    const uint32_t w = static_cast<uint32_t>(dirty.get_width());
+    const uint32_t h = static_cast<uint32_t>(dirty.get_height());
+    const auto *src = pixels_.data() + static_cast<size_t>(dirty.top) * pitch_ +
+                      static_cast<size_t>(dirty.left) * 4u;
+    if(TVPUploadSdlGpuTextureRgbaRegion(
+           gpu_tex_, static_cast<uint32_t>(Width),
+           static_cast<uint32_t>(Height), static_cast<uint32_t>(dirty.left),
+           static_cast<uint32_t>(dirty.top), w, h, src, pitch_)) {
         authority_ = Authority::Synchronized;
+        cpu_dirty_valid_ = false;
+    }
 }
 
 bool SdlGpuTexture2D::EnsureCpuReadable() {
@@ -298,6 +345,7 @@ bool SdlGpuTexture2D::EnsureCpuReadable() {
     const uint32_t h = static_cast<uint32_t>(Height);
     const uint32_t tight_pitch = w * 4u;
     EnsureCpuStorage();
+    TVPRecordSdlGpuAuthorityBarrier(static_cast<uint64_t>(w) * h * 4u);
     if (pitch_ == static_cast<int>(tight_pitch)) {
         if(!TVPReadSdlGpuTextureRgba(gpu_tex_, w, h, pixels_.data(),
                                     pixels_.size()))
@@ -330,7 +378,8 @@ void *SdlGpuTexture2D::GetScanLineForWrite(tjs_uint l) {
     // so the CPU path becomes the new source of truth.
     if (authority_ == Authority::Gpu && !EnsureCpuReadable()) return nullptr;
     if (pixels_.empty()) EnsureCpuStorage();
-    authority_ = Authority::Cpu;
+    MarkCpuDirty(tTVPRect(0, static_cast<int>(l), Width,
+                          static_cast<int>(l) + 1));
     return pixels_.data() + static_cast<size_t>(l) * pitch_;
 }
 
@@ -338,6 +387,9 @@ uint32_t SdlGpuTexture2D::GetPoint(int x, int y) {
     if (x < 0 || y < 0 || x >= Width || y >= Height) return 0;
     if (authority_ == Authority::Gpu) EnsureCpuReadable();
     if (pixels_.empty()) EnsureCpuStorage();
+    if (format_ == TVPTextureFormat::Gray) {
+        return pixels_[static_cast<size_t>(y) * pitch_ + x];
+    }
     const uint8_t *p = pixels_.data() + static_cast<size_t>(y) * pitch_ +
                        static_cast<size_t>(x) * 4u;
     return (static_cast<uint32_t>(p[0])) | (static_cast<uint32_t>(p[1]) << 8u) |
@@ -349,13 +401,19 @@ void SdlGpuTexture2D::SetPoint(int x, int y, uint32_t clr) {
     if (x < 0 || y < 0 || x >= Width || y >= Height) return;
     if (authority_ == Authority::Gpu && !EnsureCpuReadable()) return;
     if (pixels_.empty()) EnsureCpuStorage();
+    if (format_ == TVPTextureFormat::Gray) {
+        pixels_[static_cast<size_t>(y) * pitch_ + x] =
+            static_cast<uint8_t>(clr);
+        MarkCpuDirty(tTVPRect(x, y, x + 1, y + 1));
+        return;
+    }
     uint8_t *p = pixels_.data() + static_cast<size_t>(y) * pitch_ +
                  static_cast<size_t>(x) * 4u;
     p[0] = static_cast<uint8_t>(clr);
     p[1] = static_cast<uint8_t>(clr >> 8u);
     p[2] = static_cast<uint8_t>(clr >> 16u);
     p[3] = static_cast<uint8_t>(clr >> 24u);
-    authority_ = Authority::Cpu;
+    MarkCpuDirty(tTVPRect(x, y, x + 1, y + 1));
 }
 
 void SdlGpuTexture2D::Update(const void *pixel, TVPTextureFormat::e format,
@@ -378,8 +436,8 @@ void SdlGpuTexture2D::Update(const void *pixel, TVPTextureFormat::e format,
         for (int y = top; y < bottom; ++y) {
             for (int x = left; x < right; ++x) {
                 pixels_[static_cast<size_t>(y) * pitch_ + x] =
-                    src[static_cast<size_t>(y - top) * src_pitch +
-                        (x - left)];
+                    src[static_cast<size_t>(y - rc.top) * src_pitch +
+                        (x - rc.left)];
             }
         }
     } else {
@@ -387,12 +445,12 @@ void SdlGpuTexture2D::Update(const void *pixel, TVPTextureFormat::e format,
         for (int y = top; y < bottom; ++y) {
             std::memcpy(pixels_.data() + static_cast<size_t>(y) * pitch_ +
                             static_cast<size_t>(left) * 4u,
-                        src + static_cast<size_t>(y - top) * src_pitch +
-                            static_cast<size_t>(left) * 4u,
+                        src + static_cast<size_t>(y - rc.top) * src_pitch +
+                            static_cast<size_t>(left - rc.left) * 4u,
                         static_cast<size_t>(width) * 4u);
         }
     }
-    authority_ = Authority::Cpu;
+    MarkCpuDirty(tTVPRect(left, top, right, bottom));
 }
 
 void SdlGpuTexture2D::SetSize(unsigned int w, unsigned int h) {
@@ -406,6 +464,8 @@ void SdlGpuTexture2D::SetSize(unsigned int w, unsigned int h) {
     Height = static_cast<tjs_int>(h);
     pitch_ = static_cast<int>(w) * BytesPerPixel(format_);
     EnsureCpuStorage();
+    cpu_dirty_ = tTVPRect(0, 0, Width, Height);
+    cpu_dirty_valid_ = true;
     authority_ = Authority::Cpu;
 }
 
@@ -450,10 +510,13 @@ GpuPipelines *EnsurePipelines() {
     p->fill_fs = CreateShader(dev, SDL_GPU_SHADERSTAGE_FRAGMENT,
                               fill_frag_spv, fill_frag_spv_size, 0, 1);
     p->blend_d_fs = CreateShader(dev, SDL_GPU_SHADERSTAGE_FRAGMENT,
-                                blend_d_frag_spv, blend_d_frag_spv_size, 2, 1);
+                                blend_d_frag_spv, blend_d_frag_spv_size, 3, 0);
+    p->blend_const_color_d_fs = CreateShader(
+        dev, SDL_GPU_SHADERSTAGE_FRAGMENT, blend_const_color_d_frag_spv,
+        blend_const_color_d_frag_spv_size, 2, 1);
     if (p->quad_vs == nullptr || p->quad_fs == nullptr ||
         p->fill_vs == nullptr || p->fill_fs == nullptr ||
-        p->blend_d_fs == nullptr) {
+        p->blend_d_fs == nullptr || p->blend_const_color_d_fs == nullptr) {
         delete p;
         return nullptr;
     }
@@ -475,8 +538,17 @@ GpuPipelines *EnsurePipelines() {
     ib_info.usage = SDL_GPU_BUFFERUSAGE_INDEX;
     ib_info.size = sizeof(kQuadIndices);
     p->quad_ib = SDL_CreateGPUBuffer(dev, &ib_info);
+    SDL_GPUTextureCreateInfo table_info{};
+    table_info.type = SDL_GPU_TEXTURETYPE_2D;
+    table_info.format = SDL_GPU_TEXTUREFORMAT_R8G8_UNORM;
+    table_info.width = 256;
+    table_info.height = 256;
+    table_info.layer_count_or_depth = 1;
+    table_info.num_levels = 1;
+    table_info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER;
+    p->opacity_tables = SDL_CreateGPUTexture(dev, &table_info);
     if (p->sampler == nullptr || p->quad_vb == nullptr ||
-        p->quad_ib == nullptr) {
+        p->quad_ib == nullptr || p->opacity_tables == nullptr) {
         delete p;
         return nullptr;
     }
@@ -490,13 +562,27 @@ GpuPipelines *EnsurePipelines() {
     itb_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
     itb_info.size = sizeof(kQuadIndices);
     SDL_GPUTransferBuffer *itb = SDL_CreateGPUTransferBuffer(dev, &itb_info);
-    if (vtb != nullptr && itb != nullptr) {
+    SDL_GPUTransferBufferCreateInfo ttb_info{};
+    ttb_info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+    ttb_info.size = 256u * 256u * 2u;
+    SDL_GPUTransferBuffer *ttb = SDL_CreateGPUTransferBuffer(dev, &ttb_info);
+    if (vtb != nullptr && itb != nullptr && ttb != nullptr) {
         std::memcpy(SDL_MapGPUTransferBuffer(dev, vtb, false), kQuadVerts,
                     sizeof(kQuadVerts));
         SDL_UnmapGPUTransferBuffer(dev, vtb);
         std::memcpy(SDL_MapGPUTransferBuffer(dev, itb, false), kQuadIndices,
                     sizeof(kQuadIndices));
         SDL_UnmapGPUTransferBuffer(dev, itb);
+        auto *tables = static_cast<uint8_t *>(
+            SDL_MapGPUTransferBuffer(dev, ttb, false));
+        for (int source_alpha = 0; source_alpha < 256; ++source_alpha) {
+            for (int dest_alpha = 0; dest_alpha < 256; ++dest_alpha) {
+                const int index = source_alpha * 256 + dest_alpha;
+                tables[index * 2] = TVPOpacityOnOpacityTable[index];
+                tables[index * 2 + 1] = TVPNegativeMulTable[index];
+            }
+        }
+        SDL_UnmapGPUTransferBuffer(dev, ttb);
         SDL_GPUCommandBuffer *cmd = SDL_AcquireGPUCommandBuffer(dev);
         SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
         SDL_GPUTransferBufferLocation vloc{.transfer_buffer = vtb, .offset = 0};
@@ -507,10 +593,21 @@ GpuPipelines *EnsurePipelines() {
         SDL_GPUBufferRegion ireg{.buffer = p->quad_ib, .offset = 0,
                                  .size = sizeof(kQuadIndices)};
         SDL_UploadToGPUBuffer(cp, &iloc, &ireg, false);
+        SDL_GPUTextureTransferInfo tloc{};
+        tloc.transfer_buffer = ttb;
+        tloc.pixels_per_row = 256;
+        tloc.rows_per_layer = 256;
+        SDL_GPUTextureRegion treg{};
+        treg.texture = p->opacity_tables;
+        treg.w = 256;
+        treg.h = 256;
+        treg.d = 1;
+        SDL_UploadToGPUTexture(cp, &tloc, &treg, false);
         SDL_EndGPUCopyPass(cp);
         SDL_SubmitGPUCommandBuffer(cmd);
         SDL_ReleaseGPUTransferBuffer(dev, vtb);
         SDL_ReleaseGPUTransferBuffer(dev, itb);
+        SDL_ReleaseGPUTransferBuffer(dev, ttb);
     }
 
     g_pipelines = p;
@@ -581,8 +678,10 @@ SDL_GPUGraphicsPipeline *GetRectPipeline(GpuPipelines *p, uint32_t mode,
     return pipe;
 }
 
-SDL_GPUGraphicsPipeline *GetFillPipeline(GpuPipelines *p, bool *ok) {
-    auto it = p->fill_pipes.find(0);
+SDL_GPUGraphicsPipeline *GetFillPipeline(GpuPipelines *p, bool preserve_alpha,
+                                         bool *ok) {
+    const uint32_t key = preserve_alpha ? 1u : 0u;
+    auto it = p->fill_pipes.find(key);
     if (it != p->fill_pipes.end()) {
         *ok = true;
         return it->second;
@@ -599,7 +698,12 @@ SDL_GPUGraphicsPipeline *GetFillPipeline(GpuPipelines *p, bool *ok) {
     }};
     SDL_GPUColorTargetDescription color_target{};
     color_target.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
-    color_target.blend_state = BlendStateFor(TVP_GODOT_GPU_BLEND_ALPHA, ok);
+    color_target.blend_state.enable_blend = false;
+    color_target.blend_state.enable_color_write_mask = true;
+    color_target.blend_state.color_write_mask =
+        SDL_GPU_COLORCOMPONENT_R | SDL_GPU_COLORCOMPONENT_G |
+        SDL_GPU_COLORCOMPONENT_B |
+        (preserve_alpha ? 0 : SDL_GPU_COLORCOMPONENT_A);
 
     SDL_GPUGraphicsPipelineCreateInfo pipe_info{};
     pipe_info.vertex_shader = p->fill_vs;
@@ -630,7 +734,7 @@ SDL_GPUGraphicsPipeline *GetFillPipeline(GpuPipelines *p, bool *ok) {
         *ok = false;
         return nullptr;
     }
-    p->fill_pipes[0] = pipe;
+    p->fill_pipes[key] = pipe;
     *ok = true;
     return pipe;
 }
@@ -639,10 +743,13 @@ SDL_GPUGraphicsPipeline *GetFillPipeline(GpuPipelines *p, bool *ok) {
 // fragment shader samples both the source and the destination (via a scratch
 // copy) and computes the final color entirely in the shader, so the color
 // target blend state is NONE.
-SDL_GPUGraphicsPipeline *GetBlendDPipeline(GpuPipelines *p, bool *ok) {
-    if (p->blend_d_pipe != nullptr) {
+SDL_GPUGraphicsPipeline *GetBlendDPipeline(GpuPipelines *p,
+                                            bool const_color, bool *ok) {
+    SDL_GPUGraphicsPipeline *&cached = const_color
+        ? p->blend_const_color_d_pipe : p->blend_d_pipe;
+    if (cached != nullptr) {
         *ok = true;
-        return p->blend_d_pipe;
+        return cached;
     }
     SDL_GPUVertexBufferDescription vdesc[1] = {{
         .slot = 0,
@@ -663,7 +770,8 @@ SDL_GPUGraphicsPipeline *GetBlendDPipeline(GpuPipelines *p, bool *ok) {
 
     SDL_GPUGraphicsPipelineCreateInfo pipe_info{};
     pipe_info.vertex_shader = p->quad_vs;
-    pipe_info.fragment_shader = p->blend_d_fs;
+    pipe_info.fragment_shader = const_color
+        ? p->blend_const_color_d_fs : p->blend_d_fs;
     pipe_info.vertex_input_state.vertex_buffer_descriptions = vdesc;
     pipe_info.vertex_input_state.num_vertex_buffers = 1;
     pipe_info.vertex_input_state.vertex_attributes = vattr;
@@ -690,7 +798,7 @@ SDL_GPUGraphicsPipeline *GetBlendDPipeline(GpuPipelines *p, bool *ok) {
         *ok = false;
         return nullptr;
     }
-    p->blend_d_pipe = pipe;
+    cached = pipe;
     *ok = true;
     return pipe;
 }
@@ -700,27 +808,23 @@ SDL_GPUGraphicsPipeline *GetBlendDPipeline(GpuPipelines *p, bool *ok) {
 SDL_GPUTexture *EnsureScratch(GpuPipelines *p, int w, int h) {
     SDL_GPUDevice *dev = TVPGetSdlGpuDevice();
     if (dev == nullptr) return nullptr;
-    if (p->scratch != nullptr && p->scratch_w >= w && p->scratch_h >= h) {
-        return p->scratch;
-    }
-    if (p->scratch != nullptr) {
-        SDL_ReleaseGPUTexture(dev, p->scratch);
-        p->scratch = nullptr;
-    }
+    w = std::max(w, 1);
+    h = std::max(h, 1);
+    const uint64_t key = (static_cast<uint64_t>(static_cast<uint32_t>(w)) << 32u) |
+                         static_cast<uint32_t>(h);
+    auto existing = p->scratch_pool.find(key);
+    if (existing != p->scratch_pool.end()) return existing->second;
     SDL_GPUTextureCreateInfo info{};
     info.type = SDL_GPU_TEXTURETYPE_2D;
     info.format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
-    info.width = static_cast<Uint32>(std::max(w, 1));
-    info.height = static_cast<Uint32>(std::max(h, 1));
+    info.width = static_cast<Uint32>(w);
+    info.height = static_cast<Uint32>(h);
     info.layer_count_or_depth = 1;
     info.num_levels = 1;
     info.usage = SDL_GPU_TEXTUREUSAGE_SAMPLER | SDL_GPU_TEXTUREUSAGE_COLOR_TARGET;
-    p->scratch = SDL_CreateGPUTexture(dev, &info);
-    if (p->scratch != nullptr) {
-        p->scratch_w = std::max(w, 1);
-        p->scratch_h = std::max(h, 1);
-    }
-    return p->scratch;
+    SDL_GPUTexture *scratch = SDL_CreateGPUTexture(dev, &info);
+    if (scratch != nullptr) p->scratch_pool.emplace(key, scratch);
+    return scratch;
 }
 
 void ReleasePipelines() {
@@ -732,15 +836,21 @@ void ReleasePipelines() {
         for (auto &kv : p->rect_pipes) SDL_ReleaseGPUGraphicsPipeline(dev, kv.second);
         for (auto &kv : p->fill_pipes) SDL_ReleaseGPUGraphicsPipeline(dev, kv.second);
         if (p->blend_d_pipe) SDL_ReleaseGPUGraphicsPipeline(dev, p->blend_d_pipe);
+        if (p->blend_const_color_d_pipe)
+            SDL_ReleaseGPUGraphicsPipeline(dev, p->blend_const_color_d_pipe);
         if (p->quad_vs) SDL_ReleaseGPUShader(dev, p->quad_vs);
         if (p->quad_fs) SDL_ReleaseGPUShader(dev, p->quad_fs);
         if (p->fill_vs) SDL_ReleaseGPUShader(dev, p->fill_vs);
         if (p->fill_fs) SDL_ReleaseGPUShader(dev, p->fill_fs);
         if (p->blend_d_fs) SDL_ReleaseGPUShader(dev, p->blend_d_fs);
+        if (p->blend_const_color_d_fs)
+            SDL_ReleaseGPUShader(dev, p->blend_const_color_d_fs);
         if (p->sampler) SDL_ReleaseGPUSampler(dev, p->sampler);
         if (p->quad_vb) SDL_ReleaseGPUBuffer(dev, p->quad_vb);
         if (p->quad_ib) SDL_ReleaseGPUBuffer(dev, p->quad_ib);
-        if (p->scratch) SDL_ReleaseGPUTexture(dev, p->scratch);
+        for (auto &entry : p->scratch_pool)
+            SDL_ReleaseGPUTexture(dev, entry.second);
+        if (p->opacity_tables) SDL_ReleaseGPUTexture(dev, p->opacity_tables);
     }
     delete p;
 }
@@ -906,6 +1016,9 @@ uint32_t ModeForMethodName(const std::string &name) {
     if (name == "Copy" || name == "CopyOpaqueImage") return TVP_GODOT_GPU_BLEND_COPY_RGBA;
     if (name == "CopyColor") return TVP_GODOT_GPU_BLEND_COPY_COLOR;
     if (name == "AlphaBlend") return TVP_GODOT_GPU_BLEND_ALPHA;
+    if (name == "AlphaBlend_d") return TVP_GODOT_GPU_BLEND_ALPHA_D;
+    if (name == "ConstColorAlphaBlend_d")
+        return TVP_GODOT_GPU_BLEND_CONST_ALPHA_D;
     if (name == "PsScreenBlend") return TVP_GODOT_GPU_BLEND_PS_SCREEN;
     if (name == "PsAddBlend") return TVP_GODOT_GPU_BLEND_PS_ADD;
     if (name == "PsSubBlend") return TVP_GODOT_GPU_BLEND_PS_SUBTRACT;
@@ -915,7 +1028,13 @@ uint32_t ModeForMethodName(const std::string &name) {
 
 bool IsDestinationReadMode(uint32_t mode) {
     switch (mode) {
+        case TVP_GODOT_GPU_BLEND_ALPHA:
+            // KiriKiri's normal alpha blend uses 8-bit integer arithmetic
+            // with a /256 shift. Fixed-function UNORM blending uses /255 and
+            // cannot be pixel-identical, so keep CPU as the authority.
+            return true;
         case TVP_GODOT_GPU_BLEND_ALPHA_D:
+        case TVP_GODOT_GPU_BLEND_CONST_ALPHA_D:
             // Destination-read (_d) modes read the destination inside the
             // fragment shader (dst.rgb = mix(dst, src, srcA/outA)). The
             // fixed-function blend state cannot express this, and a shader
@@ -930,6 +1049,64 @@ bool IsDestinationReadMode(uint32_t mode) {
     }
 }
 }  // namespace
+
+bool SdlGpuRenderManager::DrawFill(SdlGpuTexture2D *dst,
+                                   const tTVPRect &rctar, uint32_t color,
+                                   bool preserve_alpha) {
+    if (dst == nullptr || !TVPIsSdlGpuActive() ||
+        dst->GetFormat() != TVPTextureFormat::RGBA)
+        return false;
+    if (rctar.is_empty()) return true;
+    if (rctar.left < 0 || rctar.top < 0 || rctar.right > dst->GetWidth() ||
+        rctar.bottom > dst->GetHeight())
+        return false;
+    GpuPipelines *p = EnsurePipelines();
+    if (p == nullptr) return false;
+    dst->UploadCpuToGpu();
+    if (!dst->EnsureGpuTexture()) return false;
+    bool ok = false;
+    SDL_GPUGraphicsPipeline *pipe = GetFillPipeline(p, preserve_alpha, &ok);
+    if (!ok || pipe == nullptr) return false;
+    SDL_GPUCommandBuffer *cmd = TVPGetSdlGpuFrameCommandBuffer();
+    if (cmd == nullptr) return false;
+    TVPEnsureSdlGpuRenderPassReady();
+    SDL_GPUColorTargetInfo target{};
+    target.texture = dst->GpuTexture();
+    target.load_op = SDL_GPU_LOADOP_LOAD;
+    target.store_op = SDL_GPU_STOREOP_STORE;
+    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &target, 1, nullptr);
+    if (pass == nullptr) return false;
+    SDL_BindGPUGraphicsPipeline(pass, pipe);
+    SDL_GPUBufferBinding vertex{.buffer = p->quad_vb, .offset = 0};
+    SDL_GPUBufferBinding index{.buffer = p->quad_ib, .offset = 0};
+    SDL_BindGPUVertexBuffers(pass, 0, &vertex, 1);
+    SDL_BindGPUIndexBuffer(pass, &index, SDL_GPU_INDEXELEMENTSIZE_32BIT);
+    const float vertex_params[6] = {
+        static_cast<float>(rctar.left), static_cast<float>(rctar.top),
+        static_cast<float>(rctar.get_width()),
+        static_cast<float>(rctar.get_height()),
+        static_cast<float>(dst->GetWidth()),
+        static_cast<float>(dst->GetHeight())};
+    SDL_PushGPUVertexUniformData(cmd, 0, vertex_params,
+                                 sizeof(vertex_params));
+    // CPU pixels are stored in the byte order of the little-endian ARGB word.
+    const float fragment_params[4] = {
+        static_cast<float>(color & 0xffu) / 255.0f,
+        static_cast<float>((color >> 8u) & 0xffu) / 255.0f,
+        static_cast<float>((color >> 16u) & 0xffu) / 255.0f,
+        static_cast<float>((color >> 24u) & 0xffu) / 255.0f};
+    SDL_PushGPUFragmentUniformData(cmd, 0, fragment_params,
+                                   sizeof(fragment_params));
+    SDL_GPUViewport viewport{.x = 0.0f, .y = 0.0f,
+        .w = static_cast<float>(dst->GetWidth()),
+        .h = static_cast<float>(dst->GetHeight()),
+        .min_depth = 0.0f, .max_depth = 1.0f};
+    SDL_SetGPUViewport(pass, &viewport);
+    SDL_DrawGPUIndexedPrimitives(pass, 6, 1, 0, 0, 0);
+    SDL_EndGPURenderPass(pass);
+    dst->MarkGpuDirty();
+    return true;
+}
 
 // Draws src (full GPU texture) into dst rect rctar with the given blend mode.
 // Returns true if fully handled on the GPU path.
@@ -1077,9 +1254,18 @@ bool SdlGpuRenderManager::DrawRectD(SdlGpuTexture2D *dst,
                                     SDL_GPUTexture *src,
                                     const tTVPRect &src_rc, int src_w,
                                     int src_h) {
-    if (dst == nullptr || src == nullptr) return false;
+    const bool const_color = method_name != nullptr &&
+        std::strcmp(method_name, "ConstColorAlphaBlend_d") == 0;
+    if (dst == nullptr || (!const_color && src == nullptr)) return false;
     if (!TVPIsSdlGpuActive()) return false;
     if (rctar.is_empty()) return true;
+    if (rctar.left < 0 || rctar.top < 0 || rctar.right > dst->GetWidth() ||
+        rctar.bottom > dst->GetHeight() || src_rc.left < 0 || src_rc.top < 0 ||
+        (!const_color && (src_rc.right > src_w || src_rc.bottom > src_h ||
+         rctar.get_width() != src_rc.get_width() ||
+         rctar.get_height() != src_rc.get_height() ||
+         dst->GpuTexture() == src)))
+        return false;
     GpuPipelines *p = EnsurePipelines();
     if (p == nullptr) return false;
     dst->UploadCpuToGpu();
@@ -1087,7 +1273,7 @@ bool SdlGpuRenderManager::DrawRectD(SdlGpuTexture2D *dst,
     if (mode == 0) return false;
 
     bool ok = false;
-    SDL_GPUGraphicsPipeline *pipe = GetBlendDPipeline(p, &ok);
+    SDL_GPUGraphicsPipeline *pipe = GetBlendDPipeline(p, const_color, &ok);
     if (!ok || pipe == nullptr) return false;
 
     SDL_GPUCommandBuffer *cmd = TVPGetSdlGpuFrameCommandBuffer();
@@ -1097,7 +1283,7 @@ bool SdlGpuRenderManager::DrawRectD(SdlGpuTexture2D *dst,
     // backend ensures any open render pass is ended first.
     SDL_GPUCommandBuffer *save_cmd = cmd;
     SDL_GPUTexture *scratch =
-        EnsureScratch(p, dst->GetWidth(), dst->GetHeight());
+        EnsureScratch(p, rctar.get_width(), rctar.get_height());
     if (scratch == nullptr) return false;
     TVPEnsureSdlGpuRenderPassReady();
     SDL_GPUCopyPass *cp = TVPGetSdlGpuFrameCopyPass();
@@ -1106,8 +1292,8 @@ bool SdlGpuRenderManager::DrawRectD(SdlGpuTexture2D *dst,
     src_loc.texture = dst->GpuTexture();
     src_loc.mip_level = 0;
     src_loc.layer = 0;
-    src_loc.x = 0;
-    src_loc.y = 0;
+    src_loc.x = static_cast<Uint32>(rctar.left);
+    src_loc.y = static_cast<Uint32>(rctar.top);
     src_loc.z = 0;
     SDL_GPUTextureLocation dst_loc{};
     dst_loc.texture = scratch;
@@ -1116,8 +1302,8 @@ bool SdlGpuRenderManager::DrawRectD(SdlGpuTexture2D *dst,
     dst_loc.x = 0;
     dst_loc.y = 0;
     dst_loc.z = 0;
-    const Uint32 copy_w = static_cast<Uint32>(dst->GetWidth());
-    const Uint32 copy_h = static_cast<Uint32>(dst->GetHeight());
+    const Uint32 copy_w = static_cast<Uint32>(rctar.get_width());
+    const Uint32 copy_h = static_cast<Uint32>(rctar.get_height());
     SDL_CopyGPUTextureToTexture(cp, &src_loc, &dst_loc, copy_w, copy_h, 1,
                                 false);
 
@@ -1143,12 +1329,20 @@ bool SdlGpuRenderManager::DrawRectD(SdlGpuTexture2D *dst,
     ibind.offset = 0;
     SDL_BindGPUIndexBuffer(rp, &ibind, SDL_GPU_INDEXELEMENTSIZE_32BIT);
 
-    // src at binding 0, dst-scratch at binding 1.
-    SDL_GPUTextureSamplerBinding sampler_binds[2] = {
-        {.texture = src, .sampler = p->sampler},
-        {.texture = scratch, .sampler = p->sampler},
-    };
-    SDL_BindGPUFragmentSamplers(rp, 0, sampler_binds, 2);
+    if (const_color) {
+        SDL_GPUTextureSamplerBinding sampler_binds[2] = {
+            {.texture = scratch, .sampler = p->sampler},
+            {.texture = p->opacity_tables, .sampler = p->sampler},
+        };
+        SDL_BindGPUFragmentSamplers(rp, 0, sampler_binds, 2);
+    } else {
+        SDL_GPUTextureSamplerBinding sampler_binds[3] = {
+            {.texture = src, .sampler = p->sampler},
+            {.texture = scratch, .sampler = p->sampler},
+            {.texture = p->opacity_tables, .sampler = p->sampler},
+        };
+        SDL_BindGPUFragmentSamplers(rp, 0, sampler_binds, 3);
+    }
 
     // Vertex uniform: dst rect, viewport, src uv rect.
     const float viewport_w = static_cast<float>(dst->GetWidth());
@@ -1168,15 +1362,14 @@ bool SdlGpuRenderManager::DrawRectD(SdlGpuTexture2D *dst,
         src_uv_w, src_uv_h};
     SDL_PushGPUVertexUniformData(save_cmd, 0, vparams, sizeof(vparams));
 
-    // Fragment uniform: tint color + opacity. Color is AARRGGBB; a value of 0
-    // means no tint (white).
-    const float a = static_cast<float>(opacity) / 255.0f;
-    const uint32_t tint = color != 0 ? color : 0xffffffffu;
-    const float fr = ((tint >> 16u) & 0xffu) / 255.0f;
-    const float fg = ((tint >> 8u) & 0xffu) / 255.0f;
-    const float fb = ((tint >> 0u) & 0xffu) / 255.0f;
-    const float fparams[4] = {fr, fg, fb, a};
-    SDL_PushGPUFragmentUniformData(save_cmd, 0, fparams, sizeof(fparams));
+    if (const_color) {
+        const uint32_t fparams[4] = {
+            color & 0xffu, (color >> 8u) & 0xffu,
+            (color >> 16u) & 0xffu,
+            static_cast<uint32_t>(std::clamp(opacity, 0, 255))};
+        SDL_PushGPUFragmentUniformData(save_cmd, 0, fparams,
+                                       sizeof(fparams));
+    }
 
     SDL_GPUViewport vp{};
     vp.x = 0;
@@ -1214,20 +1407,51 @@ void SdlGpuRenderManager::OperateRect(iTVPRenderMethod *method,
         src_rc = textures[0].second;
     }
 
-    // FillARGB has no source texture.
+    // Fill methods have no source texture.
     bool handled = false;
     static const bool disable_gpu_draws = []() {
         const char *v = std::getenv("AETHERKIRI_SDL_GPU_DISABLE_DRAWS");
         return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
     }();
-    if (disable_gpu_draws) {
+    static const bool enable_mixed_gpu_draws = []() {
+        const char *v = std::getenv("AETHERKIRI_SDL_GPU_ENABLE_MIXED_DRAWS");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    static const bool enable_d_blend = []() {
+        const char *v = std::getenv("AETHERKIRI_SDL_GPU_ENABLE_D_BLEND");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    static const bool disable_const_color_d_blend = []() {
+        const char *v = std::getenv(
+            "AETHERKIRI_SDL_GPU_DISABLE_CONST_COLOR_D_BLEND");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    static const bool disable_gpu_fill = []() {
+        const char *v = std::getenv("AETHERKIRI_SDL_GPU_DISABLE_FILL");
+        return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+    }();
+    // Mixing GPU Copy/Fill with exact software alpha on one target forces
+    // synchronous authority barriers. Keep a coherent software composite by
+    // default and upload once for SDL_GPU presentation.
+    if (disable_gpu_draws || !enable_mixed_gpu_draws) {
         handled = false;
-    } else if (dst != nullptr && TVPIsSdlGpuActive() &&
-        method_name == "FillARGB") {
-        // GPU fill via clear is not precise for sub-rects; route FillARGB to
-        // the software delegate for now (it is rare on the hot path).
-        handled = false;
-    } else if (dst != nullptr && src != nullptr && dst->GpuTexture() != nullptr &&
+    } else if (!disable_gpu_fill && dst != nullptr && TVPIsSdlGpuActive() &&
+               (method_name == "FillARGB" || method_name == "FillColor")) {
+        const uint32_t color =
+            godot_method != nullptr ? godot_method->Color() : 0;
+        handled = DrawFill(dst, rctar, color, method_name == "FillColor");
+    } else if (enable_d_blend && !disable_const_color_d_blend &&
+               dst != nullptr && TVPIsSdlGpuActive() &&
+               method_name == "ConstColorAlphaBlend_d") {
+        dst->UploadCpuToGpu();
+        const int opacity = godot_method != nullptr
+            ? godot_method->Opacity() : 255;
+        const uint32_t color = godot_method != nullptr
+            ? godot_method->Color() : 0;
+        handled = DrawRectD(dst, rctar, method_name.c_str(),
+                            TVP_GODOT_GPU_BLEND_CONST_ALPHA_D, opacity, color,
+                            nullptr, tTVPRect(), 0, 0);
+    } else if (dst != nullptr && src != nullptr &&
                src->EnsureGpuTexture() && method_name != "FillARGB") {
         // Fixed-function blending reads the existing render target. A prior
         // software operation may have made the CPU copy authoritative, so
@@ -1246,18 +1470,26 @@ void SdlGpuRenderManager::OperateRect(iTVPRenderMethod *method,
             godot_method != nullptr ? godot_method->Opacity() : 255;
         const uint32_t color =
             godot_method != nullptr ? godot_method->Color() : 0;
-        // _d modes resolve to mode==0 and fall back to the software delegate
-        // below (pixel-identical, see IsDestinationReadMode).
-        handled = DrawRect(dst, rctar, method_name.c_str(), mode, opacity,
-                           color, src->GpuTexture(), src_rc,
-                           src->GetWidth(), src->GetHeight());
+        if (enable_d_blend && method_name == "AlphaBlend_d") {
+            handled = DrawRectD(dst, rctar, method_name.c_str(), mode, opacity,
+                                color, src->GpuTexture(), src_rc,
+                                src->GetWidth(), src->GetHeight());
+        } else if (!IsDestinationReadMode(mode)) {
+            handled = DrawRect(dst, rctar, method_name.c_str(), mode, opacity,
+                               color, src->GpuTexture(), src_rc,
+                               src->GetWidth(), src->GetHeight());
+        }
     }
 
     if (!handled) {
         SoftwareDelegate()->OperateRect(delegate_method, tar, reftar, rctar,
                                         textures);
-        if (dst != nullptr) dst->MarkCpuDirty();
+        if (dst != nullptr) {
+            dst->MarkCpuDirty();
+        }
     }
+    TVPRecordSdlGpuDraw(handled);
+    TVPRecordSdlGpuMethod(method_name.c_str(), handled);
     static const bool trace_methods = []() {
         const char *v = std::getenv("AETHERKIRI_SDL_GPU_TRACE_METHODS");
         return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;

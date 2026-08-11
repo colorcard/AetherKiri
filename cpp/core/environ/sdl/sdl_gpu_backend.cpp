@@ -24,6 +24,15 @@ SDL_GPUCommandBuffer *g_frame_cmd = nullptr;
 SDL_GPUCopyPass *g_frame_copy_pass = nullptr;
 SDL_GPURenderPass *g_frame_render_pass = nullptr;
 bool g_compositing = false;
+bool g_borrowed_frame = false;
+std::vector<SDL_GPUTransferBuffer *> g_borrowed_transfer_buffers;
+TVPSdlGpuBenchmarkStats g_benchmark_stats{};
+
+void WaitForGpuIdle() {
+    if(g_sdl_gpu_device == nullptr) return;
+    ++g_benchmark_stats.wait_idle_calls;
+    SDL_WaitForGPUIdle(g_sdl_gpu_device);
+}
 
 }  // namespace
 
@@ -32,13 +41,13 @@ void TVPSetSdlGpuDevice(SDL_GPUDevice *device) {
         TVPSubmitSdlGpuFrameAndWait();
     }
     if(g_readback_buffer != nullptr && g_sdl_gpu_device != nullptr) {
-        SDL_WaitForGPUIdle(g_sdl_gpu_device);
+        WaitForGpuIdle();
         SDL_ReleaseGPUTransferBuffer(g_sdl_gpu_device, g_readback_buffer);
         g_readback_buffer = nullptr;
         g_readback_buffer_size = 0;
     }
     if(g_upload_buffer != nullptr && g_sdl_gpu_device != nullptr) {
-        SDL_WaitForGPUIdle(g_sdl_gpu_device);
+        WaitForGpuIdle();
         SDL_ReleaseGPUTransferBuffer(g_sdl_gpu_device, g_upload_buffer);
         g_upload_buffer = nullptr;
         g_upload_buffer_size = 0;
@@ -49,6 +58,71 @@ void TVPSetSdlGpuDevice(SDL_GPUDevice *device) {
 SDL_GPUDevice *TVPGetSdlGpuDevice() { return g_sdl_gpu_device; }
 
 bool TVPIsSdlGpuActive() { return g_sdl_gpu_device != nullptr; }
+
+bool TVPBeginSdlGpuBorrowedFrame(SDL_GPUCommandBuffer *command_buffer) {
+    if(g_sdl_gpu_device == nullptr || command_buffer == nullptr ||
+       g_frame_cmd != nullptr)
+        return false;
+    g_frame_cmd = command_buffer;
+    g_borrowed_frame = true;
+    return true;
+}
+
+bool TVPEndSdlGpuBorrowedFrame() {
+    if(!g_borrowed_frame || g_frame_cmd == nullptr) return false;
+    if(g_frame_copy_pass != nullptr) {
+        SDL_EndGPUCopyPass(g_frame_copy_pass);
+        g_frame_copy_pass = nullptr;
+    }
+    if(g_frame_render_pass != nullptr) {
+        SDL_EndGPURenderPass(g_frame_render_pass);
+        g_frame_render_pass = nullptr;
+    }
+    g_frame_cmd = nullptr;
+    g_borrowed_frame = false;
+    g_compositing = false;
+    return true;
+}
+
+bool TVPIsSdlGpuBorrowedFrame() { return g_borrowed_frame; }
+
+void TVPFlushBorrowedSdlGpuTransferBuffers() {
+    if(g_sdl_gpu_device == nullptr) return;
+    for(auto *buffer : g_borrowed_transfer_buffers)
+        SDL_ReleaseGPUTransferBuffer(g_sdl_gpu_device, buffer);
+    g_borrowed_transfer_buffers.clear();
+}
+
+TVPSdlGpuBenchmarkStats TVPGetSdlGpuBenchmarkStats() {
+    return g_benchmark_stats;
+}
+
+void TVPResetSdlGpuBenchmarkStats() { g_benchmark_stats = {}; }
+
+void TVPRecordSdlGpuDraw(bool handled_on_gpu) {
+    if(handled_on_gpu) {
+        ++g_benchmark_stats.gpu_draw_calls;
+        ++g_benchmark_stats.render_passes;
+    }
+    else ++g_benchmark_stats.software_fallback_calls;
+}
+
+void TVPRecordSdlGpuMethod(const char *method_name, bool handled_on_gpu) {
+    if (!handled_on_gpu || method_name == nullptr) return;
+    if (std::strcmp(method_name, "FillARGB") == 0)
+        ++g_benchmark_stats.fill_argb_gpu_calls;
+    else if (std::strcmp(method_name, "FillColor") == 0)
+        ++g_benchmark_stats.fill_color_gpu_calls;
+    else if (std::strcmp(method_name, "AlphaBlend_d") == 0)
+        ++g_benchmark_stats.alpha_blend_d_gpu_calls;
+    else if (std::strcmp(method_name, "ConstColorAlphaBlend_d") == 0)
+        ++g_benchmark_stats.const_color_alpha_blend_d_gpu_calls;
+}
+
+void TVPRecordSdlGpuAuthorityBarrier(uint64_t bytes) {
+    ++g_benchmark_stats.authority_barrier_calls;
+    g_benchmark_stats.authority_barrier_bytes += bytes;
+}
 
 bool TVPReadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
                              uint32_t height, void *out_pixels,
@@ -65,7 +139,7 @@ bool TVPReadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
     TVPSubmitSdlGpuFrameAndWait();
     if(g_readback_buffer == nullptr || g_readback_buffer_size < required) {
         if(g_readback_buffer != nullptr) {
-            SDL_WaitForGPUIdle(g_sdl_gpu_device);
+            WaitForGpuIdle();
             SDL_ReleaseGPUTransferBuffer(g_sdl_gpu_device,
                                          g_readback_buffer);
         }
@@ -84,9 +158,11 @@ bool TVPReadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
     bool ok = false;
     SDL_GPUCommandBuffer *cmd =
         SDL_AcquireGPUCommandBuffer(g_sdl_gpu_device);
+    if(cmd != nullptr) ++g_benchmark_stats.command_buffers_acquired;
     if (cmd != nullptr) {
         SDL_GPUCopyPass *cp = SDL_BeginGPUCopyPass(cmd);
         if (cp != nullptr) {
+            ++g_benchmark_stats.copy_passes;
             SDL_GPUTextureRegion src{};
             src.texture = texture;
             src.w = width;
@@ -99,13 +175,16 @@ bool TVPReadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
             SDL_DownloadFromGPUTexture(cp, &src, &dst);
             SDL_EndGPUCopyPass(cp);
             if (SDL_SubmitGPUCommandBuffer(cmd)) {
-                SDL_WaitForGPUIdle(g_sdl_gpu_device);
+                ++g_benchmark_stats.command_buffers_submitted;
+                WaitForGpuIdle();
                 const void *mapped =
                     SDL_MapGPUTransferBuffer(g_sdl_gpu_device, tb, false);
                 if (mapped != nullptr) {
                     std::memcpy(out_pixels, mapped, required);
                     SDL_UnmapGPUTransferBuffer(g_sdl_gpu_device, tb);
                     ok = true;
+                    ++g_benchmark_stats.readback_calls;
+                    g_benchmark_stats.readback_bytes += required;
                 }
             }
         } else {
@@ -118,12 +197,72 @@ bool TVPReadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
 bool TVPUploadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
                                uint32_t height, const void *pixels,
                                uint32_t pitch) {
+    return TVPUploadSdlGpuTextureRgbaRegion(texture, width, height, 0, 0,
+                                            width, height, pixels, pitch);
+}
+
+bool TVPUploadSdlGpuTextureRgbaRegion(
+    SDL_GPUTexture *texture, uint32_t texture_width, uint32_t texture_height,
+    uint32_t x, uint32_t y, uint32_t width, uint32_t height,
+    const void *pixels, uint32_t pitch) {
     if(g_sdl_gpu_device == nullptr || texture == nullptr || pixels == nullptr ||
-       width == 0 || height == 0)
+       width == 0 || height == 0 || x > texture_width || y > texture_height ||
+       width > texture_width - x || height > texture_height - y)
         return false;
     const uint64_t required64 = static_cast<uint64_t>(width) * height * 4u;
     if(required64 > UINT32_MAX) return false;
     const uint32_t required = static_cast<uint32_t>(required64);
+    const bool full_upload = x == 0 && y == 0 && width == texture_width &&
+                             height == texture_height;
+    if(g_borrowed_frame) {
+        SDL_GPUTransferBufferCreateInfo info{};
+        info.usage = SDL_GPU_TRANSFERBUFFERUSAGE_UPLOAD;
+        info.size = required;
+        SDL_GPUTransferBuffer *buffer =
+            SDL_CreateGPUTransferBuffer(g_sdl_gpu_device, &info);
+        if(buffer == nullptr) return false;
+        void *mapped = SDL_MapGPUTransferBuffer(
+            g_sdl_gpu_device, buffer, false);
+        if(mapped == nullptr) {
+            SDL_ReleaseGPUTransferBuffer(g_sdl_gpu_device, buffer);
+            return false;
+        }
+        const uint32_t tight_pitch = width * 4u;
+        const auto *src = static_cast<const uint8_t *>(pixels);
+        auto *dst = static_cast<uint8_t *>(mapped);
+        for(uint32_t y = 0; y < height; ++y)
+            std::memcpy(dst + static_cast<size_t>(y) * tight_pitch,
+                        src + static_cast<size_t>(y) * pitch, tight_pitch);
+        SDL_UnmapGPUTransferBuffer(g_sdl_gpu_device, buffer);
+        SDL_GPUCopyPass *cp = TVPGetSdlGpuFrameCopyPass();
+        if(cp == nullptr) {
+            SDL_ReleaseGPUTransferBuffer(g_sdl_gpu_device, buffer);
+            return false;
+        }
+        SDL_GPUTextureTransferInfo src_info{};
+        src_info.transfer_buffer = buffer;
+        src_info.pixels_per_row = width;
+        src_info.rows_per_layer = height;
+        SDL_GPUTextureRegion dst_region{};
+        dst_region.texture = texture;
+        dst_region.x = x;
+        dst_region.y = y;
+        dst_region.w = width;
+        dst_region.h = height;
+        dst_region.d = 1;
+        SDL_UploadToGPUTexture(cp, &src_info, &dst_region, false);
+        g_borrowed_transfer_buffers.push_back(buffer);
+        ++g_benchmark_stats.upload_calls;
+        g_benchmark_stats.upload_bytes += required;
+        if (full_upload) {
+            ++g_benchmark_stats.full_upload_calls;
+            g_benchmark_stats.full_upload_bytes += required;
+        } else {
+            ++g_benchmark_stats.dirty_upload_calls;
+            g_benchmark_stats.dirty_upload_bytes += required;
+        }
+        return true;
+    }
     // The single staging buffer is deliberately serialized. Mapping with
     // cycle=true lets SDL allocate one backing store per upload until submit;
     // asset-heavy scene transitions can then reserve multiple gigabytes in a
@@ -158,10 +297,21 @@ bool TVPUploadSdlGpuTextureRgba(SDL_GPUTexture *texture, uint32_t width,
     src_info.rows_per_layer = height;
     SDL_GPUTextureRegion dst_region{};
     dst_region.texture = texture;
+    dst_region.x = x;
+    dst_region.y = y;
     dst_region.w = width;
     dst_region.h = height;
     dst_region.d = 1;
     SDL_UploadToGPUTexture(cp, &src_info, &dst_region, false);
+    ++g_benchmark_stats.upload_calls;
+    g_benchmark_stats.upload_bytes += required;
+    if (full_upload) {
+        ++g_benchmark_stats.full_upload_calls;
+        g_benchmark_stats.full_upload_bytes += required;
+    } else {
+        ++g_benchmark_stats.dirty_upload_calls;
+        g_benchmark_stats.dirty_upload_bytes += required;
+    }
     TVPSubmitSdlGpuFrameAndWait();
     return true;
 }
@@ -197,6 +347,7 @@ SDL_GPUCommandBuffer *TVPGetSdlGpuFrameCommandBuffer() {
     }
     if (g_frame_cmd == nullptr) {
         g_frame_cmd = SDL_AcquireGPUCommandBuffer(g_sdl_gpu_device);
+        if(g_frame_cmd != nullptr) ++g_benchmark_stats.command_buffers_acquired;
     }
     return g_frame_cmd;
 }
@@ -215,6 +366,7 @@ SDL_GPUCopyPass *TVPGetSdlGpuFrameCopyPass() {
     }
     if (g_frame_copy_pass == nullptr) {
         g_frame_copy_pass = SDL_BeginGPUCopyPass(cmd);
+        if(g_frame_copy_pass != nullptr) ++g_benchmark_stats.copy_passes;
     }
     return g_frame_copy_pass;
 }
@@ -250,8 +402,13 @@ void TVPSubmitSdlGpuFrame() {
         SDL_EndGPURenderPass(g_frame_render_pass);
         g_frame_render_pass = nullptr;
     }
+    if(g_borrowed_frame) {
+        g_compositing = false;
+        return;
+    }
     if (g_frame_cmd != nullptr) {
-        SDL_SubmitGPUCommandBuffer(g_frame_cmd);
+        if(SDL_SubmitGPUCommandBuffer(g_frame_cmd))
+            ++g_benchmark_stats.command_buffers_submitted;
         g_frame_cmd = nullptr;
     }
     g_compositing = false;
@@ -262,7 +419,7 @@ void TVPSubmitSdlGpuFrameAndWait() {
         return;
     }
     TVPSubmitSdlGpuFrame();
-    SDL_WaitForGPUIdle(g_sdl_gpu_device);
+    WaitForGpuIdle();
 }
 
 void TVPBeginSdlGpuComposite() {
@@ -272,4 +429,11 @@ void TVPBeginSdlGpuComposite() {
     g_compositing = true;
 }
 
-void TVPEndSdlGpuComposite() { TVPSubmitSdlGpuFrame(); }
+void TVPEndSdlGpuComposite() {
+    if(g_borrowed_frame) {
+        TVPEnsureSdlGpuRenderPassReady();
+        g_compositing = false;
+    } else {
+        TVPSubmitSdlGpuFrame();
+    }
+}

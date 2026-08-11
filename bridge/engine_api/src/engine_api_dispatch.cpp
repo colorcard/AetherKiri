@@ -970,6 +970,162 @@ engine_result_t engine_set_surface_size(engine_handle_t public_handle,
   return result;
 }
 
+namespace {
+
+engine_result_t DispatchSdlGpuSetDevice(engine_handle_t public_handle,
+                                       void* device) {
+  return Route(public_handle, "sdl_gpu.v1.set_device",
+               [&](engine_handle_t legacy) {
+                 const void* raw = nullptr;
+                 auto result = engine_legacy_query_interface(
+                     legacy, ENGINE_INTERFACE_RENDER_SDL_GPU_V1,
+                     ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1, &raw);
+                 if (result != ENGINE_RESULT_OK) return result;
+                 return static_cast<const engine_render_sdl_gpu_v1_t*>(raw)
+                     ->set_device(legacy, device);
+               },
+               [&](DispatchHandle*) { return ENGINE_RESULT_NOT_SUPPORTED; });
+}
+
+engine_result_t DispatchSdlGpuAcquire(
+    engine_handle_t public_handle, engine_sdl_gpu_frame_v1_t* out_frame) {
+  return Route(public_handle, "sdl_gpu.v1.acquire_frame",
+               [&](engine_handle_t legacy) {
+                 const void* raw = nullptr;
+                 auto result = engine_legacy_query_interface(
+                     legacy, ENGINE_INTERFACE_RENDER_SDL_GPU_V1,
+                     ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1, &raw);
+                 if (result != ENGINE_RESULT_OK) return result;
+                 return static_cast<const engine_render_sdl_gpu_v1_t*>(raw)
+                     ->acquire_frame(legacy, out_frame);
+               },
+               [&](DispatchHandle*) { return ENGINE_RESULT_NOT_SUPPORTED; });
+}
+
+engine_result_t DispatchSdlGpuRelease(engine_handle_t public_handle,
+                                     uint64_t lease_token, void* fence) {
+  return Route(public_handle, "sdl_gpu.v1.release_frame",
+               [&](engine_handle_t legacy) {
+                 const void* raw = nullptr;
+                 auto result = engine_legacy_query_interface(
+                     legacy, ENGINE_INTERFACE_RENDER_SDL_GPU_V1,
+                     ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1, &raw);
+                 if (result != ENGINE_RESULT_OK) return result;
+                 return static_cast<const engine_render_sdl_gpu_v1_t*>(raw)
+                     ->release_frame(legacy, lease_token, fence);
+               },
+               [&](DispatchHandle*) { return ENGINE_RESULT_NOT_SUPPORTED; });
+}
+
+engine_result_t DispatchSdlGpuGetStats(
+    engine_handle_t public_handle, engine_sdl_gpu_stats_v1_t* out_stats) {
+  return Route(public_handle, "sdl_gpu.v1.get_stats",
+               [&](engine_handle_t legacy) {
+                 const void* raw = nullptr;
+                 auto result = engine_legacy_query_interface(
+                     legacy, ENGINE_INTERFACE_RENDER_SDL_GPU_V1,
+                     ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1, &raw);
+                 if(result != ENGINE_RESULT_OK) return result;
+                 return static_cast<const engine_render_sdl_gpu_v1_t*>(raw)
+                     ->get_stats(legacy, out_stats);
+               },
+               [&](DispatchHandle*) { return ENGINE_RESULT_NOT_SUPPORTED; });
+}
+
+engine_result_t DispatchSdlGpuResetStats(engine_handle_t public_handle) {
+  return Route(public_handle, "sdl_gpu.v1.reset_stats",
+               [&](engine_handle_t legacy) {
+                 const void* raw = nullptr;
+                 auto result = engine_legacy_query_interface(
+                     legacy, ENGINE_INTERFACE_RENDER_SDL_GPU_V1,
+                     ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1, &raw);
+                 if(result != ENGINE_RESULT_OK) return result;
+                 return static_cast<const engine_render_sdl_gpu_v1_t*>(raw)
+                     ->reset_stats(legacy);
+               },
+               [&](DispatchHandle*) { return ENGINE_RESULT_NOT_SUPPORTED; });
+}
+
+const engine_render_sdl_gpu_v1_t kDispatchSdlGpuV1 = {
+    sizeof(engine_render_sdl_gpu_v1_t),
+    ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1,
+    DispatchSdlGpuSetDevice, DispatchSdlGpuAcquire, DispatchSdlGpuRelease,
+    DispatchSdlGpuGetStats, DispatchSdlGpuResetStats,
+    {}, {}};
+
+engine_result_t DispatchSdlGpuV2Begin(engine_handle_t handle, void* cmd) {
+  return Route(handle, "sdl_gpu.v2.begin_frame",
+               [&](engine_handle_t legacy) {
+                 const void* raw = nullptr;
+                 auto result = engine_legacy_query_interface(
+                     legacy, ENGINE_INTERFACE_RENDER_SDL_GPU_V2,
+                     ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2, &raw);
+                 if(result != ENGINE_RESULT_OK) return result;
+                 return static_cast<const engine_render_sdl_gpu_v2_t*>(raw)
+                     ->begin_frame(legacy, cmd);
+               },
+               [&](DispatchHandle*) { return ENGINE_RESULT_NOT_SUPPORTED; });
+}
+engine_result_t DispatchSdlGpuV2End(engine_handle_t handle,
+                                   engine_sdl_gpu_frame_v1_t* frame) {
+  return Route(handle, "sdl_gpu.v2.end_frame",
+               [&](engine_handle_t legacy) {
+                 const void* raw = nullptr;
+                 auto result = engine_legacy_query_interface(
+                     legacy, ENGINE_INTERFACE_RENDER_SDL_GPU_V2,
+                     ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2, &raw);
+                 if(result != ENGINE_RESULT_OK) return result;
+                 return static_cast<const engine_render_sdl_gpu_v2_t*>(raw)
+                     ->end_frame(legacy, frame);
+               },
+               [&](DispatchHandle*) { return ENGINE_RESULT_NOT_SUPPORTED; });
+}
+
+const engine_render_sdl_gpu_v2_t kDispatchSdlGpuV2 = {
+    sizeof(engine_render_sdl_gpu_v2_t),
+    ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2,
+    DispatchSdlGpuSetDevice,
+    DispatchSdlGpuV2Begin,
+    DispatchSdlGpuV2End,
+    DispatchSdlGpuRelease,
+    DispatchSdlGpuGetStats,
+    DispatchSdlGpuResetStats,
+    {}, {}};
+
+}  // namespace
+
+engine_result_t engine_query_interface(engine_handle_t public_handle,
+                                       const char* name, uint32_t version,
+                                       const void** out_interface) {
+  if (name == nullptr || out_interface == nullptr) {
+    return ThreadError(ENGINE_RESULT_INVALID_ARGUMENT,
+                       "interface name or output is null");
+  }
+  *out_interface = nullptr;
+  const bool wants_v1 =
+      strcmp(name, ENGINE_INTERFACE_RENDER_SDL_GPU_V1) == 0 &&
+      version == ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1;
+  const bool wants_v2 =
+      strcmp(name, ENGINE_INTERFACE_RENDER_SDL_GPU_V2) == 0 &&
+      version == ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2;
+  if(!wants_v1 && !wants_v2) {
+    return ThreadError(ENGINE_RESULT_NOT_SUPPORTED,
+                       "requested interface is unsupported");
+  }
+  const auto result = Route(
+      public_handle, "query_interface",
+      [&](engine_handle_t legacy) {
+        const void* ignored = nullptr;
+        return engine_legacy_query_interface(legacy, name, version, &ignored);
+      },
+      [&](DispatchHandle*) { return ENGINE_RESULT_NOT_SUPPORTED; });
+  if(result == ENGINE_RESULT_OK)
+    *out_interface = wants_v2
+        ? static_cast<const void*>(&kDispatchSdlGpuV2)
+        : static_cast<const void*>(&kDispatchSdlGpuV1);
+  return result;
+}
+
 engine_result_t engine_get_frame_desc(engine_handle_t public_handle,
                                       engine_frame_desc_t* out_frame_desc) {
   return Route(public_handle, "get_frame_desc",

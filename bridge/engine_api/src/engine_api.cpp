@@ -162,6 +162,9 @@ struct engine_handle_s {
   std::thread::id owner_thread;
   bool runtime_owner = false;
   uint64_t tick_count = 0;
+  uint64_t next_sdl_gpu_lease = 1;
+  std::unordered_set<uint64_t> sdl_gpu_leases;
+  std::vector<SDL_GPUFence*> sdl_gpu_completion_fences;
 
   // Frame state — readback buffer and tracking
   struct FrameState {
@@ -235,6 +238,9 @@ struct engine_handle_s {
     std::deque<std::string> events;
   } diagnostics;
 };
+
+extern "C" void PollSdlGpuCompletionFences(engine_handle_s* impl,
+                                             bool wait_all);
 
 class StandaloneMediaPlayer final : public KRMovie::TVPMoviePlayer {
  public:
@@ -1590,14 +1596,20 @@ bool CopyHostFrameLocked(engine_handle_s* impl) {
 bool CaptureHostGpuFrameLocked(engine_handle_s* impl) {
   if (impl == nullptr ||
       (impl->render.renderer != ENGINE_RENDERER_GODOT_NATIVE &&
-       impl->render.renderer != ENGINE_RENDERER_GPU_BRIDGE)) {
+       impl->render.renderer != ENGINE_RENDERER_GPU_BRIDGE &&
+       impl->render.renderer != ENGINE_RENDERER_SDL3_GPU)) {
     return false;
   }
   uint64_t texture = 0;
   uint32_t width = 0;
   uint32_t height = 0;
   uint64_t serial = 0;
-  if (!TVPHostGetLatestHostGpuFrame(&texture, &width, &height, &serial) ||
+  const bool is_sdl_gpu =
+      impl->render.renderer == ENGINE_RENDERER_SDL3_GPU;
+  const bool got_frame = is_sdl_gpu
+      ? TVPHostGetLatestHostGpuFrameSdl(&texture, &width, &height, &serial)
+      : TVPHostGetLatestHostGpuFrame(&texture, &width, &height, &serial);
+  if (!got_frame ||
       texture == 0 || width == 0 || height == 0) {
     return false;
   }
@@ -2324,6 +2336,8 @@ engine_result_t engine_destroy(engine_handle_t handle) {
     // is still alive. Some texture objects outlive a game session, so merely
     // flushing the deferred-release queue is insufficient.
     TVPSubmitSdlGpuFrameAndWait();
+    PollSdlGpuCompletionFences(impl, true);
+    impl->sdl_gpu_leases.clear();
     TVPReleaseAllSdlGpuTextures();
     TVPReleaseSdlGpuPipelines();
     TVPFlushReleasedSdlGpuTextures();
@@ -3534,6 +3548,7 @@ engine_result_t engine_flush_released_textures(engine_handle_t handle) {
   // after its present so a frame still being presented is never destroyed
   // mid-frame.
   TVPFlushReleasedSdlTextures();
+  PollSdlGpuCompletionFences(impl, false);
   ClearHandleErrorLocked(impl);
   SetThreadError(nullptr);
   return ENGINE_RESULT_OK;
@@ -3570,7 +3585,16 @@ engine_result_t engine_get_frame_desc(engine_handle_t handle,
   }
 
   if (!impl->frame.ready) {
-    CopyHostFrameLocked(impl);
+    uint32_t width = 0, height = 0, stride = 0;
+    uint64_t serial = 0;
+    if(TVPHostGetLatestFrameDesc(&width, &height, &stride, &serial) &&
+       width > 0 && height > 0 && stride > 0) {
+      impl->frame.width = width;
+      impl->frame.height = height;
+      impl->frame.stride_bytes = stride;
+      impl->frame.serial = serial;
+      impl->frame.ready = true;
+    }
   }
 
   FrameReadbackLayout layout;
@@ -4025,6 +4049,238 @@ engine_result_t engine_get_sdl_gpu_frame_texture(
   return EngineGetSdlGpuFrameTextureImpl(
       handle, out_texture_id, out_width, out_height, out_frame_serial,
       "engine_get_sdl_gpu_frame_texture");
+}
+
+void PollSdlGpuCompletionFences(engine_handle_s* impl, bool wait_all) {
+  SDL_GPUDevice* device = TVPGetSdlGpuDevice();
+  if (device == nullptr) {
+    impl->sdl_gpu_completion_fences.clear();
+    return;
+  }
+  auto& fences = impl->sdl_gpu_completion_fences;
+  for (auto it = fences.begin(); it != fences.end();) {
+    SDL_GPUFence* fence = *it;
+    if (wait_all) {
+      SDL_WaitForGPUFences(device, true, &fence, 1);
+    }
+    if (wait_all || SDL_QueryGPUFence(device, fence)) {
+      SDL_ReleaseGPUFence(device, fence);
+      it = fences.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (fences.empty()) {
+    TVPFlushReleasedSdlGpuTextures();
+    TVPFlushBorrowedSdlGpuTransferBuffers();
+  }
+}
+
+engine_result_t SdlGpuV1SetDevice(engine_handle_t handle, void* device) {
+  if (device == nullptr) {
+    std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+    engine_handle_s* impl = nullptr;
+    auto result = ValidateHandleLocked(handle, &impl);
+    if (result != ENGINE_RESULT_OK) return result;
+    std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+    if (!impl->sdl_gpu_leases.empty()) {
+      return SetHandleErrorAndReturnLocked(
+          impl, ENGINE_RESULT_INVALID_STATE,
+          "cannot detach SDL_GPU device while frame leases are outstanding");
+    }
+    PollSdlGpuCompletionFences(impl, true);
+  }
+  return engine_set_sdl_gpu_device(handle, device);
+}
+
+engine_result_t SdlGpuV1AcquireFrame(
+    engine_handle_t handle, engine_sdl_gpu_frame_v1_t* out_frame) {
+  if (out_frame == nullptr ||
+      out_frame->struct_size < sizeof(engine_sdl_gpu_frame_v1_t)) {
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "SDL_GPU frame descriptor is too small");
+  }
+  engine_submit_sdl_gpu_frame(handle);
+  uint64_t texture = 0, serial = 0;
+  uint32_t width = 0, height = 0;
+  auto result = engine_get_sdl_gpu_frame_texture(
+      handle, &texture, &width, &height, &serial);
+  if (result != ENGINE_RESULT_OK) return result;
+
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  PollSdlGpuCompletionFences(impl, false);
+  const uint64_t token = impl->next_sdl_gpu_lease++;
+  impl->sdl_gpu_leases.insert(token);
+  memset(out_frame, 0, sizeof(*out_frame));
+  out_frame->struct_size = sizeof(*out_frame);
+  out_frame->width = width;
+  out_frame->height = height;
+  out_frame->format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+  out_frame->frame_serial = serial;
+  out_frame->texture = reinterpret_cast<void*>(static_cast<uintptr_t>(texture));
+  out_frame->lease_token = token;
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t SdlGpuV1ReleaseFrame(engine_handle_t handle,
+                                    uint64_t lease_token,
+                                    void* completion_fence) {
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  if (lease_token == 0 || impl->sdl_gpu_leases.erase(lease_token) != 1) {
+    return SetHandleErrorAndReturnLocked(impl, ENGINE_RESULT_INVALID_ARGUMENT,
+                                         "SDL_GPU frame lease is invalid");
+  }
+  if (completion_fence != nullptr) {
+    impl->sdl_gpu_completion_fences.push_back(
+        static_cast<SDL_GPUFence*>(completion_fence));
+  } else if (impl->sdl_gpu_leases.empty()) {
+    TVPFlushReleasedSdlGpuTextures();
+  }
+  // SDL retains submitted transfer resources until command completion; drop
+  // the engine's references now so the borrowed-frame upload pool stays
+  // bounded even while multiple fences are in flight.
+  TVPFlushBorrowedSdlGpuTransferBuffers();
+  PollSdlGpuCompletionFences(impl, false);
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t SdlGpuV1GetStats(engine_handle_t handle,
+                                engine_sdl_gpu_stats_v1_t* out_stats) {
+  constexpr size_t kStatsV1Minimum =
+      offsetof(engine_sdl_gpu_stats_v1_t, fill_argb_gpu_calls);
+  if(out_stats == nullptr || out_stats->struct_size < kStatsV1Minimum)
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "SDL_GPU stats descriptor is too small");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  const auto stats = TVPGetSdlGpuBenchmarkStats();
+  const uint32_t caller_size = out_stats->struct_size;
+  memset(out_stats, 0, std::min<size_t>(caller_size, sizeof(*out_stats)));
+  out_stats->struct_size = sizeof(*out_stats);
+#define COPY_STAT(name) do { \
+  if(caller_size >= offsetof(engine_sdl_gpu_stats_v1_t, name) + \
+                    sizeof(out_stats->name)) out_stats->name = stats.name; \
+} while(false)
+  COPY_STAT(command_buffers_acquired);
+  COPY_STAT(command_buffers_submitted);
+  COPY_STAT(render_passes);
+  COPY_STAT(copy_passes);
+  COPY_STAT(wait_idle_calls);
+  COPY_STAT(upload_calls);
+  COPY_STAT(upload_bytes);
+  COPY_STAT(full_upload_calls);
+  COPY_STAT(full_upload_bytes);
+  COPY_STAT(dirty_upload_calls);
+  COPY_STAT(dirty_upload_bytes);
+  COPY_STAT(readback_calls);
+  COPY_STAT(readback_bytes);
+  COPY_STAT(gpu_draw_calls);
+  COPY_STAT(software_fallback_calls);
+  COPY_STAT(fill_argb_gpu_calls);
+  COPY_STAT(fill_color_gpu_calls);
+  COPY_STAT(alpha_blend_d_gpu_calls);
+  COPY_STAT(const_color_alpha_blend_d_gpu_calls);
+  COPY_STAT(authority_barrier_calls);
+  COPY_STAT(authority_barrier_bytes);
+#undef COPY_STAT
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t SdlGpuV1ResetStats(engine_handle_t handle) {
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  TVPResetSdlGpuBenchmarkStats();
+  return ENGINE_RESULT_OK;
+}
+
+static const engine_render_sdl_gpu_v1_t kSdlGpuV1 = {
+    sizeof(engine_render_sdl_gpu_v1_t),
+    ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1,
+    SdlGpuV1SetDevice,
+    SdlGpuV1AcquireFrame,
+    SdlGpuV1ReleaseFrame,
+    SdlGpuV1GetStats,
+    SdlGpuV1ResetStats,
+    {}, {}};
+
+engine_result_t SdlGpuV2BeginFrame(engine_handle_t handle,
+                                  void* command_buffer) {
+  if(command_buffer == nullptr)
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "SDL_GPU command buffer is null");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  if(!TVPBeginSdlGpuBorrowedFrame(
+         static_cast<SDL_GPUCommandBuffer*>(command_buffer)))
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INVALID_STATE,
+        "could not begin borrowed SDL_GPU frame");
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t SdlGpuV2EndFrame(engine_handle_t handle,
+                                engine_sdl_gpu_frame_v1_t* out_frame) {
+  if(!TVPEndSdlGpuBorrowedFrame())
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_STATE,
+                                   "no borrowed SDL_GPU frame is active");
+  return SdlGpuV1AcquireFrame(handle, out_frame);
+}
+
+static const engine_render_sdl_gpu_v2_t kSdlGpuV2 = {
+    sizeof(engine_render_sdl_gpu_v2_t),
+    ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2,
+    SdlGpuV1SetDevice,
+    SdlGpuV2BeginFrame,
+    SdlGpuV2EndFrame,
+    SdlGpuV1ReleaseFrame,
+    SdlGpuV1GetStats,
+    SdlGpuV1ResetStats,
+    {}, {}};
+
+engine_result_t engine_query_interface(engine_handle_t handle,
+                                       const char* name, uint32_t version,
+                                       const void** out_interface) {
+  if (name == nullptr || out_interface == nullptr) {
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "interface name or output is null");
+  }
+  *out_interface = nullptr;
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) return result;
+  const bool wants_v1 =
+      strcmp(name, ENGINE_INTERFACE_RENDER_SDL_GPU_V1) == 0 &&
+      version == ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1;
+  const bool wants_v2 =
+      strcmp(name, ENGINE_INTERFACE_RENDER_SDL_GPU_V2) == 0 &&
+      version == ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2;
+  if(!wants_v1 && !wants_v2) {
+    return SetHandleErrorAndReturnLocked(impl, ENGINE_RESULT_NOT_SUPPORTED,
+                                         "requested interface is unsupported");
+  }
+  *out_interface = wants_v2 ? static_cast<const void*>(&kSdlGpuV2)
+                            : static_cast<const void*>(&kSdlGpuV1);
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
 }
 
 engine_result_t engine_get_host_native_window(engine_handle_t handle,

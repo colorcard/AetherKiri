@@ -31,6 +31,10 @@ engine_result_t engine_legacy_set_option(engine_handle_t handle,
 engine_result_t engine_legacy_set_surface_size(engine_handle_t handle,
                                                uint32_t width,
                                                uint32_t height);
+engine_result_t engine_legacy_query_interface(engine_handle_t handle,
+                                              const char* name,
+                                              uint32_t version,
+                                              const void** out_interface);
 engine_result_t engine_legacy_set_sdl_renderer(engine_handle_t handle,
                                                 void* sdl_renderer_ptr);
 engine_result_t engine_legacy_set_sdl_gpu_device(engine_handle_t handle,

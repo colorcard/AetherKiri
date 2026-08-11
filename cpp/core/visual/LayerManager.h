@@ -308,6 +308,8 @@ class tTVPLayerManager : public iTVPLayerManager, public tTVPDrawable {
 
     bool InNotifyingHintOrCursorChange;
     bool HoldAlpha = true;
+    tjs_uint64 LayerSnapshotFrame = 0;
+    tjs_uint64 LayerSnapshotLastTick = 0;
     tTVPBaseTexture *EnsureDrawBufferSize(tjs_int w, tjs_int h,
                                           bool clear_on_resize);
     tTVPBaseTexture *EnsureDrawBufferMatchesPrimary(bool clear_on_resize);

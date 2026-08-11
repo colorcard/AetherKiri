@@ -86,6 +86,7 @@ extern const tjs_char *TVPGetPatchRuntimeRegistryExpression();
 extern const tjs_char *TVPGetPatchRuntimeInstanceRecoveryScript();
 extern const tjs_char *TVPGetD3DStandSourcePatchScript();
 extern const tjs_char *TVPGetD3DEmoteGpuBatchPatchScript();
+extern const tjs_char *TVPGetWorldLayerClonePatchScript();
 extern bool TVPMergeObjectMembers(iTJSDispatch2 *destination,
                                   iTJSDispatch2 *source);
 extern bool TVPMergeMissingObjectMembers(iTJSDispatch2 *destination,

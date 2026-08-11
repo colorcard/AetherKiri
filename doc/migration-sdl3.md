@@ -110,15 +110,23 @@ UI 壳 (aetherkiri_ui: ImGui Launcher/Overlay/诊断)   ── 可选
 - **软件路径**：CPU 合成 → readback（保留，截图/诊断依赖）
 - **gpu_bridge**：引擎内嵌 SDL 纹理直写（ABGR8888 流式 + `SDL_LockTexture`），宿主
   `SDL_RenderTexture` 零拷贝直显（已落地）
-- **sdl3_gpu（2026-08-11 落地）**：SDL_GPU shader-pipeline 合成器。rect blend 操作
-  （Copy/AlphaBlend/PsScreen/PsAdd/PsSub/PsMul）记录到逐帧 SDL_GPU command buffer，
-  用自定义 SPIR-V pipeline 合成；`_d`（读目标）模式、triangles、mask 回退软件保证
-  像素一致。宿主注入 `SDL_GPUDevice`（`engine_set_sdl_gpu_device`）。
+- **sdl3_gpu（2026-08-11 落地）**：SDL_GPU 呈现与实验 shader-pipeline 合成器。
+  普通 AlphaBlend 使用
+  KiriKiri 的 8-bit `/256` 算术，而固定功能 UNORM blend 是 `/255`；为保证 AE=0，
+  默认用一致的软件合成 authority，再单次上传给 SDL_GPU 呈现。Copy/Fill/Ps* 与
+  软件 AlphaBlend 的混合路径会产生同步长帧，仅由
+  `AETHERKIRI_SDL_GPU_ENABLE_MIXED_DRAWS=1` 实验启用。宿主注入
+  `SDL_GPUDevice`（`engine_set_sdl_gpu_device`）。
+
+默认选择（2026-08-11）：`aetherkiri_ui` 与独立引擎壳均默认 `gpu_bridge`。
+千恋万花的标题→流程图层交换在 software/gpu_bridge 正常，而 `sdl3_gpu` 仍会保留
+旧标题层；在定位 SDL_GPU 纹理/层交换的首个差异前，后者仅通过显式
+`--render-backend sdl3_gpu` 启用。
 
 关键结论（2026-08-11）：
 
 - **语义保真**：demo 逐像素 0.00% 差异（sdl3_gpu vs software），gpu_bridge 也 0%。
-  这证明 GPU 合成（非 `_d`）完全正确。
+  默认一致的软件合成 authority 维持该结果，同时仍使用 SDL_GPU 零 readback 呈现。
 - **swapchain 零拷贝 present（aetherkiri_engine 已落地）**：`engine_get_sdl_gpu_frame_texture`
   发布合成帧的 SDL_GPUTexture，宿主 `SDL_BlitGPUTexture` 到 swapchain 直显（无 readback）。
   截图通过 `engine_read_frame_rgba` 按需下载 GPU 纹理，不影响正常 present 热路径。
@@ -257,3 +265,18 @@ out/linux/debug/apps/sdl_host/aetherkiri_sdl --game demos/aetherkiri-test/data -
   当成 RSS。
 - 验证：demo software/sdl3_gpu PPM SHA-256 相同；千恋万花 UI 壳 10 秒基准
   56.8 fps，最大 RSS 约 954 MiB（修复前约 12 GiB），静态运行 RSS 保持稳定。
+
+## 12. Fill、dirty upload 与区域 `_d` 实验（2026-08-11）
+
+- `FillARGB`/`FillColor` 使用子矩形 SDL_GPU quad；后者通过 RGB write mask
+  保留目标 alpha。`AETHERKIRI_SDL_GPU_DISABLE_FILL=1` 可做 A/B。
+- CPU texture 修改仍合并 dirty rect，但默认上传完整纹理；真实游戏证明部分 bitmap
+  writer 会在声明区域外更新或保留 scanline 指针，局部上传会产生水平带与旧 UI
+  碎片。`AETHERKIRI_SDL_GPU_ENABLE_DIRTY_UPLOAD=1` 仅用于继续调查该契约。
+- `AETHERKIRI_SDL_GPU_ENABLE_D_BLEND=1` 启用区域 scratch 的
+  `AlphaBlend_d`/`ConstColorAlphaBlend_d`。opacity 表使用 CPU 同源的 256x256
+  lookup texture，scratch 按精确尺寸池化，避免在途 command buffer 复用或提前释放。
+- 动态 workload 位于 `demos/aetherkiri-gpu-bench/data`；正式 A/B 用
+  `tools/benchmark_sdl_gpu_ab.sh`，只接受 Release 真实桌面结果。
+- 当前实验路径仍默认关闭：self-test 的启用/关闭截图尚有 617 个差异像素，集中在
+  半透明文字和少量抗锯齿边缘。任何 AE 非零都阻止默认开启。

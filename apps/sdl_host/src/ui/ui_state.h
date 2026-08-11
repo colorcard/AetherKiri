@@ -8,7 +8,9 @@
 
 struct UiSettings {
     std::string game_path;
-    std::string render_backend = "software";
+    // Mature zero-readback path. SDL_GPU remains selectable for compositor
+    // development, but is not yet the safe default for layer-heavy games.
+    std::string render_backend = "gpu_bridge";
     uint32_t fps_limit = 0;           // 0 = unlimited
     std::string diagnostics_profile;  // empty = off
     uint32_t slow_frame_threshold_ms = 20;
