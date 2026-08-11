@@ -119,6 +119,9 @@ UI 壳 (aetherkiri_ui: ImGui Launcher/Overlay/诊断)   ── 可选
 
 - **语义保真**：demo 逐像素 0.00% 差异（sdl3_gpu vs software），gpu_bridge 也 0%。
   这证明 GPU 合成（非 `_d`）完全正确。
+- **swapchain 零拷贝 present（aetherkiri_engine 已落地）**：`engine_get_sdl_gpu_frame_texture`
+  发布合成帧的 SDL_GPUTexture，宿主 `SDL_BlitGPUTexture` 到 swapchain 直显（无 readback）。
+  截图走 `engine_read_frame_rgba`。千恋万花主菜单 87.8% 彩色正常。
 - **SDL3 升级 3.2.22 → 3.4.14**（vcpkg baseline 更新）：3.2.22 的 Vulkan backend 对
   自定义 fragment shader 的 descriptor set 布局要求不匹配（fragment 资源必须 set 2、
   fragment uniform set 3、vertex uniform set 1），导致离屏 render pass 无效。
@@ -126,18 +129,20 @@ UI 壳 (aetherkiri_ui: ImGui Launcher/Overlay/诊断)   ── 可选
   - software：2483 fps（tick 0.13ms，readback 0.02ms，upload 0.06ms）
   - sdl3_gpu（readback present）：2421 fps（tick 0.14ms）
   - gpu_bridge（零拷贝 present）：6787 fps（tick 0.00ms，无 upload）
-  - **结论：性能瓶颈是 present readback/upload，不是合成**。sdl3_gpu 下一步必须
-    实现 **swapchain 零拷贝 present**（AcquireGPUSwapchainTexture 直显），才能体现
-    GPU 合成价值。
+  - **结论：性能瓶颈是 present readback/upload，不是合成**。sdl3_gpu 的 swapchain
+    present（已落地）应达到与 gpu_bridge 相当的水平（待 sdl_host benchmark 确认）。
 
 后续可深化项：
 
-- **sdl3_gpu swapchain 零拷贝 present**（关键）：宿主 acquire swapchain → 引擎 GPU
-  帧纹理 blit 到 swapchain → submit。结合 GPU 合成应显著超越 gpu_bridge。
+- **sdl_host 的 swapchain present**：aetherkiri_engine 已落地零拷贝 swapchain present；
+  sdl_host（ImGui 叠层）仍走 readback，需 ImGui 改 SDL_GPU 后端才能直显。同时用
+  sdl_host benchmark 量化 swapchain present 的 fps。
 - **`_d`（读目标）模式 GPU 化**：`DrawRectD` + `blend_d.frag`（scratch 复制 dst +
   双 sampler）已实现为参考，但需全 GPU 合成管线（消除 GPU/CPU 目标内容分叉）才能
-  像素一致启用。
+  像素一致启用。当前 `_d` 回退软件（0% 一致）。
 - **triangles / mask GPU 路径**（`SDL_RenderGeometry` 等价的 SDL_GPU 管线）。
+- **SDL_GPU 退出清理警告**：设备销毁时仍有 transfer buffer 未释放（验证层警告，
+  不影响运行），需在 teardown 完整 flush。
 - 软件路径 readback 最终移除（截图/诊断保留）。
 
 ### 阶段 3: 纹理导出 + UI 层接入（1-2 周）
