@@ -83,6 +83,12 @@ typedef struct engine_frame_desc_t {
 #define ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1 1u
 #define ENGINE_INTERFACE_RENDER_SDL_GPU_V2 "engine.render.sdl_gpu.v2"
 #define ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2 2u
+#define ENGINE_INTERFACE_VISUAL_DIAGNOSTICS_V1 \
+  "engine.visual_diagnostics.v1"
+#define ENGINE_VISUAL_DIAGNOSTICS_INTERFACE_VERSION_1 1u
+#define ENGINE_INTERFACE_VISUAL_CHECKPOINT_V1 \
+  "engine.visual_checkpoint.v1"
+#define ENGINE_VISUAL_CHECKPOINT_INTERFACE_VERSION_1 1u
 
 typedef struct engine_sdl_gpu_frame_v1_t {
   uint32_t struct_size;
@@ -162,6 +168,60 @@ typedef struct engine_render_sdl_gpu_v2_t {
   uint64_t reserved_u64[4];
   void* reserved_ptr[4];
 } engine_render_sdl_gpu_v2_t;
+
+/* Read-only, on-demand snapshot of the last completed visual frame. The
+ * first call may pass out_buffer=NULL and buffer_size=0 to query the required
+ * byte count (including the trailing NUL). A short buffer returns
+ * ENGINE_RESULT_INVALID_ARGUMENT and leaves the snapshot available. */
+typedef struct engine_visual_diagnostics_v1_t {
+  uint32_t struct_size;
+  uint32_t interface_version;
+  engine_result_t (*get_snapshot_json)(engine_handle_t engine,
+                                       char* out_buffer,
+                                       uint32_t buffer_size,
+                                       uint32_t* out_required_bytes);
+  uint64_t reserved_u64[4];
+  void* reserved_ptr[4];
+} engine_visual_diagnostics_v1_t;
+
+typedef enum engine_visual_checkpoint_status_t {
+  ENGINE_VISUAL_CHECKPOINT_PENDING = 1,
+  ENGINE_VISUAL_CHECKPOINT_READY = 2,
+  ENGINE_VISUAL_CHECKPOINT_FAILED = 3
+} engine_visual_checkpoint_status_t;
+
+typedef struct engine_visual_checkpoint_info_v1_t {
+  uint32_t struct_size;
+  uint32_t status;
+  uint64_t token;
+  uint64_t frame_serial;
+  uint32_t width;
+  uint32_t height;
+  uint32_t stride_bytes;
+  uint32_t pixel_format;
+  uint64_t rgba_bytes;
+  uint32_t snapshot_json_bytes; /* Includes the trailing NUL. */
+  uint32_t reserved_u32;
+  uint64_t reserved_u64[4];
+  void* reserved_ptr[4];
+} engine_visual_checkpoint_info_v1_t;
+
+/* A request is consumed exactly once by the next completed visual frame.
+ * get_capture may be used first with NULL output buffers to query sizes.
+ * Pixels and the diagnostics JSON always describe info.frame_serial. */
+typedef struct engine_visual_checkpoint_v1_t {
+  uint32_t struct_size;
+  uint32_t interface_version;
+  engine_result_t (*request_capture)(engine_handle_t engine,
+                                     uint64_t* out_token);
+  engine_result_t (*get_capture)(
+      engine_handle_t engine, uint64_t token,
+      engine_visual_checkpoint_info_v1_t* out_info,
+      void* out_rgba, size_t rgba_size,
+      char* out_snapshot_json, uint32_t snapshot_json_size);
+  uint64_t reserved_u64[4];
+  void* reserved_ptr[4];
+} engine_visual_checkpoint_v1_t;
 
 typedef enum engine_media_status_t {
   ENGINE_MEDIA_STATUS_IDLE = 0,

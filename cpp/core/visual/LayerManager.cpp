@@ -40,8 +40,13 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <sstream>
 
 namespace {
+// Engine APIs are owner-thread-affine, so this pointer is read and written on
+// the same thread. It avoids any snapshot work in normal rendering.
+tTVPLayerManager *TVPLastCompletedLayerManager = nullptr;
+
 std::string TVPJsonEscape(std::string_view value) {
     std::string escaped;
     escaped.reserve(value.size() + 8);
@@ -65,6 +70,22 @@ std::string TVPJsonEscape(std::string_view value) {
         }
     }
     return escaped;
+}
+
+std::string TVPLayerStablePath(tTJSNI_BaseLayer *layer) {
+    std::vector<tTJSNI_BaseLayer *> chain;
+    for(auto *cursor = layer; cursor; cursor = cursor->GetParent())
+        chain.push_back(cursor);
+    std::string path;
+    for(auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if(!path.empty()) path.push_back('/');
+        const std::string name = (*it)->GetName().AsStdString();
+        path += name.empty() ? "<unnamed>" : name;
+        path.push_back('[');
+        path += std::to_string((*it)->GetOrderIndex());
+        path.push_back(']');
+    }
+    return path;
 }
 
 bool TVPLayerSnapshotSelectFrame(tjs_uint64 frame) {
@@ -898,6 +919,8 @@ tTVPLayerManager::tTVPLayerManager(iTVPLayerTreeOwner *owner) {
 }
 //---------------------------------------------------------------------------
 tTVPLayerManager::~tTVPLayerManager() {
+    if(TVPLastCompletedLayerManager == this)
+        TVPLastCompletedLayerManager = nullptr;
     if(DrawBuffer)
         delete DrawBuffer;
 }
@@ -2297,6 +2320,9 @@ void tTVPLayerManager::UpdateToDrawDevice() {
     const tTVPRect snapshot_dirty = snapshot_dirty_count > 0
         ? UpdateRegion.GetBound()
         : tTVPRect(0, 0, 0, 0);
+    LastCompletedUpdateRegion = snapshot_dirty;
+    LastCompletedUpdateRegionCount = snapshot_dirty_count;
+    TVPLastCompletedLayerManager = this;
     Primary->CompleteForWindow(this);
     const tjs_uint64 snapshot_tick = TVPGetRoughTickCount32();
     // Completion may run repeatedly while a script builds a layer tree. Treat
@@ -2312,6 +2338,84 @@ void tTVPLayerManager::UpdateToDrawDevice() {
     process_pending_enter(true);
     TVPTraceCgModeViewTransIdle(this, (tjs_int)Primary->GetWidth() / 2,
                                 (tjs_int)Primary->GetHeight() / 2);
+}
+
+bool TVPCaptureVisualDiagnosticsJson(tjs_uint64 frame_serial,
+                                     tjs_uint surface_width,
+                                     tjs_uint surface_height,
+                                     const std::string &backend,
+                                     std::string &out_json) {
+    auto *manager = TVPLastCompletedLayerManager;
+    if(!manager || !manager->GetPrimaryLayer()) return false;
+
+    const bool sdl_gpu = backend == "sdl3_gpu";
+    const bool gpu_bridge = backend == "gpu_bridge";
+    const char *authority = sdl_gpu ? "cpu_gpu_synchronized"
+                            : (gpu_bridge ? "gpu" : "cpu");
+    const char *final_method = sdl_gpu ? "coherent_software_composite_upload"
+                               : (gpu_bridge ? "sdl_texture_upload"
+                                             : "software_composite");
+    const char *fallback_reason = sdl_gpu
+        ? "\"mixed_draws_disabled_for_pixel_stability\"" : "null";
+    const auto &dirty = manager->GetLastCompletedUpdateRegion();
+
+    std::ostringstream json;
+    json << "{\"schema\":\"engine.visual_diagnostics.v1\""
+         << ",\"frame_serial\":" << frame_serial
+         << ",\"surface\":{\"width\":" << surface_width
+         << ",\"height\":" << surface_height << "}"
+         << ",\"backend\":\"" << TVPJsonEscape(backend) << "\""
+         << ",\"layers\":[";
+    bool first = true;
+    for(auto *layer : manager->GetAllNodes()) {
+        if(!layer) continue;
+        if(!first) json << ',';
+        first = false;
+        auto *parent = layer->GetParent();
+        auto *image = layer->GetMainImage();
+        const auto &clip = layer->GetClip();
+        json << "{\"path\":\""
+             << TVPJsonEscape(TVPLayerStablePath(layer)) << "\""
+             << ",\"name\":\""
+             << TVPJsonEscape(layer->GetName().AsStdString()) << "\""
+             << ",\"parent\":";
+        if(parent)
+            json << "\"" << TVPJsonEscape(TVPLayerStablePath(parent)) << "\"";
+        else
+            json << "null";
+        json << ",\"order\":" << layer->GetOrderIndex()
+             << ",\"visible\":" << (layer->GetVisible() ? "true" : "false")
+             << ",\"node_visible\":" << (layer->GetNodeVisible() ? "true" : "false")
+             << ",\"opacity\":" << layer->GetOpacity()
+             << ",\"type\":\""
+             << TVPJsonEscape(ttstr(layer->GetTypeNameString()).AsStdString())
+             << "\",\"rect\":{\"left\":" << layer->GetLeft()
+             << ",\"top\":" << layer->GetTop()
+             << ",\"width\":" << layer->GetWidth()
+             << ",\"height\":" << layer->GetHeight() << "}"
+             << ",\"clip\":{\"left\":" << clip.left
+             << ",\"top\":" << clip.top
+             << ",\"right\":" << clip.right
+             << ",\"bottom\":" << clip.bottom << "}"
+             << ",\"transform\":[1,0,0,1," << layer->GetLeft()
+             << ',' << layer->GetTop() << ']'
+             << ",\"image\":{\"present\":" << (image ? "true" : "false")
+             << ",\"width\":" << (image ? image->GetWidth() : 0)
+             << ",\"height\":" << (image ? image->GetHeight() : 0)
+             << ",\"content_revision\":"
+             << (layer->GetImageModified() ? 1 : 0) << "}"
+             << ",\"update_region\":{\"count\":"
+             << manager->GetLastCompletedUpdateRegionCount()
+             << ",\"left\":" << dirty.left << ",\"top\":" << dirty.top
+             << ",\"right\":" << dirty.right << ",\"bottom\":"
+             << dirty.bottom << "}"
+             << ",\"texture_authority\":\"" << authority << "\""
+             << ",\"final_render_method\":\"" << final_method << "\""
+             << ",\"fallback_reason\":" << fallback_reason << '}';
+    }
+    json << "]}";
+    out_json = json.str();
+    return true;
 }
 //---------------------------------------------------------------------------
 void tTVPLayerManager::NotifyUpdateRegionFixed() {

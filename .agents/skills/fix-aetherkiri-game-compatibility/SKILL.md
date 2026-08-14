@@ -19,7 +19,20 @@ Do not treat a deliberately missing or modified save, an unrelated popup, or a s
 
 ## Reproduce with evidence
 
-1. Launch through the normal AetherKiri game-selection interface unless the user explicitly requests direct auto-start.
+1. For rendering and layer compatibility regressions covered by a profile in
+   `tests/visual_profiles/`, use the resource-driven visual compatibility
+   runner first:
+
+   ```bash
+   AETHERKIRI_<GAME>_PATH=/absolute/game/path \
+     ./tools/check_visual_compat.sh <profile>
+   ```
+
+   Use `--quick` for the controlled Debug software/gpu_bridge loop. The default
+   run also exercises the quarantined backends and Release desktop
+   certification. For flows without a visual profile, launch through the
+   normal AetherKiri game-selection interface unless the user explicitly
+   requests direct auto-start.
 2. Capture the newest KiriKiri/AetherKiri log and correlate it with the visible symptom. Use focused diagnostic environment variables only when existing evidence is insufficient.
 3. Reduce the failure to the first unsupported boundary, for example:
    - path normalization or archive lookup;
@@ -30,6 +43,15 @@ Do not treat a deliberately missing or modified save, an unrelated popup, or a s
    - input-method composition and committed-text delivery.
 4. Distinguish startup success from gameplay success. A title page proves only the startup path; it does not verify save/load, prolonged play, galleries, movies, character rendering, or plugin-driven RPG scenes.
 5. Prefer narrow tracing that exposes names, types, arguments, transitions, and failure codes. Avoid permanent high-volume logging unless it is independently useful and appropriately gated.
+
+For a profiled visual run, treat the software backend as the visual oracle.
+The runner must use its isolated shadow game directory and write screenshots,
+layer snapshots, logs, fingerprints, and saves only below ignored
+`out/compat/`. Never copy commercial resources or generated references into
+Git. Checkpoints must be captured through `engine.visual_checkpoint.v1`, which
+atomically binds pixels, normalized layers, diagnostics, and frame serial to
+the same completed frame. Do not replace these checkpoints with desktop
+screenshots or timer-only sleeps.
 
 For an existing diagnostic ZIP, use `$unpack-investigate-artifacts` rather than recollecting evidence.
 
@@ -81,6 +103,29 @@ Run validation in increasing scope:
 6. Reproduce the formerly failing boundary and continue beyond it.
 7. Exercise the relevant regression surface: background and character rendering, repeated save/load after extended runtime, input, audio, scene changes, return-to-title behavior, or native-plugin-dependent RPG rendering.
 8. Inspect logs for script errors, bridge failures, missing module registrations, crashes, deadlocks, and repeated warnings.
+
+For resource-driven visual validation:
+
+1. Keep an unapproved software run as a candidate. Create or update a local
+   reference only with an explicit, human-reviewed command:
+
+   ```bash
+   ./tools/check_visual_compat.sh <profile> approve-reference \
+     --reviewed-run out/compat/runs/... --confirm
+   ```
+
+2. Require software and `gpu_bridge` to pass. Always report `sdl3_gpu` when it
+   runs, but keep it quarantined until its profile and Release certification
+   pass and the project explicitly promotes it.
+3. Report every checkpoint's layer equality, ROI results, RGB MAE/P99,
+   luminance SSIM, edge F1, and largest structural difference. A process exit
+   or a non-black frame alone is not a visual pass.
+4. Preserve failure artifacts and the failed predicate below `out/compat/`.
+   A missing reference, unavailable GPU, resource fingerprint change, source
+   directory write, or timeout is a distinct result and must not silently
+   update the baseline.
+5. Use C ABI input injection from the scenario runner. Do not use `xdotool` or
+   window screenshots for checkpoint control.
 
 Do not claim success from compilation alone. For a render fix, require a presented non-black frame with the expected layers. For an RPG/native-plugin fix, enter the RPG scene and verify its map, character, HUD, and input rather than relying on story-mode startup.
 

@@ -15,12 +15,19 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
+#if defined(__linux__)
+#include <unistd.h>
+#endif
 
 #include "engine_api.h"
 #include "engine_options.h"
 #include "host_input.h"
+#include "scenario.h"
 
 namespace {
 
@@ -41,6 +48,22 @@ struct ShellState {
     std::string screenshot_path;
     int screenshot_after_frames = 0;
     int frame_count_since_start = 0;
+
+    std::string scenario_path;
+    std::string scenario_output = "out/compat/scenario";
+    std::unique_ptr<ScenarioRunner> scenario;
+    const engine_visual_diagnostics_v1_t *visual_diagnostics = nullptr;
+    const engine_visual_checkpoint_v1_t *visual_checkpoint = nullptr;
+    uint64_t checkpoint_token = 0;
+    std::string checkpoint_name;
+    std::string runtime_logs;
+    std::string last_visual_snapshot;
+    bool scenario_failure_saved = false;
+    bool scenario_failed = false;
+    bool scenario_fast_exit = false;
+    uint64_t scenario_started_ms = 0;
+    uint64_t scenario_start_rss_bytes = 0;
+    std::vector<uint32_t> scenario_frame_times_ms;
 
     bool startup_complete = false;
     bool exit_requested = false;
@@ -68,9 +91,11 @@ void PrintUsage() {
             "usage: aetherkiri_engine --game <path> [options]\n"
             "  --game <path>              game directory (absolute path)\n"
             "  --fps <n>                  frame rate limit (0 = unlimited)\n"
-            "  --render-backend <name>    software | gpu_bridge (default gpu_bridge)\n"
+            "  --render-backend <name>    software | gpu_bridge | sdl3_gpu (default gpu_bridge)\n"
             "  --screenshot <path>        save a PPM after N frames\n"
-            "  --screenshot-frames <n>    frames before screenshot (default 180)\n");
+            "  --screenshot-frames <n>    frames before screenshot (default 180)\n"
+            "  --scenario <path>          run a version 1 scenario JSON\n"
+            "  --scenario-output <path>   artifact directory (default out/compat/scenario)\n");
 }
 
 void ParseArgs(int argc, char *argv[]) {
@@ -104,6 +129,12 @@ void ParseArgs(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--screenshot-frames") == 0 &&
                    i + 1 < argc) {
             g.screenshot_after_frames = std::max(0, atoi(argv[++i]));
+        } else if (strcmp(argv[i], "--scenario") == 0 && i + 1 < argc) {
+            g.scenario_path = argv[++i];
+        } else if (strcmp(argv[i], "--scenario-output") == 0 && i + 1 < argc) {
+            g.scenario_output = argv[++i];
+        } else if (strcmp(argv[i], "--scenario-fast-exit") == 0) {
+            g.scenario_fast_exit = true;
         } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             PrintUsage();
             std::exit(0);
@@ -111,12 +142,12 @@ void ParseArgs(int argc, char *argv[]) {
     }
 }
 
-void SavePpm(const std::string &path, const uint8_t *rgba, uint32_t width,
+bool SavePpm(const std::string &path, const uint8_t *rgba, uint32_t width,
              uint32_t height, uint32_t stride) {
     FILE *file = fopen(path.c_str(), "wb");
     if (file == nullptr) {
         fprintf(stderr, "screenshot: cannot open %s\n", path.c_str());
-        return;
+        return false;
     }
     fprintf(file, "P6\n%u %u\n255\n", width, height);
     for (uint32_t row = 0; row < height; ++row) {
@@ -130,6 +161,165 @@ void SavePpm(const std::string &path, const uint8_t *rgba, uint32_t width,
     fclose(file);
     fprintf(stderr, "screenshot saved: %s (%ux%u)\n", path.c_str(), width,
             height);
+    return true;
+}
+
+bool SaveText(const std::filesystem::path &path, const std::string &value) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if(!output) return false;
+    output.write(value.data(), static_cast<std::streamsize>(value.size()));
+    return output.good();
+}
+
+uint64_t ReadRssBytes() {
+#if defined(__linux__)
+    std::ifstream input("/proc/self/statm");
+    uint64_t total_pages = 0;
+    uint64_t resident_pages = 0;
+    if(input >> total_pages >> resident_pages)
+        return resident_pages * static_cast<uint64_t>(sysconf(_SC_PAGESIZE));
+#endif
+    return 0;
+}
+
+void SaveScenarioReport(const char *status) {
+    if(!g.scenario || g.scenario_started_ms == 0) return;
+    std::error_code ec;
+    std::filesystem::create_directories(g.scenario_output, ec);
+    std::vector<uint32_t> sorted = g.scenario_frame_times_ms;
+    std::sort(sorted.begin(), sorted.end());
+    const uint32_t p99 = sorted.empty() ? 0 :
+        sorted[std::min(sorted.size() - 1,
+                        static_cast<size_t>(sorted.size() * .99))];
+    const uint32_t maximum = sorted.empty() ? 0 : sorted.back();
+    const uint64_t elapsed_ms = SDL_GetTicks() - g.scenario_started_ms;
+    const double fps = elapsed_ms == 0 ? 0.0 :
+        g.scenario_frame_times_ms.size() * 1000.0 / elapsed_ms;
+    const uint64_t end_rss = ReadRssBytes();
+    std::ostringstream report;
+    report << "{\"schema\":\"aetherkiri.scenario-report.v1\""
+           << ",\"status\":\"" << status << "\""
+           << ",\"frames\":" << g.scenario_frame_times_ms.size()
+           << ",\"elapsed_ms\":" << elapsed_ms
+           << ",\"average_fps\":" << fps
+           << ",\"p99_frame_time_ms\":" << p99
+           << ",\"max_frame_time_ms\":" << maximum
+           << ",\"rss_start_bytes\":" << g.scenario_start_rss_bytes
+           << ",\"rss_end_bytes\":" << end_rss
+           << ",\"rss_growth_bytes\":"
+           << (end_rss > g.scenario_start_rss_bytes
+                   ? end_rss - g.scenario_start_rss_bytes : 0) << "}\n";
+    SaveText(std::filesystem::path(g.scenario_output) / "scenario-report.json",
+             report.str());
+}
+
+std::string SafeArtifactName(std::string name) {
+    for(char &ch : name) {
+        const bool safe = (ch >= 'a' && ch <= 'z') ||
+                          (ch >= 'A' && ch <= 'Z') ||
+                          (ch >= '0' && ch <= '9') || ch == '-' || ch == '_';
+        if(!safe) ch = '_';
+    }
+    return name.empty() ? "checkpoint" : name;
+}
+
+ScenarioRunner::CheckpointStatus CaptureCheckpoint(
+    const std::string &requested_name, std::string &error) {
+    if(g.visual_checkpoint == nullptr) {
+        error = "visual checkpoint interface is unavailable";
+        return ScenarioRunner::CheckpointStatus::Failed;
+    }
+    if(g.checkpoint_token == 0) {
+        if(g.visual_checkpoint->request_capture(
+               g.engine, &g.checkpoint_token) != ENGINE_RESULT_OK) {
+            error = std::string("checkpoint request failed: ") +
+                    engine_get_last_error(g.engine);
+            return ScenarioRunner::CheckpointStatus::Failed;
+        }
+        g.checkpoint_name = requested_name;
+        return ScenarioRunner::CheckpointStatus::Pending;
+    }
+    if(g.checkpoint_name != requested_name) {
+        error = "another checkpoint request is pending";
+        return ScenarioRunner::CheckpointStatus::Failed;
+    }
+    engine_visual_checkpoint_info_v1_t info{};
+    info.struct_size = sizeof(info);
+    if(g.visual_checkpoint->get_capture(
+           g.engine, g.checkpoint_token, &info, nullptr, 0, nullptr, 0) !=
+       ENGINE_RESULT_OK) {
+        error = std::string("checkpoint query failed: ") +
+                engine_get_last_error(g.engine);
+        return ScenarioRunner::CheckpointStatus::Failed;
+    }
+    if(info.status == ENGINE_VISUAL_CHECKPOINT_PENDING)
+        return ScenarioRunner::CheckpointStatus::Pending;
+    if(info.status != ENGINE_VISUAL_CHECKPOINT_READY || info.rgba_bytes == 0 ||
+       info.snapshot_json_bytes == 0) {
+        error = "engine failed to capture the requested visual frame";
+        return ScenarioRunner::CheckpointStatus::Failed;
+    }
+    std::vector<uint8_t> rgba(static_cast<size_t>(info.rgba_bytes));
+    std::vector<char> snapshot(info.snapshot_json_bytes);
+    info.struct_size = sizeof(info);
+    if(g.visual_checkpoint->get_capture(
+           g.engine, g.checkpoint_token, &info, rgba.data(), rgba.size(),
+           snapshot.data(), static_cast<uint32_t>(snapshot.size())) !=
+       ENGINE_RESULT_OK) {
+        error = std::string("checkpoint read failed: ") +
+                engine_get_last_error(g.engine);
+        return ScenarioRunner::CheckpointStatus::Failed;
+    }
+    std::error_code ec;
+    std::filesystem::create_directories(g.scenario_output, ec);
+    if(ec) {
+        error = "cannot create scenario output: " + ec.message();
+        return ScenarioRunner::CheckpointStatus::Failed;
+    }
+    const auto base = std::filesystem::path(g.scenario_output) /
+                      SafeArtifactName(requested_name);
+    if(!SavePpm(base.string() + ".ppm", rgba.data(), info.width, info.height,
+                info.stride_bytes) ||
+       !SaveText(base.string() + ".layers.json", snapshot.data()) ||
+       !SaveText(base.string() + ".logs.txt", g.runtime_logs)) {
+        error = "cannot write checkpoint artifacts";
+        return ScenarioRunner::CheckpointStatus::Failed;
+    }
+    std::ostringstream metadata;
+    metadata << "{\"schema\":\"aetherkiri.checkpoint.v1\",\"name\":\""
+             << SafeArtifactName(requested_name) << "\",\"frame_serial\":"
+             << info.frame_serial << ",\"width\":" << info.width
+             << ",\"height\":" << info.height << "}\n";
+    if(!SaveText(base.string() + ".json", metadata.str())) {
+        error = "cannot write checkpoint metadata";
+        return ScenarioRunner::CheckpointStatus::Failed;
+    }
+    g.checkpoint_token = 0;
+    g.checkpoint_name.clear();
+    return ScenarioRunner::CheckpointStatus::Completed;
+}
+
+void DrainRuntimeLogs() {
+    char buffer[8192];
+    for(;;) {
+        uint32_t written = 0;
+        if(engine_drain_runtime_logs(g.engine, buffer, sizeof(buffer), &written) !=
+               ENGINE_RESULT_OK || written == 0) break;
+        g.runtime_logs.append(buffer, written);
+    }
+}
+
+bool ReadVisualSnapshot(std::string &snapshot) {
+    if(g.visual_diagnostics == nullptr) return false;
+    uint32_t required = 0;
+    if(g.visual_diagnostics->get_snapshot_json(g.engine, nullptr, 0, &required) !=
+           ENGINE_RESULT_OK || required == 0) return false;
+    std::vector<char> buffer(required);
+    if(g.visual_diagnostics->get_snapshot_json(
+           g.engine, buffer.data(), static_cast<uint32_t>(buffer.size()),
+           &required) != ENGINE_RESULT_OK) return false;
+    snapshot.assign(buffer.data());
+    return true;
 }
 
 void SaveGpuFramePpm() {
@@ -235,6 +425,30 @@ bool StartupEngine() {
     if (engine_create(&desc, &g.engine) != ENGINE_RESULT_OK) {
         fprintf(stderr, "engine_create failed\n");
         return false;
+    }
+    if(!g.scenario_path.empty()) {
+        const void *raw = nullptr;
+        if(engine_query_interface(
+               g.engine, ENGINE_INTERFACE_VISUAL_DIAGNOSTICS_V1,
+               ENGINE_VISUAL_DIAGNOSTICS_INTERFACE_VERSION_1, &raw) !=
+               ENGINE_RESULT_OK) {
+            fprintf(stderr, "visual diagnostics interface unavailable: %s\n",
+                    engine_get_last_error(g.engine));
+            return false;
+        }
+        g.visual_diagnostics =
+            static_cast<const engine_visual_diagnostics_v1_t *>(raw);
+        raw = nullptr;
+        if(engine_query_interface(
+               g.engine, ENGINE_INTERFACE_VISUAL_CHECKPOINT_V1,
+               ENGINE_VISUAL_CHECKPOINT_INTERFACE_VERSION_1, &raw) !=
+               ENGINE_RESULT_OK) {
+            fprintf(stderr, "visual checkpoint interface unavailable: %s\n",
+                    engine_get_last_error(g.engine));
+            return false;
+        }
+        g.visual_checkpoint =
+            static_cast<const engine_visual_checkpoint_v1_t *>(raw);
     }
 
     engine_option_t option;
@@ -357,6 +571,18 @@ void TickShell(uint32_t delta_ms) {
     if (engine_get_frame_desc(g.engine, &frame_desc) != ENGINE_RESULT_OK) {
         return;
     }
+    if(frame_desc.width > 0 && frame_desc.height > 0 &&
+       (frame_desc.width != g.surface_width ||
+        frame_desc.height != g.surface_height)) {
+        // The game may select its logical resolution during startup. Keep the
+        // host surface contract synchronized so C ABI pointer coordinates are
+        // not scaled a second time by the draw device.
+        if(engine_set_surface_size(g.engine, frame_desc.width,
+                                   frame_desc.height) == ENGINE_RESULT_OK) {
+            g.surface_width = frame_desc.width;
+            g.surface_height = frame_desc.height;
+        }
+    }
 
     // Frame-stop detection: the engine stops producing frames once its
     // application terminates (TVPTerminateAsync, e.g. script win.close());
@@ -417,6 +643,51 @@ void TickShell(uint32_t delta_ms) {
         g.surface_height = frame_desc.height;
     }
     AutoSizeWindowForSurface(g.surface_width, g.surface_height);
+
+    DrainRuntimeLogs();
+    if(g.scenario) {
+        if(g.scenario_started_ms == 0) {
+            g.scenario_started_ms = SDL_GetTicks();
+            g.scenario_start_rss_bytes = ReadRssBytes();
+        }
+        g.scenario_frame_times_ms.push_back(delta_ms);
+        ReadVisualSnapshot(g.last_visual_snapshot);
+        g.scenario->Tick(g.engine, frame_desc.frame_serial, SDL_GetTicks(),
+                         g.runtime_logs, g.last_visual_snapshot,
+                         CaptureCheckpoint);
+        if(g.scenario->failed()) {
+            fprintf(stderr, "[aetherkiri_engine] scenario failed: %s\n",
+                    g.scenario->failure().c_str());
+            if(!g.scenario_failure_saved) {
+                std::string capture_error;
+                const auto capture_status =
+                    CaptureCheckpoint("failure", capture_error);
+                if(capture_status == ScenarioRunner::CheckpointStatus::Pending)
+                    return;
+                if(capture_status == ScenarioRunner::CheckpointStatus::Failed)
+                    fprintf(stderr, "failure checkpoint failed: %s\n",
+                            capture_error.c_str());
+                SaveText(std::filesystem::path(g.scenario_output) /
+                             "failure.txt", g.scenario->failure() + "\n");
+                g.scenario_failure_saved = true;
+            }
+            g.exit_requested = true;
+            g.scenario_failed = true;
+            SaveScenarioReport("failed");
+            if(g.scenario_fast_exit) {
+                std::fflush(nullptr);
+                std::_Exit(EXIT_FAILURE);
+            }
+        } else if(g.scenario->finished()) {
+            fprintf(stderr, "[aetherkiri_engine] scenario completed\n");
+            g.exit_requested = true;
+            SaveScenarioReport("passed");
+            if(g.scenario_fast_exit) {
+                std::fflush(nullptr);
+                std::_Exit(EXIT_SUCCESS);
+            }
+        }
+    }
 
     if (!g.screenshot_path.empty()) {
         ++g.frame_count_since_start;
@@ -553,6 +824,15 @@ SDL_AppResult SDL_AppInit(void **appstate, int argc, char *argv[]) {
         PrintUsage();
         return SDL_APP_FAILURE;
     }
+    if(!g.scenario_path.empty()) {
+        ScenarioProfile profile;
+        std::string error;
+        if(!LoadScenarioProfile(g.scenario_path, profile, error)) {
+            fprintf(stderr, "scenario parse failed: %s\n", error.c_str());
+            return SDL_APP_FAILURE;
+        }
+        g.scenario = std::make_unique<ScenarioRunner>(std::move(profile));
+    }
     if (!CreatePresentation()) {
         return SDL_APP_FAILURE;
     }
@@ -595,7 +875,7 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
     (void)appstate;
 
     if (g.exit_requested) {
-        return SDL_APP_SUCCESS;
+        return g.scenario_failed ? SDL_APP_FAILURE : SDL_APP_SUCCESS;
     }
 
     const uint32_t now = SDL_GetTicks();
@@ -621,7 +901,9 @@ SDL_AppResult SDL_AppIterate(void *appstate) {
             SDL_Delay(frame_ms - elapsed);
         }
     }
-    return g.exit_requested ? SDL_APP_SUCCESS : SDL_APP_CONTINUE;
+    if(g.exit_requested)
+        return g.scenario_failed ? SDL_APP_FAILURE : SDL_APP_SUCCESS;
+    return SDL_APP_CONTINUE;
 }
 
 void SDL_AppQuit(void *appstate, SDL_AppResult result) {

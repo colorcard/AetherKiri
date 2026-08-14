@@ -6,6 +6,7 @@ find_package(SDL3 CONFIG REQUIRED)
 
 add_executable(aetherkiri_engine
     main.cpp
+    scenario.cpp
     ../sdl_host/src/host_input.cpp
 )
 

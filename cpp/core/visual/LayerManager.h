@@ -14,8 +14,8 @@
 #include "LayerIntf.h"
 #include "drawable.h"
 #include <algorithm>
-#include <string>
 #include <vector>
+#include <string>
 
 /*[*/
 class tTJSNI_BaseLayer;
@@ -310,6 +310,8 @@ class tTVPLayerManager : public iTVPLayerManager, public tTVPDrawable {
     bool HoldAlpha = true;
     tjs_uint64 LayerSnapshotFrame = 0;
     tjs_uint64 LayerSnapshotLastTick = 0;
+    tTVPRect LastCompletedUpdateRegion{0, 0, 0, 0};
+    tjs_int LastCompletedUpdateRegionCount = 0;
     tTVPBaseTexture *EnsureDrawBufferSize(tjs_int w, tjs_int h,
                                           bool clear_on_resize);
     tTVPBaseTexture *EnsureDrawBufferMatchesPrimary(bool clear_on_resize);
@@ -365,6 +367,12 @@ public:
                                             // from its parent
 
     tTVPComplexRect &GetUpdateRegionForCompletion() { return UpdateRegion; }
+    const tTVPRect &GetLastCompletedUpdateRegion() const {
+        return LastCompletedUpdateRegion;
+    }
+    tjs_int GetLastCompletedUpdateRegionCount() const {
+        return LastCompletedUpdateRegionCount;
+    }
 
 private:
     void _RecreateOverallOrderIndex(tjs_uint &index,
@@ -588,6 +596,14 @@ private:
     }
     void SetTouchCapture(tjs_uint32 id, tTJSNI_BaseLayer *layer);
 };
+
+// Builds a read-only JSON snapshot only when requested by a diagnostics host.
+// Must be called on the engine owner thread.
+bool TVPCaptureVisualDiagnosticsJson(tjs_uint64 frame_serial,
+                                     tjs_uint surface_width,
+                                     tjs_uint surface_height,
+                                     const std::string &backend,
+                                     std::string &out_json);
 //---------------------------------------------------------------------------
 
 #endif
