@@ -31,12 +31,142 @@
 #include "LayerTreeOwner.h"
 #include "WindowIntf.h"
 #include "EngineLoop.h"
+#include "RenderManager.h"
 #include "spdlog/spdlog.h"
 
 #include <cctype>
+#include <cerrno>
+#include <cstdint>
+#include <cstring>
 #include <string>
+#include <string_view>
+#include <sstream>
 
 namespace {
+// Engine APIs are owner-thread-affine, so this pointer is read and written on
+// the same thread. It avoids any snapshot work in normal rendering.
+tTVPLayerManager *TVPLastCompletedLayerManager = nullptr;
+
+std::string TVPJsonEscape(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for(const unsigned char ch : value) {
+        switch(ch) {
+            case '"': escaped += "\\\""; break;
+            case '\\': escaped += "\\\\"; break;
+            case '\b': escaped += "\\b"; break;
+            case '\f': escaped += "\\f"; break;
+            case '\n': escaped += "\\n"; break;
+            case '\r': escaped += "\\r"; break;
+            case '\t': escaped += "\\t"; break;
+            default:
+                if(ch < 0x20) {
+                    char buffer[7];
+                    std::snprintf(buffer, sizeof(buffer), "\\u%04x", ch);
+                    escaped += buffer;
+                } else {
+                    escaped.push_back(static_cast<char>(ch));
+                }
+        }
+    }
+    return escaped;
+}
+
+std::string TVPLayerStablePath(tTJSNI_BaseLayer *layer) {
+    std::vector<tTJSNI_BaseLayer *> chain;
+    for(auto *cursor = layer; cursor; cursor = cursor->GetParent())
+        chain.push_back(cursor);
+    std::string path;
+    for(auto it = chain.rbegin(); it != chain.rend(); ++it) {
+        if(!path.empty()) path.push_back('/');
+        const std::string name = (*it)->GetName().AsStdString();
+        path += name.empty() ? "<unnamed>" : name;
+        path.push_back('[');
+        path += std::to_string((*it)->GetOrderIndex());
+        path.push_back(']');
+    }
+    return path;
+}
+
+bool TVPLayerSnapshotSelectFrame(tjs_uint64 frame) {
+    const char *selection = std::getenv("AETHERKIRI_LAYER_SNAPSHOT_FRAMES");
+    if(!selection || !*selection || std::string_view(selection) == "all")
+        return true;
+
+    const char *cursor = selection;
+    while(*cursor) {
+        while(*cursor == ' ' || *cursor == ',') ++cursor;
+        if(!*cursor) break;
+        errno = 0;
+        char *end = nullptr;
+        const auto requested = std::strtoull(cursor, &end, 10);
+        if(end == cursor || errno == ERANGE) return false;
+        if(requested == frame) return true;
+        cursor = end;
+        while(*cursor == ' ') ++cursor;
+        if(*cursor && *cursor != ',') return false;
+    }
+    return false;
+}
+
+void TVPWriteLayerSnapshot(tTVPLayerManager *manager, tjs_uint64 frame,
+                           const tTVPRect &dirty, tjs_int dirty_count) {
+    const char *path = std::getenv("AETHERKIRI_LAYER_SNAPSHOT_JSONL");
+    if(!path || !*path || !TVPLayerSnapshotSelectFrame(frame)) return;
+
+    FILE *output = std::string_view(path) == "-" ? stderr : std::fopen(path, "ab");
+    if(!output) {
+        spdlog::warn("Cannot open layer snapshot JSONL '{}': {}", path,
+                     std::strerror(errno));
+        return;
+    }
+
+    auto *render_manager = TVPGetRenderManager();
+    const std::string render_name =
+        render_manager ? render_manager->GetName() : "unknown";
+    for(auto *layer : manager->GetAllNodes()) {
+        if(!layer) continue;
+        auto *parent = layer->GetParent();
+        const auto name = TVPJsonEscape(layer->GetName().AsStdString());
+        const auto parent_name = TVPJsonEscape(
+            parent ? parent->GetName().AsStdString() : std::string());
+        const auto type = TVPJsonEscape(
+            ttstr(layer->GetTypeNameString()).AsStdString());
+        const bool sdl_gpu = render_name == "SdlGpu";
+        const bool coherent_software_composite = sdl_gpu;
+        const char *authority =
+            (!sdl_gpu || coherent_software_composite) ? "cpu" : "gpu";
+        const char *final_method = coherent_software_composite
+            ? "software_delegate"
+            : (sdl_gpu ? "gpu_composite" : "software_composite");
+        const char *fallback_reason = coherent_software_composite
+            ? "\"coherent_software_composite\""
+            : "null";
+        std::fprintf(
+            output,
+            "{\"event\":\"layer_snapshot\",\"frame\":%llu,"
+            "\"name\":\"%s\",\"parent\":%s%s%s,\"order\":%u,"
+            "\"left\":%d,\"top\":%d,\"width\":%u,\"height\":%u,"
+            "\"type\":\"%s\",\"opacity\":%d,\"visible\":%s,"
+            "\"node_visible\":%s,\"update_region\":{\"count\":%d,"
+            "\"left\":%d,\"top\":%d,\"right\":%d,\"bottom\":%d},"
+            "\"texture_authority\":\"%s\",\"render_manager\":\"%s\","
+            "\"final_render_method\":\"%s\","
+            "\"fallback_reason\":%s}\n",
+            static_cast<unsigned long long>(frame), name.c_str(),
+            parent ? "\"" : "", parent ? parent_name.c_str() : "null",
+            parent ? "\"" : "", layer->GetOrderIndex(), layer->GetLeft(),
+            layer->GetTop(), layer->GetWidth(), layer->GetHeight(), type.c_str(),
+            layer->GetOpacity(), layer->GetVisible() ? "true" : "false",
+            layer->GetNodeVisible() ? "true" : "false", dirty_count,
+            dirty.left, dirty.top, dirty.right, dirty.bottom, authority,
+            TVPJsonEscape(render_name).c_str(), final_method,
+            fallback_reason);
+    }
+    std::fflush(output);
+    if(output != stderr) std::fclose(output);
+}
+
 bool TVPInputTraceEnabled() {
     const char *value = std::getenv("AETHERKIRI_INPUT_TRACE");
     return value && *value && *value != '0';
@@ -789,6 +919,8 @@ tTVPLayerManager::tTVPLayerManager(iTVPLayerTreeOwner *owner) {
 }
 //---------------------------------------------------------------------------
 tTVPLayerManager::~tTVPLayerManager() {
+    if(TVPLastCompletedLayerManager == this)
+        TVPLastCompletedLayerManager = nullptr;
     if(DrawBuffer)
         delete DrawBuffer;
 }
@@ -2184,10 +2316,106 @@ void tTVPLayerManager::UpdateToDrawDevice() {
         if(auto *loop = EngineLoop::GetInstance())
             loop->HandleInputEvent(event);
     }
+    const tjs_int snapshot_dirty_count = UpdateRegion.GetCount();
+    const tTVPRect snapshot_dirty = snapshot_dirty_count > 0
+        ? UpdateRegion.GetBound()
+        : tTVPRect(0, 0, 0, 0);
+    LastCompletedUpdateRegion = snapshot_dirty;
+    LastCompletedUpdateRegionCount = snapshot_dirty_count;
+    TVPLastCompletedLayerManager = this;
     Primary->CompleteForWindow(this);
+    const tjs_uint64 snapshot_tick = TVPGetRoughTickCount32();
+    // Completion may run repeatedly while a script builds a layer tree. Treat
+    // those same-tick completions as one diagnostic frame so selected frame
+    // numbers track the host's paced frame loop rather than layer count.
+    if(LayerSnapshotLastTick == 0 ||
+       snapshot_tick - LayerSnapshotLastTick >= 8) {
+        LayerSnapshotLastTick = snapshot_tick;
+        ++LayerSnapshotFrame;
+        TVPWriteLayerSnapshot(this, LayerSnapshotFrame, snapshot_dirty,
+                              snapshot_dirty_count);
+    }
     process_pending_enter(true);
     TVPTraceCgModeViewTransIdle(this, (tjs_int)Primary->GetWidth() / 2,
                                 (tjs_int)Primary->GetHeight() / 2);
+}
+
+bool TVPCaptureVisualDiagnosticsJson(tjs_uint64 frame_serial,
+                                     tjs_uint surface_width,
+                                     tjs_uint surface_height,
+                                     const std::string &backend,
+                                     std::string &out_json) {
+    auto *manager = TVPLastCompletedLayerManager;
+    if(!manager || !manager->GetPrimaryLayer()) return false;
+
+    const bool sdl_gpu = backend == "sdl3_gpu";
+    const bool gpu_bridge = backend == "gpu_bridge";
+    const char *authority = sdl_gpu ? "cpu_gpu_synchronized"
+                            : (gpu_bridge ? "gpu" : "cpu");
+    const char *final_method = sdl_gpu ? "coherent_software_composite_upload"
+                               : (gpu_bridge ? "sdl_texture_upload"
+                                             : "software_composite");
+    const char *fallback_reason = sdl_gpu
+        ? "\"mixed_draws_disabled_for_pixel_stability\"" : "null";
+    const auto &dirty = manager->GetLastCompletedUpdateRegion();
+
+    std::ostringstream json;
+    json << "{\"schema\":\"engine.visual_diagnostics.v1\""
+         << ",\"frame_serial\":" << frame_serial
+         << ",\"surface\":{\"width\":" << surface_width
+         << ",\"height\":" << surface_height << "}"
+         << ",\"backend\":\"" << TVPJsonEscape(backend) << "\""
+         << ",\"layers\":[";
+    bool first = true;
+    for(auto *layer : manager->GetAllNodes()) {
+        if(!layer) continue;
+        if(!first) json << ',';
+        first = false;
+        auto *parent = layer->GetParent();
+        auto *image = layer->GetMainImage();
+        const auto &clip = layer->GetClip();
+        json << "{\"path\":\""
+             << TVPJsonEscape(TVPLayerStablePath(layer)) << "\""
+             << ",\"name\":\""
+             << TVPJsonEscape(layer->GetName().AsStdString()) << "\""
+             << ",\"parent\":";
+        if(parent)
+            json << "\"" << TVPJsonEscape(TVPLayerStablePath(parent)) << "\"";
+        else
+            json << "null";
+        json << ",\"order\":" << layer->GetOrderIndex()
+             << ",\"visible\":" << (layer->GetVisible() ? "true" : "false")
+             << ",\"node_visible\":" << (layer->GetNodeVisible() ? "true" : "false")
+             << ",\"opacity\":" << layer->GetOpacity()
+             << ",\"type\":\""
+             << TVPJsonEscape(ttstr(layer->GetTypeNameString()).AsStdString())
+             << "\",\"rect\":{\"left\":" << layer->GetLeft()
+             << ",\"top\":" << layer->GetTop()
+             << ",\"width\":" << layer->GetWidth()
+             << ",\"height\":" << layer->GetHeight() << "}"
+             << ",\"clip\":{\"left\":" << clip.left
+             << ",\"top\":" << clip.top
+             << ",\"right\":" << clip.right
+             << ",\"bottom\":" << clip.bottom << "}"
+             << ",\"transform\":[1,0,0,1," << layer->GetLeft()
+             << ',' << layer->GetTop() << ']'
+             << ",\"image\":{\"present\":" << (image ? "true" : "false")
+             << ",\"width\":" << (image ? image->GetWidth() : 0)
+             << ",\"height\":" << (image ? image->GetHeight() : 0)
+             << ",\"content_revision\":"
+             << (layer->GetImageModified() ? 1 : 0) << "}"
+             << ",\"update_region\":{\"count\":"
+             << manager->GetLastCompletedUpdateRegionCount()
+             << ",\"left\":" << dirty.left << ",\"top\":" << dirty.top
+             << ",\"right\":" << dirty.right << ",\"bottom\":"
+             << dirty.bottom << "}"
+             << ",\"texture_authority\":\"" << authority << "\""
+             << ",\"final_render_method\":\"" << final_method << "\""
+             << ",\"fallback_reason\":" << fallback_reason << '}';
+    }
+    json << "]}";
+    out_json = json.str();
+    return true;
 }
 //---------------------------------------------------------------------------
 void tTVPLayerManager::NotifyUpdateRegionFixed() {

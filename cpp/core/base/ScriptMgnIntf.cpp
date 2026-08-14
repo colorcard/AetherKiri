@@ -2449,6 +2449,22 @@ const tjs_char *TVPGetD3DEmoteGpuBatchPatchScript() {
         "})();\r\n");
 }
 
+const tjs_char *TVPGetWorldLayerClonePatchScript() {
+    return TJS_W(
+        "(function() {\r\n"
+        "\tif (typeof global.EnvLayerObject == \"undefined\") return;\r\n"
+        "\tif (typeof global.EnvLayerObject.__aetherKiriOrigCreateLayer != \"undefined\") return;\r\n"
+        "\tglobal.EnvLayerObject.__aetherKiriOrigCreateLayer = &global.EnvLayerObject.createLayer;\r\n"
+        "\tglobal.EnvLayerObject.createLayer = function(src=void) {\r\n"
+        "\t\tvar layer = (global.EnvLayerObject.__aetherKiriOrigCreateLayer incontextof this)(src);\r\n"
+        "\t\tif (layer !== void) {\r\n"
+        "\t\t\tif (typeof this.msgvisible != \"undefined\" && typeof layer.msgvisible != \"undefined\") layer.msgvisible = this.msgvisible;\r\n"
+        "\t\t}\r\n"
+        "\t\treturn layer;\r\n"
+        "\t};\r\n"
+        "})();\r\n");
+}
+
 static void TVPApplyPostScriptCompatibilityPatches(const ttstr &shortname) {
     const ttstr lower = shortname.AsLowerCase();
     const bool patchWorld = lower == TJS_W("world.tjs");
@@ -2537,20 +2553,7 @@ static void TVPApplyPostScriptCompatibilityPatches(const ttstr &shortname) {
 
     if(patchWorld) try {
         TVPExecuteScript(
-            TJS_W(
-                "(function() {\r\n"
-                "\tif (typeof global.EnvLayerObject == \"undefined\") return;\r\n"
-                "\tif (typeof global.EnvLayerObject.__aetherKiriOrigCreateLayer != \"undefined\") return;\r\n"
-                "\tglobal.EnvLayerObject.__aetherKiriOrigCreateLayer = &global.EnvLayerObject.createLayer;\r\n"
-                "\tglobal.EnvLayerObject.createLayer = function(src=void) {\r\n"
-                "\t\tvar layer = (global.EnvLayerObject.__aetherKiriOrigCreateLayer incontextof this)(src);\r\n"
-                "\t\tif (layer !== void) {\r\n"
-                "\t\t\ttry { layer.msgvisible = this.msgvisible; } catch(e) {}\r\n"
-                "\t\t\ttry { layer.ignore = this.ignore; } catch(e) {}\r\n"
-                "\t\t}\r\n"
-                "\t\treturn layer;\r\n"
-                "\t};\r\n"
-                "})();\r\n"),
+            TVPGetWorldLayerClonePatchScript(),
             TJS_W("AetherKiriWorldLayerClonePatch"), 0,
             (tTJSVariant *)nullptr);
         spdlog::info("Applied compatibility hook for world layer clone state");

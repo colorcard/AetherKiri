@@ -290,6 +290,70 @@ TEST_CASE("surface request made before provider selection is replayed") {
   REQUIRE(frame.stride_bytes == 1920u * 4u);
 }
 
+TEST_CASE("visual diagnostics query is wrapped by the dispatch handle") {
+  Handle handle;
+  const void* raw = nullptr;
+  REQUIRE(engine_query_interface(
+              handle.value, ENGINE_INTERFACE_VISUAL_DIAGNOSTICS_V1,
+              ENGINE_VISUAL_DIAGNOSTICS_INTERFACE_VERSION_1, &raw) ==
+          ENGINE_RESULT_OK);
+  REQUIRE(raw != nullptr);
+  const auto* visual =
+      static_cast<const engine_visual_diagnostics_v1_t*>(raw);
+  REQUIRE(visual->interface_version ==
+          ENGINE_VISUAL_DIAGNOSTICS_INTERFACE_VERSION_1);
+  uint32_t required = 99;
+  REQUIRE(visual->get_snapshot_json(handle.value, nullptr, 0, &required) ==
+          ENGINE_RESULT_INVALID_STATE);
+  REQUIRE(required == 0);
+}
+
+TEST_CASE("visual checkpoint captures exactly one completed frame through dispatch") {
+  Handle handle;
+  const void* raw = nullptr;
+  REQUIRE(engine_query_interface(
+              handle.value, ENGINE_INTERFACE_VISUAL_CHECKPOINT_V1,
+              ENGINE_VISUAL_CHECKPOINT_INTERFACE_VERSION_1, &raw) ==
+          ENGINE_RESULT_OK);
+  REQUIRE(raw != nullptr);
+  const auto* checkpoint =
+      static_cast<const engine_visual_checkpoint_v1_t*>(raw);
+  REQUIRE(engine_open_game(handle.value, ".", nullptr) == ENGINE_RESULT_OK);
+
+  uint64_t token = 0;
+  REQUIRE(checkpoint->request_capture(handle.value, &token) == ENGINE_RESULT_OK);
+  REQUIRE(token != 0);
+  engine_visual_checkpoint_info_v1_t info{};
+  info.struct_size = sizeof(info);
+  REQUIRE(checkpoint->get_capture(handle.value, token, &info, nullptr, 0,
+                                  nullptr, 0) == ENGINE_RESULT_OK);
+  REQUIRE(info.status == ENGINE_VISUAL_CHECKPOINT_PENDING);
+  REQUIRE(info.frame_serial == 0);
+
+  REQUIRE(engine_tick(handle.value, 16) == ENGINE_RESULT_OK);
+  info.struct_size = sizeof(info);
+  REQUIRE(checkpoint->get_capture(handle.value, token, &info, nullptr, 0,
+                                  nullptr, 0) == ENGINE_RESULT_OK);
+  REQUIRE(info.status == ENGINE_VISUAL_CHECKPOINT_READY);
+  REQUIRE(info.frame_serial == 1);
+  REQUIRE(info.rgba_bytes == 1280u * 720u * 4u);
+  std::vector<uint8_t> rgba(static_cast<size_t>(info.rgba_bytes));
+  std::vector<char> json(info.snapshot_json_bytes);
+  info.struct_size = sizeof(info);
+  REQUIRE(checkpoint->get_capture(handle.value, token, &info, rgba.data(),
+                                  rgba.size(), json.data(),
+                                  static_cast<uint32_t>(json.size())) ==
+          ENGINE_RESULT_OK);
+  REQUIRE(std::string(json.data()).find("\"frame_serial\":1") !=
+          std::string::npos);
+
+  REQUIRE(engine_tick(handle.value, 16) == ENGINE_RESULT_OK);
+  info.struct_size = sizeof(info);
+  REQUIRE(checkpoint->get_capture(handle.value, token, &info, nullptr, 0,
+                                  nullptr, 0) == ENGINE_RESULT_OK);
+  REQUIRE(info.frame_serial == 1);
+}
+
 TEST_CASE("standalone media is routed through the legacy host service") {
   REQUIRE(engine_register_runtime_provider(&kFakeProvider) == ENGINE_RESULT_OK);
   Handle handle;

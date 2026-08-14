@@ -1,0 +1,179 @@
+// Synthetic four-stage layer-composition regression inspired by the generic
+// structure of a 1920x1080 visual novel. No commercial assets are used.
+
+var SW = 1920;
+var SH = 1080;
+var win = new Window();
+win.setInnerSize(SW, SH);
+
+class SyntheticLayerState {
+    var opacity = 255;
+    var visible = true;
+    var type = ltTransparent;
+    function assign(src) {
+        opacity = src.opacity;
+        visible = src.visible;
+        type = src.type;
+    }
+    function apply(layer) {
+        layer.opacity = opacity;
+        layer.visible = visible;
+        layer.type = type;
+    }
+}
+
+var primary = new Layer(win, null);
+win.add(primary);
+primary.name = "primary";
+primary.setSize(SW, SH);
+primary.type = ltOpaque;
+primary.colorRect(0, 0, SW, SH, 0x10141d, 255);
+primary.visible = true;
+
+function newRoot(name) {
+    var layer = new Layer(win, primary);
+    win.add(layer);
+    layer.name = name;
+    layer.setSize(SW, SH);
+    layer.type = ltTransparent;
+    layer.visible = false;
+    return layer;
+}
+
+function newChild(parent, name, left, top, width, height, type) {
+    var layer = new Layer(win, parent);
+    win.add(layer);
+    layer.name = name;
+    layer.setSize(width, height);
+    layer.left = left;
+    layer.top = top;
+    layer.type = type;
+    layer.visible = true;
+    return layer;
+}
+
+// Stage 0: nested brand mark over a dark opaque foundation.
+var logoRoot = newRoot("stage_logo");
+var logoBackdrop = newChild(logoRoot, "logo_backdrop", 0, 0, SW, SH, ltOpaque);
+logoBackdrop.colorRect(0, 0, SW, SH, 0x172335, 255);
+var logoGlow = newChild(logoRoot, "logo_glow", 530, 280, 860, 400, ltTransparent);
+logoGlow.opacity = 176;
+for (var gi = 0; gi < 8; ++gi)
+    logoGlow.colorRect(gi * 20, gi * 12, 860 - gi * 40, 400 - gi * 24,
+                       0x69c6d5, 18);
+var logoMark = newChild(logoGlow, "logo_mark", 140, 105, 580, 190, ltTransparent);
+logoMark.colorRect(0, 0, 580, 190, 0xf5f0df, 232);
+logoMark.drawText(82, 54, "SYNTHETIC BRAND", 0x24364b, 255, true);
+
+// Stage 1/2: title background, animated-decoration surrogate, and menu.
+var titleRoot = newRoot("stage_title");
+var titleBackground = newChild(titleRoot, "title_background", 0, 0, SW, SH, ltOpaque);
+titleBackground.colorRect(0, 0, SW, SH, 0x8fc8d3, 255);
+for (var ty = 0; ty < SH; ty += 90)
+    titleBackground.colorRect(0, ty, SW, 45, 0xbfe0dc, 96);
+var titleDecor = newChild(titleRoot, "title_animation_result", 80, 70, 1760, 850,
+                          ltTransparent);
+titleDecor.opacity = 220;
+for (var di = 0; di < 12; ++di) {
+    titleDecor.colorRect(80 + di * 135, 120 + (di % 3) * 110, 86, 86,
+                         di % 2 ? 0xf7a8a8 : 0xf7e6a8, 150);
+}
+var titleLogo = newChild(titleRoot, "title_logo", 1050, 120, 690, 300, ltTransparent);
+titleLogo.colorRect(0, 0, 690, 300, 0xffffff, 196);
+titleLogo.drawText(90, 82, "LAYER CONSISTENCY", 0x7d3158, 255, true);
+titleLogo.drawText(180, 145, "REGRESSION", 0x3f5d75, 196, true);
+
+var menuRoot = newChild(titleRoot, "title_menu", 1180, 470, 520, 430,
+                        ltTransparent);
+menuRoot.visible = false;
+menuRoot.opacity = 238;
+menuRoot.colorRect(0, 0, 520, 430, 0x172335, 150);
+var menuLabels = ["START", "CONTINUE", "CONFIG", "EXIT"];
+for (var mi = 0; mi < 4; ++mi) {
+    var item = newChild(menuRoot, "menu_item_" + mi, 44, 36 + mi * 92,
+                        432, 68, ltTransparent);
+    item.colorRect(0, 0, 432, 68, mi == 0 ? 0xf4c6cf : 0xffffff,
+                   mi == 0 ? 218 : 128);
+    item.drawText(34, 14, menuLabels[mi], 0x24364b,
+                  mi == 0 ? 255 : 190, true);
+}
+
+// Stage 3: scene background, character occlusion, clone/assign state, and
+// a semi-transparent message layer. The character deliberately overlaps the
+// background but remains behind the message tree.
+var sceneRoot = newRoot("stage_scene");
+var sceneBackground = newChild(sceneRoot, "scene_background", 0, 0, SW, SH, ltOpaque);
+sceneBackground.colorRect(0, 0, SW, SH, 0x365d74, 255);
+sceneBackground.colorRect(0, 620, SW, 460, 0x294736, 255);
+for (var bx = 0; bx < SW; bx += 160)
+    sceneBackground.colorRect(bx, 300, 90, 380, 0x6d8990, 255);
+
+var character = newChild(sceneRoot, "character", 650, 120, 720, 900,
+                         ltTransparent);
+character.opacity = 246;
+character.colorRect(240, 40, 240, 240, 0xf0d2bd, 255);
+character.colorRect(170, 245, 380, 610, 0x754a73, 245);
+character.colorRect(85, 350, 150, 470, 0x5e395f, 220);
+character.colorRect(485, 350, 150, 470, 0x5e395f, 220);
+character.colorRect(278, 110, 45, 45, 0x27303d, 255);
+character.colorRect(398, 110, 45, 45, 0x27303d, 255);
+
+var badgeSource = newChild(sceneRoot, "clone_source", 70, 64, 320, 100,
+                           ltTransparent);
+badgeSource.colorRect(0, 0, 320, 100, 0xf5f0df, 205);
+badgeSource.drawText(25, 28, "SCENE 01", 0x24364b, 220, true);
+var badgeClone = newChild(sceneRoot, "clone_assigned", 1530, 64, 320, 100,
+                          ltTransparent);
+var badgeSourceState = new SyntheticLayerState();
+badgeSourceState.opacity = badgeSource.opacity;
+badgeSourceState.visible = badgeSource.visible;
+badgeSourceState.type = badgeSource.type;
+var badgeCloneState = new SyntheticLayerState();
+badgeCloneState.assign(badgeSourceState);
+badgeCloneState.apply(badgeClone);
+badgeClone.colorRect(0, 0, 320, 100, 0xf5f0df, 205);
+badgeClone.drawText(25, 28, "SCENE 01", 0x24364b, 220, true);
+
+var messageRoot = newChild(sceneRoot, "message_root", 100, 760, 1720, 260,
+                           ltTransparent);
+messageRoot.opacity = 224;
+messageRoot.colorRect(0, 0, 1720, 260, 0x111827, 205);
+var namePlate = newChild(messageRoot, "message_name", 55, 28, 310, 64,
+                         ltTransparent);
+namePlate.colorRect(0, 0, 310, 64, 0xd98b9d, 220);
+namePlate.drawText(24, 12, "SYNTHETIC HERO", 0xffffff, 232, true);
+var messageText = newChild(messageRoot, "message_text", 68, 105, 1580, 110,
+                           ltTransparent);
+messageText.drawText(0, 0, "Transparent edges, ordering, clone/assign, and local invalidation.",
+                     0xffffff, 208, true, 0, 1, 0x000000, 1, 2, 2);
+
+var stage = -1;
+function showStage(next) {
+    if (stage == next) return;
+    stage = next;
+    logoRoot.visible = next == 0;
+    titleRoot.visible = next == 1 || next == 2;
+    menuRoot.visible = next == 2;
+    sceneRoot.visible = next == 3;
+    Debug.notice("[AETHERKIRI_LAYER_DEMO] stage=" + next);
+}
+
+var startTick = System.getTickCount();
+showStage(0);
+var stageTimer = new Timer(function () {
+    var elapsed = System.getTickCount() - startTick;
+    var next = elapsed < 1000 ? 0 : elapsed < 2000 ? 1 : elapsed < 3000 ? 2 : 3;
+    showStage(next);
+    if (next == 3) {
+        // Repaint only a small badge area after the full scene transition.
+        badgeClone.colorRect(8, 8, 24, 24, 0xf4c6cf, 255);
+    }
+}, "");
+stageTimer.interval = 50;
+stageTimer.enabled = true;
+
+win.onKeyDown = function (key, shift) {
+    if (key >= 0x31 && key <= 0x34) { showStage(key - 0x31); return true; }
+    if (key == 27) { win.close(); return true; }
+    return false;
+};

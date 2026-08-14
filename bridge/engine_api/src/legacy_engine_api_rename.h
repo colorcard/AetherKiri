@@ -14,7 +14,10 @@
 #define engine_resume engine_legacy_resume
 #define engine_set_option engine_legacy_set_option
 #define engine_set_surface_size engine_legacy_set_surface_size
+#define engine_query_interface engine_legacy_query_interface
 #define engine_set_sdl_renderer engine_legacy_set_sdl_renderer
+#define engine_set_sdl_gpu_device engine_legacy_set_sdl_gpu_device
+#define engine_submit_sdl_gpu_frame engine_legacy_submit_sdl_gpu_frame
 #define engine_flush_released_textures engine_legacy_flush_released_textures
 #define engine_get_frame_desc engine_legacy_get_frame_desc
 #define engine_read_frame_rgba engine_legacy_read_frame_rgba
@@ -31,6 +34,8 @@
 #define engine_media_read_frame_rgba engine_legacy_media_read_frame_rgba
 #define engine_get_gpu_frame_texture \
   engine_legacy_get_gpu_frame_texture
+#define engine_get_sdl_gpu_frame_texture \
+  engine_legacy_get_sdl_gpu_frame_texture
 #define engine_get_host_native_window engine_legacy_get_host_native_window
 #define engine_get_host_native_view engine_legacy_get_host_native_view
 #define engine_send_input engine_legacy_send_input

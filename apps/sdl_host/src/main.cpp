@@ -22,6 +22,7 @@
 #include <imgui.h>
 #include <imgui_impl_sdl3.h>
 #include <imgui_impl_sdlrenderer3.h>
+#include <imgui_impl_sdlgpu3.h>
 
 #include "ui/ui_state.h"
 
@@ -33,6 +34,8 @@ FileDialogRequest g_file_dialog;
 
 namespace {
 
+bool g_imgui_uses_sdl_gpu = false;
+
 constexpr uint32_t kDefaultSurfaceWidth = 1280;
 constexpr uint32_t kDefaultSurfaceHeight = 720;
 constexpr uint32_t kDefaultFpsLimit = 60;
@@ -41,6 +44,11 @@ struct HostState {
     engine_handle_t engine = nullptr;
     SDL_Window *window = nullptr;
     SDL_Renderer *renderer = nullptr;
+    SDL_GPUDevice *gpu_device = nullptr;
+    const engine_render_sdl_gpu_v1_t *sdl_gpu_interface = nullptr;
+    const engine_render_sdl_gpu_v2_t *sdl_gpu_interface_v2 = nullptr;
+    engine_sdl_gpu_frame_v1_t sdl_gpu_frame{};
+    SDL_GPUCommandBuffer *host_gpu_command_buffer = nullptr;
     SDL_Texture *screen = nullptr;
     SDL_Texture *pixel_buffer = nullptr;
 
@@ -48,6 +56,7 @@ struct HostState {
     uint32_t surface_height = kDefaultSurfaceHeight;
     uint32_t window_width = kDefaultSurfaceWidth;
     uint32_t window_height = kDefaultSurfaceHeight;
+    bool window_auto_sized = false;
 
     uint32_t frame_stride = 0;
     std::vector<uint8_t> frame_pixels;
@@ -87,12 +96,34 @@ struct HostState {
     uint32_t suppressed_slow_frames = 0;
     // Benchmark (--benchmark <seconds>; 0 disables).
     uint32_t benchmark_seconds = 0;
+    uint32_t benchmark_warmup_seconds = 2;
+    bool benchmark_measuring = false;
+    uint64_t benchmark_warmup_start_ms = 0;
+    uint64_t benchmark_complete_frames = 0;
+    std::string requested_present_mode = "auto";
+    std::string actual_present_mode = "none";
+    std::string gpu_driver = "none";
+    std::string gpu_device_name = "none";
+    bool gpu_validation = true;
+    bool benchmark_offscreen = false;
+    double last_tick_us = 0.0;
+    double last_readback_us = 0.0;
+    double last_upload_us = 0.0;
+    double last_fetch_us = 0.0;
+    double last_swapchain_acquire_us = 0.0;
+    double last_present_submit_us = 0.0;
+    double last_game_draw_us = 0.0;
+    double last_ui_us = 0.0;
+    std::vector<double> benchmark_frame_interval_us;
+    std::vector<double> benchmark_fetch_us;
+    std::vector<double> benchmark_swapchain_us;
+    std::vector<double> benchmark_present_us;
+    std::vector<double> benchmark_game_draw_us;
+    std::vector<double> benchmark_ui_us;
     uint64_t benchmark_start_ms = 0;
-    uint64_t benchmark_frames = 0;
     std::vector<double> benchmark_tick_us;
     std::vector<double> benchmark_readback_us;
     std::vector<double> benchmark_upload_us;
-    std::vector<double> benchmark_total_us;
 };
 
 void SavePpm(const std::string &path, const uint8_t *rgba,
@@ -184,6 +215,71 @@ void UpdateWindowTitle(HostState &state) {
 }
 
 bool CreatePresentation(HostState &state) {
+    if(g_ui_state.settings.render_backend == "sdl3_gpu") {
+        state.gpu_device = SDL_CreateGPUDevice(
+            SDL_GPU_SHADERFORMAT_SPIRV | SDL_GPU_SHADERFORMAT_MSL,
+            state.gpu_validation,
+            nullptr);
+        if(state.gpu_device == nullptr) {
+            fprintf(stderr, "SDL_CreateGPUDevice failed: %s\n", SDL_GetError());
+            return false;
+        }
+        if(!SDL_ClaimWindowForGPUDevice(state.gpu_device, state.window)) {
+            fprintf(stderr, "SDL_ClaimWindowForGPUDevice failed: %s\n",
+                    SDL_GetError());
+            SDL_DestroyGPUDevice(state.gpu_device);
+            state.gpu_device = nullptr;
+            return false;
+        }
+        SDL_GPUPresentMode selected = SDL_GPU_PRESENTMODE_VSYNC;
+        if(state.requested_present_mode == "immediate" ||
+           (state.requested_present_mode == "auto" &&
+            state.benchmark_seconds > 0)) {
+            if(SDL_WindowSupportsGPUPresentMode(
+                   state.gpu_device, state.window,
+                   SDL_GPU_PRESENTMODE_IMMEDIATE)) {
+                selected = SDL_GPU_PRESENTMODE_IMMEDIATE;
+            } else if(state.requested_present_mode == "immediate") {
+                fprintf(stderr, "requested GPU present mode is unsupported\n");
+                return false;
+            } else if(SDL_WindowSupportsGPUPresentMode(
+                          state.gpu_device, state.window,
+                          SDL_GPU_PRESENTMODE_MAILBOX)) {
+                selected = SDL_GPU_PRESENTMODE_MAILBOX;
+            }
+        } else if(state.requested_present_mode == "mailbox") {
+            if(!SDL_WindowSupportsGPUPresentMode(
+                   state.gpu_device, state.window,
+                   SDL_GPU_PRESENTMODE_MAILBOX)) {
+                fprintf(stderr, "requested GPU present mode is unsupported\n");
+                return false;
+            }
+            selected = SDL_GPU_PRESENTMODE_MAILBOX;
+        }
+        if(!SDL_SetGPUSwapchainParameters(
+               state.gpu_device, state.window,
+               SDL_GPU_SWAPCHAINCOMPOSITION_SDR, selected)) {
+            fprintf(stderr, "SDL_SetGPUSwapchainParameters failed: %s\n",
+                    SDL_GetError());
+            return false;
+        }
+        state.actual_present_mode =
+            selected == SDL_GPU_PRESENTMODE_IMMEDIATE ? "immediate" :
+            selected == SDL_GPU_PRESENTMODE_MAILBOX ? "mailbox" : "vsync";
+        const char *driver = SDL_GetGPUDeviceDriver(state.gpu_device);
+        const SDL_PropertiesID props =
+            SDL_GetGPUDeviceProperties(state.gpu_device);
+        const char *device_name = SDL_GetStringProperty(
+            props, SDL_PROP_GPU_DEVICE_NAME_STRING, "unknown");
+        state.gpu_driver = driver != nullptr ? driver : "unknown";
+        state.gpu_device_name = device_name;
+        fprintf(stderr, "[host] sdl3_gpu: driver=%s device=%s "
+                        "present_mode=%s validation=%s\n",
+                state.gpu_driver.c_str(), state.gpu_device_name.c_str(),
+                state.actual_present_mode.c_str(),
+                state.gpu_validation ? "on" : "off");
+        return true;
+    }
     state.renderer =
         SDL_CreateRenderer(state.window, nullptr);
     if(state.renderer == nullptr) {
@@ -204,6 +300,14 @@ bool CreatePresentation(HostState &state) {
 }
 
 void DestroyPresentation(HostState &state) {
+    if(state.gpu_device != nullptr) {
+        SDL_WaitForGPUIdle(state.gpu_device);
+        if(state.window != nullptr) {
+            SDL_ReleaseWindowFromGPUDevice(state.gpu_device, state.window);
+        }
+        SDL_DestroyGPUDevice(state.gpu_device);
+        state.gpu_device = nullptr;
+    }
     if(state.screen != nullptr) {
         SDL_DestroyTexture(state.screen);
         state.screen = nullptr;
@@ -235,35 +339,12 @@ void PresentGameTexture(HostState &state) {
     }
     if(frame == nullptr)
         return;
-    int frame_w = 0;
-    int frame_h = 0;
-    float tex_w = 0.0f;
-    float tex_h = 0.0f;
-    // SDL3 returns true on success; a failed query leaves the frame
-    // undrawable, so skip drawing then (the window stays cleared).
-    if(!SDL_GetTextureSize(frame, &tex_w, &tex_h) || tex_w <= 0.0f ||
-       tex_h <= 0.0f) {
-        return;
-    }
-    frame_w = static_cast<int>(tex_w);
-    frame_h = static_cast<int>(tex_h);
-    const float win_w = static_cast<float>(state.window_width);
-    const float win_h = static_cast<float>(state.window_height);
-    const float src_aspect =
-        static_cast<float>(frame_w) / static_cast<float>(frame_h);
-    const float win_aspect = win_w / win_h;
-    // Fit the frame inside the window preserving its aspect (letterbox);
-    // a no-op when the window aspect matches the frame.
-    SDL_FRect dst;
-    if(src_aspect > win_aspect) {
-        dst.w = win_w;
-        dst.h = win_w / src_aspect;
-    } else {
-        dst.h = win_h;
-        dst.w = win_h * src_aspect;
-    }
-    dst.x = (win_w - dst.w) * 0.5f;
-    dst.y = (win_h - dst.h) * 0.5f;
+    const PresentationTransform viewport = CalculatePresentationTransform(
+        state.surface_width, state.surface_height,
+        static_cast<float>(state.window_width),
+        static_cast<float>(state.window_height));
+    SDL_FRect dst{viewport.offset_x, viewport.offset_y, viewport.width,
+                  viewport.height};
     SDL_RenderTexture(state.renderer, frame, nullptr, &dst);
 }
 
@@ -335,7 +416,39 @@ void TickEngine(HostState &state) {
         elapsed > 0xFFFFFFFFull ? 0xFFFFFFFFu : static_cast<uint32_t>(elapsed);
 
     const auto tick_start = std::chrono::steady_clock::now();
+    state.last_tick_us = state.last_readback_us = state.last_upload_us =
+        state.last_fetch_us = 0.0;
+    bool borrowed_frame = false;
+    if(state.sdl_gpu_interface_v2 != nullptr) {
+        state.host_gpu_command_buffer =
+            SDL_AcquireGPUCommandBuffer(state.gpu_device);
+        if(state.host_gpu_command_buffer != nullptr &&
+           state.sdl_gpu_interface_v2->begin_frame(
+               state.engine, state.host_gpu_command_buffer) ==
+               ENGINE_RESULT_OK) {
+            borrowed_frame = true;
+        } else if(state.host_gpu_command_buffer != nullptr) {
+            SDL_CancelGPUCommandBuffer(state.host_gpu_command_buffer);
+            state.host_gpu_command_buffer = nullptr;
+        }
+    }
     engine_tick(state.engine, delta_ms);
+    if(borrowed_frame) {
+        engine_sdl_gpu_frame_v1_t frame{};
+        frame.struct_size = sizeof(frame);
+        if(state.sdl_gpu_interface_v2->end_frame(state.engine, &frame) ==
+           ENGINE_RESULT_OK) {
+            state.sdl_gpu_frame = frame;
+            state.gpu_frame_texture = reinterpret_cast<uint64_t>(frame.texture);
+            state.frame_ready = frame.texture != nullptr;
+        } else {
+            SDL_CancelGPUCommandBuffer(state.host_gpu_command_buffer);
+            state.host_gpu_command_buffer = nullptr;
+        }
+    }
+    if(g_ui_state.settings.render_backend == "sdl3_gpu") {
+        engine_submit_sdl_gpu_frame(state.engine);
+    }
     const auto tick_end = std::chrono::steady_clock::now();
 
     engine_frame_desc_t frame_desc;
@@ -359,23 +472,90 @@ void TickEngine(HostState &state) {
         state.surface_height = frame_desc.height;
         engine_set_surface_size(state.engine, frame_desc.width,
                                 frame_desc.height);
+        if(!state.window_auto_sized && state.window != nullptr) {
+            SDL_Rect usable{};
+            const SDL_DisplayID display = SDL_GetDisplayForWindow(state.window);
+            if(display != 0 && SDL_GetDisplayUsableBounds(display, &usable)) {
+                const float scale = std::min(
+                    1.0f,
+                    std::min(usable.w * 0.9f / frame_desc.width,
+                             usable.h * 0.9f / frame_desc.height));
+                state.window_width = std::max(
+                    1u, static_cast<uint32_t>(frame_desc.width * scale));
+                state.window_height = std::max(
+                    1u, static_cast<uint32_t>(frame_desc.height * scale));
+                SDL_SetWindowSize(state.window, state.window_width,
+                                  state.window_height);
+                SDL_SetWindowPosition(state.window, SDL_WINDOWPOS_CENTERED,
+                                      SDL_WINDOWPOS_CENTERED);
+            }
+            state.window_auto_sized = true;
+        }
         MatchWindowToSurfaceAspect(state);
         if(state.screen != nullptr) {
             SDL_DestroyTexture(state.screen);
             state.screen = nullptr;
         }
-        state.screen = SDL_CreateTexture(
-            state.renderer, SDL_PIXELFORMAT_ABGR8888,
-            SDL_TEXTUREACCESS_STREAMING, state.surface_width,
-            state.surface_height);
-        if(state.screen != nullptr) {
-            SDL_SetTextureScaleMode(state.screen, SDL_SCALEMODE_NEAREST);
-    SDL_SetTextureBlendMode(state.screen, SDL_BLENDMODE_NONE);
-        } else {
-            fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
-            state.exit_requested = true;
-            return;
+        if(state.renderer != nullptr) {
+            state.screen = SDL_CreateTexture(
+                state.renderer, SDL_PIXELFORMAT_ABGR8888,
+                SDL_TEXTUREACCESS_STREAMING, state.surface_width,
+                state.surface_height);
+            if(state.screen != nullptr) {
+                SDL_SetTextureScaleMode(state.screen, SDL_SCALEMODE_NEAREST);
+                SDL_SetTextureBlendMode(state.screen, SDL_BLENDMODE_NONE);
+            } else {
+                fprintf(stderr, "SDL_CreateTexture failed: %s\n", SDL_GetError());
+                state.exit_requested = true;
+                return;
+            }
         }
+    }
+
+    // Native SDL_GPU path: the extension submits engine compositing and
+    // leases the resulting texture to this host. CPU readback is reserved
+    // for explicit screenshots below.
+    if(state.sdl_gpu_interface != nullptr) {
+        engine_sdl_gpu_frame_v1_t frame{};
+        frame.struct_size = sizeof(frame);
+        const auto acquire_start = std::chrono::steady_clock::now();
+        const engine_result_t result = borrowed_frame
+            ? ENGINE_RESULT_OK
+            : state.sdl_gpu_interface->acquire_frame(state.engine, &frame);
+        const auto acquire_end = std::chrono::steady_clock::now();
+        if(borrowed_frame) {
+            frame = state.sdl_gpu_frame;
+        }
+        if(result == ENGINE_RESULT_OK) {
+            state.sdl_gpu_frame = frame;
+            state.gpu_frame_texture = reinterpret_cast<uint64_t>(frame.texture);
+            state.frame_ready = frame.texture != nullptr;
+        } else {
+            state.frame_ready = false;
+        }
+        if(!state.screenshot_path.empty()) {
+            ++state.frame_count_since_start;
+            if(state.frame_count_since_start >= state.screenshot_after_frames) {
+                std::vector<uint8_t> pixels(frame_bytes);
+                if(engine_read_frame_rgba(state.engine, pixels.data(),
+                                          pixels.size()) == ENGINE_RESULT_OK) {
+                    SavePpm(state.screenshot_path, pixels.data(),
+                            frame_desc.width, frame_desc.height,
+                            frame_desc.stride_bytes);
+                }
+                state.screenshot_path.clear();
+            }
+        }
+        const auto us = [](const auto &a, const auto &b) {
+            return std::chrono::duration<double, std::micro>(b - a).count();
+        };
+        g_overlay_stats.tick_ms = us(tick_start, tick_end) / 1000.0;
+        state.last_tick_us = us(tick_start, tick_end);
+        state.last_fetch_us = us(acquire_start, acquire_end);
+        g_overlay_stats.readback_ms = 0.0;
+        g_overlay_stats.upload_ms = 0.0;
+        g_overlay_stats.total_ms = us(tick_start, acquire_end) / 1000.0;
+        return;
     }
 
     if(frame_bytes != state.frame_pixels.size()) {
@@ -383,10 +563,6 @@ void TickEngine(HostState &state) {
         state.frame_stride = frame_desc.stride_bytes;
     }
     const auto readback_start = std::chrono::steady_clock::now();
-    const bool frame_read =
-        engine_read_frame_rgba(state.engine, state.frame_pixels.data(),
-                               frame_bytes) == ENGINE_RESULT_OK;
-    const auto readback_end = std::chrono::steady_clock::now();
     if(state.use_gpu_present) {
         // Zero-copy path: grab the engine's published GPU frame handle and
         // present it directly; no readback, no texture upload.
@@ -426,34 +602,14 @@ void TickEngine(HostState &state) {
         };
         const double tick_us = us(tick_start, tick_end);
         const double fetch_us = us(readback_start, gpu_end);
+        state.last_tick_us = tick_us;
+        state.last_fetch_us = fetch_us;
         const double total_us = us(tick_start, gpu_end);
         g_overlay_stats.tick_ms = tick_us / 1000.0;
         g_overlay_stats.readback_ms = fetch_us / 1000.0;
         g_overlay_stats.upload_ms = 0.0;
         g_overlay_stats.total_ms = total_us / 1000.0;
         g_overlay_stats.stats_valid = true;
-        if(state.benchmark_seconds > 0) {
-            state.benchmark_frames++;
-            state.benchmark_tick_us.push_back(tick_us);
-            state.benchmark_readback_us.push_back(fetch_us);
-            state.benchmark_upload_us.push_back(0.0);
-            state.benchmark_total_us.push_back(total_us);
-            constexpr size_t kMaxBenchmarkSamples = 100000;
-            if(state.benchmark_total_us.size() > kMaxBenchmarkSamples) {
-                state.benchmark_tick_us.erase(
-                    state.benchmark_tick_us.begin(),
-                    state.benchmark_tick_us.begin() + 10000);
-                state.benchmark_readback_us.erase(
-                    state.benchmark_readback_us.begin(),
-                    state.benchmark_readback_us.begin() + 10000);
-                state.benchmark_upload_us.erase(
-                    state.benchmark_upload_us.begin(),
-                    state.benchmark_upload_us.begin() + 10000);
-                state.benchmark_total_us.erase(
-                    state.benchmark_total_us.begin(),
-                    state.benchmark_total_us.begin() + 10000);
-            }
-        }
         if(state.slow_frame_threshold_ms > 0 &&
            total_us >= state.slow_frame_threshold_ms * 1000.0) {
             const uint64_t slow_now = SDL_GetTicks();
@@ -485,6 +641,10 @@ void TickEngine(HostState &state) {
         }
         return;
     }
+    const bool frame_read =
+        engine_read_frame_rgba(state.engine, state.frame_pixels.data(),
+                               frame_bytes) == ENGINE_RESULT_OK;
+    const auto readback_end = std::chrono::steady_clock::now();
     if(frame_read) {
         const auto upload_start = std::chrono::steady_clock::now();
         UploadEngineFrame(state);
@@ -510,6 +670,9 @@ void TickEngine(HostState &state) {
         const double readback_us = us(readback_start, readback_end);
         const double upload_us = us(upload_start, upload_end);
         const double total_us = us(tick_start, frame_end);
+        state.last_tick_us = tick_us;
+        state.last_readback_us = readback_us;
+        state.last_upload_us = upload_us;
 
         // Publish to the ImGui overlay.
         g_overlay_stats.tick_ms = tick_us / 1000.0;
@@ -517,29 +680,6 @@ void TickEngine(HostState &state) {
         g_overlay_stats.upload_ms = upload_us / 1000.0;
         g_overlay_stats.total_ms = total_us / 1000.0;
         g_overlay_stats.stats_valid = true;
-
-        if(state.benchmark_seconds > 0) {
-            state.benchmark_frames++;
-            state.benchmark_tick_us.push_back(tick_us);
-            state.benchmark_readback_us.push_back(readback_us);
-            state.benchmark_upload_us.push_back(upload_us);
-            state.benchmark_total_us.push_back(total_us);
-            constexpr size_t kMaxBenchmarkSamples = 100000;
-            if(state.benchmark_total_us.size() > kMaxBenchmarkSamples) {
-                state.benchmark_tick_us.erase(
-                    state.benchmark_tick_us.begin(),
-                    state.benchmark_tick_us.begin() + 10000);
-                state.benchmark_readback_us.erase(
-                    state.benchmark_readback_us.begin(),
-                    state.benchmark_readback_us.begin() + 10000);
-                state.benchmark_upload_us.erase(
-                    state.benchmark_upload_us.begin(),
-                    state.benchmark_upload_us.begin() + 10000);
-                state.benchmark_total_us.erase(
-                    state.benchmark_total_us.begin(),
-                    state.benchmark_total_us.begin() + 10000);
-            }
-        }
 
         if(state.slow_frame_threshold_ms > 0 &&
            total_us >= state.slow_frame_threshold_ms * 1000.0) {
@@ -589,16 +729,16 @@ void PrintBenchmarkSummary(HostState &state) {
     const uint64_t now = SDL_GetTicks();
     const double duration_s =
         static_cast<double>(now - state.benchmark_start_ms) / 1000.0;
-    if(duration_s <= 0.0 || state.benchmark_total_us.empty()) {
+    if(duration_s <= 0.0 || state.benchmark_frame_interval_us.empty()) {
         fprintf(stderr, "benchmark: no frames collected\n");
         return;
     }
     const double avg_fps =
-        static_cast<double>(state.benchmark_frames) / duration_s;
+        static_cast<double>(state.benchmark_complete_frames) / duration_s;
     fprintf(stderr,
             "benchmark: duration=%.1fs frames=%llu avg_fps=%.1f\n",
             duration_s,
-            static_cast<unsigned long long>(state.benchmark_frames),
+            static_cast<unsigned long long>(state.benchmark_complete_frames),
             avg_fps);
     const auto print_series = [](const char *name,
                                  const std::vector<double> &samples) {
@@ -613,10 +753,111 @@ void PrintBenchmarkSummary(HostState &state) {
                 Percentile(samples, 0.99) / 1000.0,
                 *std::max_element(samples.begin(), samples.end()) / 1000.0);
     };
-    print_series("frame_total", state.benchmark_total_us);
+    print_series("frame_interval", state.benchmark_frame_interval_us);
     print_series("tick", state.benchmark_tick_us);
+    print_series("frame_fetch", state.benchmark_fetch_us);
     print_series("readback", state.benchmark_readback_us);
     print_series("upload", state.benchmark_upload_us);
+    print_series("game_draw", state.benchmark_game_draw_us);
+    print_series("ui", state.benchmark_ui_us);
+    print_series("swapchain_acquire", state.benchmark_swapchain_us);
+    print_series("present_submit", state.benchmark_present_us);
+
+    engine_sdl_gpu_stats_v1_t gpu_stats{};
+    gpu_stats.struct_size = sizeof(gpu_stats);
+    if(state.sdl_gpu_interface != nullptr &&
+       state.sdl_gpu_interface->get_stats != nullptr &&
+       state.sdl_gpu_interface->get_stats(state.engine, &gpu_stats) ==
+           ENGINE_RESULT_OK) {
+        fprintf(stderr,
+                "  gpu_stats cmd_acquire=%llu cmd_submit=%llu "
+                "render_pass=%llu copy_pass=%llu wait_idle=%llu "
+                "upload=%llu/%lluB readback=%llu/%lluB "
+                "gpu_draw=%llu fallback=%llu fill=%llu/%llu "
+                "d=%llu/%llu dirty_upload=%llu/%lluB "
+                "full_upload=%llu/%lluB barrier=%llu/%lluB\n",
+                (unsigned long long)gpu_stats.command_buffers_acquired,
+                (unsigned long long)gpu_stats.command_buffers_submitted,
+                (unsigned long long)gpu_stats.render_passes,
+                (unsigned long long)gpu_stats.copy_passes,
+                (unsigned long long)gpu_stats.wait_idle_calls,
+                (unsigned long long)gpu_stats.upload_calls,
+                (unsigned long long)gpu_stats.upload_bytes,
+                (unsigned long long)gpu_stats.readback_calls,
+                (unsigned long long)gpu_stats.readback_bytes,
+                (unsigned long long)gpu_stats.gpu_draw_calls,
+                (unsigned long long)gpu_stats.software_fallback_calls,
+                (unsigned long long)gpu_stats.fill_argb_gpu_calls,
+                (unsigned long long)gpu_stats.fill_color_gpu_calls,
+                (unsigned long long)gpu_stats.alpha_blend_d_gpu_calls,
+                (unsigned long long)gpu_stats.const_color_alpha_blend_d_gpu_calls,
+                (unsigned long long)gpu_stats.dirty_upload_calls,
+                (unsigned long long)gpu_stats.dirty_upload_bytes,
+                (unsigned long long)gpu_stats.full_upload_calls,
+                (unsigned long long)gpu_stats.full_upload_bytes,
+                (unsigned long long)gpu_stats.authority_barrier_calls,
+                (unsigned long long)gpu_stats.authority_barrier_bytes);
+    }
+    const auto average = [](const std::vector<double> &values) {
+        double sum = 0.0;
+        for(double value : values) sum += value;
+        return values.empty() ? 0.0 : sum / values.size() / 1000.0;
+    };
+    fprintf(stderr,
+            "benchmark_json: {\"backend\":\"%s\",\"present_mode\":\"%s\","
+            "\"gpu_driver\":\"%s\",\"gpu_device\":\"%s\","
+            "\"validation\":%s,\"offscreen\":%s,"
+            "\"width\":%u,\"height\":%u,"
+            "\"duration_s\":%.3f,\"frames\":%llu,\"fps\":%.3f,"
+            "\"frame_interval_ms_avg\":%.6f,\"frame_interval_ms_p95\":%.6f,"
+            "\"tick_ms_avg\":%.6f,\"fetch_ms_avg\":%.6f,"
+            "\"readback_ms_avg\":%.6f,\"upload_ms_avg\":%.6f,"
+            "\"game_draw_ms_avg\":%.6f,\"ui_ms_avg\":%.6f,"
+            "\"swapchain_ms_avg\":%.6f,\"present_ms_avg\":%.6f,"
+            "\"gpu_wait_idle\":%llu,\"gpu_upload_calls\":%llu,"
+            "\"gpu_upload_bytes\":%llu,\"gpu_readback_calls\":%llu,"
+            "\"gpu_readback_bytes\":%llu,\"gpu_draw_calls\":%llu,"
+            "\"software_fallback_calls\":%llu,"
+            "\"fill_argb_gpu_calls\":%llu,\"fill_color_gpu_calls\":%llu,"
+            "\"alpha_blend_d_gpu_calls\":%llu,"
+            "\"const_color_alpha_blend_d_gpu_calls\":%llu,"
+            "\"full_upload_calls\":%llu,\"full_upload_bytes\":%llu,"
+            "\"dirty_upload_calls\":%llu,\"dirty_upload_bytes\":%llu,"
+            "\"authority_barrier_calls\":%llu,"
+            "\"authority_barrier_bytes\":%llu}\n",
+            g_ui_state.settings.render_backend.c_str(),
+            state.actual_present_mode.c_str(),
+            state.gpu_driver.c_str(), state.gpu_device_name.c_str(),
+            state.gpu_validation ? "true" : "false",
+            state.benchmark_offscreen ? "true" : "false",
+            state.surface_width, state.surface_height, duration_s,
+            (unsigned long long)state.benchmark_complete_frames, avg_fps,
+            average(state.benchmark_frame_interval_us),
+            Percentile(state.benchmark_frame_interval_us, 0.95) / 1000.0,
+            average(state.benchmark_tick_us), average(state.benchmark_fetch_us),
+            average(state.benchmark_readback_us),
+            average(state.benchmark_upload_us),
+            average(state.benchmark_game_draw_us),
+            average(state.benchmark_ui_us),
+            average(state.benchmark_swapchain_us),
+            average(state.benchmark_present_us),
+            (unsigned long long)gpu_stats.wait_idle_calls,
+            (unsigned long long)gpu_stats.upload_calls,
+            (unsigned long long)gpu_stats.upload_bytes,
+            (unsigned long long)gpu_stats.readback_calls,
+            (unsigned long long)gpu_stats.readback_bytes,
+            (unsigned long long)gpu_stats.gpu_draw_calls,
+            (unsigned long long)gpu_stats.software_fallback_calls,
+            (unsigned long long)gpu_stats.fill_argb_gpu_calls,
+            (unsigned long long)gpu_stats.fill_color_gpu_calls,
+            (unsigned long long)gpu_stats.alpha_blend_d_gpu_calls,
+            (unsigned long long)gpu_stats.const_color_alpha_blend_d_gpu_calls,
+            (unsigned long long)gpu_stats.full_upload_calls,
+            (unsigned long long)gpu_stats.full_upload_bytes,
+            (unsigned long long)gpu_stats.dirty_upload_calls,
+            (unsigned long long)gpu_stats.dirty_upload_bytes,
+            (unsigned long long)gpu_stats.authority_barrier_calls,
+            (unsigned long long)gpu_stats.authority_barrier_bytes);
 }
 
 void HandleWindowEvent(HostState &state, const SDL_Event *event) {
@@ -671,13 +912,12 @@ void PollInput(HostState &state) {
             io.WantCaptureKeyboard;
         if(state.engine != nullptr && state.startup_complete &&
            !capture_mouse && !capture_key) {
-            const float scale_x =
-                static_cast<float>(state.surface_width) /
-                static_cast<float>(state.window_width);
-            const float scale_y =
-                static_cast<float>(state.surface_height) /
-                static_cast<float>(state.window_height);
-            ForwardSdlEventToEngine(state.engine, &event, scale_x, scale_y);
+            const PresentationTransform viewport =
+                CalculatePresentationTransform(
+                    state.surface_width, state.surface_height,
+                    static_cast<float>(state.window_width),
+                    static_cast<float>(state.window_height));
+            ForwardSdlEventToEngine(state.engine, &event, viewport);
         }
     }
 }
@@ -826,8 +1066,9 @@ void RunStartup(HostState &state) {
     DrainStartupLogs(state);
     if(startup_state == ENGINE_STARTUP_STATE_SUCCEEDED) {
         state.startup_complete = true;
-        if(state.benchmark_seconds > 0 && state.benchmark_start_ms == 0)
-            state.benchmark_start_ms = SDL_GetTicks();
+        if(state.benchmark_seconds > 0 &&
+           state.benchmark_warmup_start_ms == 0)
+            state.benchmark_warmup_start_ms = SDL_GetTicks();
         UpdateWindowTitle(state);
         return;
     }
@@ -857,11 +1098,13 @@ void UpdateFps(HostState &state) {
 
 // Forward declarations for ImGui integration and engine-lifecycle helpers
 // (defined later in this anonymous namespace).
-bool InitImGui(SDL_Window *window, SDL_Renderer *renderer,
+bool InitImGui(HostState &state,
                const std::string &font_path);
 void ShutdownImGui();
 void BeginImGuiFrame();
 void EndImGuiFrame(SDL_Renderer *renderer);
+void PresentSdlGpu(HostState &state);
+void SubmitSdlGpuOffscreen(HostState &state);
 void PaintUi(UiState &state, bool game_running);
 void PollFileDialog(SDL_Window *window);
 void StopEngine(HostState &state);
@@ -874,6 +1117,9 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
             const std::string &screenshot_path, int screenshot_after_frames,
             const std::string &diagnostics_profile,
             uint32_t slow_frame_threshold_ms, uint32_t benchmark_seconds,
+            uint32_t benchmark_warmup_seconds,
+            const std::string &present_mode, bool gpu_validation,
+            bool benchmark_offscreen,
             const std::vector<std::pair<std::string, std::string>>
                 &extra_options) {
     HostState state;
@@ -881,6 +1127,10 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
     state.screenshot_after_frames = screenshot_after_frames;
     state.slow_frame_threshold_ms = slow_frame_threshold_ms;
     state.benchmark_seconds = benchmark_seconds;
+    state.benchmark_warmup_seconds = benchmark_warmup_seconds;
+    state.requested_present_mode = present_mode;
+    state.gpu_validation = gpu_validation;
+    state.benchmark_offscreen = benchmark_offscreen;
 
     const std::string base_dir = WritableBaseDir();
     EnsureDirectory(base_dir);
@@ -916,8 +1166,7 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
         return 1;
     }
 
-    if(!InitImGui(state.window, state.renderer,
-                  g_ui_state.settings.font_path)) {
+    if(!InitImGui(state, g_ui_state.settings.font_path)) {
         DestroyPresentation(state);
         SDL_DestroyWindow(state.window);
         SDL_Quit();
@@ -955,6 +1204,11 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
             : 0;
 
     while(state.running && !state.exit_requested) {
+        const auto loop_frame_start = std::chrono::steady_clock::now();
+        state.last_swapchain_acquire_us = 0.0;
+        state.last_present_submit_us = 0.0;
+        state.last_game_draw_us = 0.0;
+        state.last_ui_us = 0.0;
         PollInput(state);
         if(state.exit_requested)
             break;
@@ -987,10 +1241,23 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
         }
         if(state.engine != nullptr && g_ui_state.want_screenshot) {
             g_ui_state.want_screenshot = false;
-            if(!state.frame_pixels.empty()) {
-                static int shot_seq = 0;
-                const std::string path =
-                    base_dir + "/shot-" + std::to_string(++shot_seq) + ".ppm";
+            static int shot_seq = 0;
+            const std::string path =
+                base_dir + "/shot-" + std::to_string(++shot_seq) + ".ppm";
+            if(state.sdl_gpu_interface != nullptr) {
+                engine_frame_desc_t desc{};
+                desc.struct_size = sizeof(desc);
+                if(engine_get_frame_desc(state.engine, &desc) == ENGINE_RESULT_OK) {
+                    std::vector<uint8_t> pixels(
+                        static_cast<size_t>(desc.stride_bytes) * desc.height);
+                    if(engine_read_frame_rgba(state.engine, pixels.data(),
+                                              pixels.size()) == ENGINE_RESULT_OK) {
+                        SavePpm(path, pixels.data(), desc.width, desc.height,
+                                desc.stride_bytes);
+                        g_ui_state.status_text = u8"截图已保存: " + path;
+                    }
+                }
+            } else if(!state.frame_pixels.empty()) {
                 SavePpm(path, state.frame_pixels.data(),
                         state.surface_width, state.surface_height,
                         state.frame_stride);
@@ -1038,22 +1305,41 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
 
         // Draw the scene (game texture or launcher background), then layer
         // ImGui on top, then present once.
-        if(game_running) {
+        const auto game_draw_start = std::chrono::steady_clock::now();
+        if(game_running && state.gpu_device == nullptr) {
             PresentGameTexture(state);
             UpdateFps(state);
-        } else {
+        } else if(state.gpu_device == nullptr) {
             SDL_SetRenderDrawColor(state.renderer, 24, 24, 32, 255);
             SDL_RenderClear(state.renderer);
+        } else if(game_running) {
+            UpdateFps(state);
         }
+        state.last_game_draw_us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - game_draw_start).count();
 
+        const auto ui_start = std::chrono::steady_clock::now();
         BeginImGuiFrame();
         PaintUi(g_ui_state, game_running);
         if(game_running && state.startup_complete) {
             g_overlay_stats.fps = state.fps;
         }
         EndImGuiFrame(state.renderer);
+        state.last_ui_us = std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - ui_start).count();
 
-        SDL_RenderPresent(state.renderer);
+        const auto present_start = std::chrono::steady_clock::now();
+        if(state.gpu_device != nullptr) {
+            if(state.benchmark_offscreen)
+                SubmitSdlGpuOffscreen(state);
+            else
+                PresentSdlGpu(state);
+        } else {
+            SDL_RenderPresent(state.renderer);
+            state.last_present_submit_us =
+                std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - present_start).count();
+        }
 
         // Destroy textures the engine released this frame only after the
         // present above no longer references them.
@@ -1061,7 +1347,72 @@ int RunHost(const std::string &game_path, uint32_t fps_limit,
             engine_flush_released_textures(state.engine);
         }
 
-        if(state.benchmark_seconds > 0 && state.benchmark_start_ms != 0 &&
+        if(game_running && state.startup_complete &&
+           state.benchmark_seconds > 0) {
+            const uint64_t benchmark_now = SDL_GetTicks();
+            if(!state.benchmark_measuring &&
+               state.benchmark_warmup_start_ms != 0 &&
+               benchmark_now - state.benchmark_warmup_start_ms >=
+                   static_cast<uint64_t>(state.benchmark_warmup_seconds) *
+                       1000) {
+                state.benchmark_measuring = true;
+                state.benchmark_start_ms = benchmark_now;
+                state.benchmark_complete_frames = 0;
+                state.benchmark_frame_interval_us.clear();
+                state.benchmark_fetch_us.clear();
+                state.benchmark_swapchain_us.clear();
+                state.benchmark_present_us.clear();
+                state.benchmark_game_draw_us.clear();
+                state.benchmark_ui_us.clear();
+                state.benchmark_tick_us.clear();
+                state.benchmark_readback_us.clear();
+                state.benchmark_upload_us.clear();
+                if(state.sdl_gpu_interface != nullptr &&
+                   state.sdl_gpu_interface->reset_stats != nullptr)
+                    state.sdl_gpu_interface->reset_stats(state.engine);
+                fprintf(stderr, "benchmark: warmup complete, measuring\n");
+            }
+            if(state.benchmark_measuring) {
+                const double interval_us =
+                    std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - loop_frame_start)
+                        .count();
+                ++state.benchmark_complete_frames;
+                state.benchmark_frame_interval_us.push_back(interval_us);
+                state.benchmark_tick_us.push_back(state.last_tick_us);
+                state.benchmark_readback_us.push_back(state.last_readback_us);
+                state.benchmark_upload_us.push_back(state.last_upload_us);
+                state.benchmark_fetch_us.push_back(state.last_fetch_us);
+                state.benchmark_swapchain_us.push_back(
+                    state.last_swapchain_acquire_us);
+                state.benchmark_present_us.push_back(
+                    state.last_present_submit_us);
+                state.benchmark_game_draw_us.push_back(state.last_game_draw_us);
+                state.benchmark_ui_us.push_back(state.last_ui_us);
+                constexpr size_t kMaxBenchmarkSamples = 100000;
+                constexpr size_t kBenchmarkTrimSamples = 10000;
+                if(state.benchmark_frame_interval_us.size() >
+                   kMaxBenchmarkSamples) {
+                    std::vector<double> *series[] = {
+                        &state.benchmark_frame_interval_us,
+                        &state.benchmark_tick_us,
+                        &state.benchmark_fetch_us,
+                        &state.benchmark_readback_us,
+                        &state.benchmark_upload_us,
+                        &state.benchmark_game_draw_us,
+                        &state.benchmark_ui_us,
+                        &state.benchmark_swapchain_us,
+                        &state.benchmark_present_us};
+                    for(auto *values : series) {
+                        values->erase(values->begin(),
+                                      values->begin() +
+                                          kBenchmarkTrimSamples);
+                    }
+                }
+            }
+        }
+
+        if(state.benchmark_measuring && state.benchmark_start_ms != 0 &&
            SDL_GetTicks() - state.benchmark_start_ms >=
                static_cast<uint64_t>(state.benchmark_seconds) * 1000) {
             PrintBenchmarkSummary(state);
@@ -1095,7 +1446,7 @@ namespace {
 // ---------------------------------------------------------------------------
 // ImGui integration
 // ---------------------------------------------------------------------------
-bool InitImGui(SDL_Window *window, SDL_Renderer *renderer,
+bool InitImGui(HostState &state,
                const std::string &font_path) {
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
@@ -1126,35 +1477,147 @@ bool InitImGui(SDL_Window *window, SDL_Renderer *renderer,
             u8"中文界面字体缺失（NotoSansCJK-Regular.ttc），已回退英文界面";
     }
 
-    if(!ImGui_ImplSDL3_InitForSDLRenderer(window, renderer)) {
-        fprintf(stderr, "ImGui_ImplSDL3_InitForSDLRenderer failed\n");
+    const bool gpu = state.gpu_device != nullptr;
+    if(!(gpu ? ImGui_ImplSDL3_InitForSDLGPU(state.window)
+             : ImGui_ImplSDL3_InitForSDLRenderer(state.window,
+                                                 state.renderer))) {
+        fprintf(stderr, "ImGui SDL3 platform initialization failed\n");
         ImGui::DestroyContext();
         return false;
     }
-    if(!ImGui_ImplSDLRenderer3_Init(renderer)) {
-        fprintf(stderr, "ImGui_ImplSDLRenderer3_Init failed\n");
+    bool renderer_ok = false;
+    if(gpu) {
+        ImGui_ImplSDLGPU3_InitInfo info{};
+        info.Device = state.gpu_device;
+        info.ColorTargetFormat = SDL_GetGPUSwapchainTextureFormat(
+            state.gpu_device, state.window);
+        renderer_ok = ImGui_ImplSDLGPU3_Init(&info);
+    } else {
+        renderer_ok = ImGui_ImplSDLRenderer3_Init(state.renderer);
+    }
+    if(!renderer_ok) {
+        fprintf(stderr, "ImGui renderer initialization failed\n");
         ImGui_ImplSDL3_Shutdown();
         ImGui::DestroyContext();
         return false;
     }
+    g_imgui_uses_sdl_gpu = gpu;
     return true;
 }
 
 void ShutdownImGui() {
-    ImGui_ImplSDLRenderer3_Shutdown();
+    if(g_imgui_uses_sdl_gpu)
+        ImGui_ImplSDLGPU3_Shutdown();
+    else
+        ImGui_ImplSDLRenderer3_Shutdown();
     ImGui_ImplSDL3_Shutdown();
     ImGui::DestroyContext();
 }
 
 void BeginImGuiFrame() {
     ImGui_ImplSDL3_NewFrame();
-    ImGui_ImplSDLRenderer3_NewFrame();
+    if(g_imgui_uses_sdl_gpu)
+        ImGui_ImplSDLGPU3_NewFrame();
+    else
+        ImGui_ImplSDLRenderer3_NewFrame();
     ImGui::NewFrame();
 }
 
 void EndImGuiFrame(SDL_Renderer *renderer) {
     ImGui::Render();
-    ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
+    if(!g_imgui_uses_sdl_gpu)
+        ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), renderer);
+}
+
+void PresentSdlGpu(HostState &state) {
+    const auto acquire_start = std::chrono::steady_clock::now();
+    SDL_GPUCommandBuffer *cmd = state.host_gpu_command_buffer != nullptr
+        ? state.host_gpu_command_buffer
+        : SDL_AcquireGPUCommandBuffer(state.gpu_device);
+    if(cmd == nullptr)
+        return;
+    SDL_GPUTexture *swap = nullptr;
+    Uint32 sw = 0, sh = 0;
+    if(!SDL_AcquireGPUSwapchainTexture(cmd, state.window, &swap, &sw, &sh)) {
+        SDL_CancelGPUCommandBuffer(cmd);
+        return;
+    }
+    const auto acquire_end = std::chrono::steady_clock::now();
+    state.last_swapchain_acquire_us =
+        std::chrono::duration<double, std::micro>(acquire_end - acquire_start)
+            .count();
+    if(swap == nullptr) {
+        SDL_SubmitGPUCommandBuffer(cmd);
+        return;
+    }
+    if(state.frame_ready && state.sdl_gpu_frame.texture != nullptr) {
+        const PresentationTransform viewport = CalculatePresentationTransform(
+            state.surface_width, state.surface_height,
+            static_cast<float>(sw), static_cast<float>(sh));
+        SDL_GPUBlitInfo blit{};
+        blit.source.texture = static_cast<SDL_GPUTexture*>(
+            state.sdl_gpu_frame.texture);
+        blit.source.w = state.surface_width;
+        blit.source.h = state.surface_height;
+        blit.destination.texture = swap;
+        blit.destination.x = static_cast<Uint32>(viewport.offset_x);
+        blit.destination.y = static_cast<Uint32>(viewport.offset_y);
+        blit.destination.w = static_cast<Uint32>(viewport.width);
+        blit.destination.h = static_cast<Uint32>(viewport.height);
+        blit.load_op = SDL_GPU_LOADOP_CLEAR;
+        blit.clear_color = SDL_FColor{0, 0, 0, 1};
+        blit.filter = SDL_GPU_FILTER_NEAREST;
+        SDL_BlitGPUTexture(cmd, &blit);
+    }
+    ImGui_ImplSDLGPU3_PrepareDrawData(ImGui::GetDrawData(), cmd);
+    SDL_GPUColorTargetInfo target{};
+    target.texture = swap;
+    target.load_op = state.frame_ready ? SDL_GPU_LOADOP_LOAD
+                                       : SDL_GPU_LOADOP_CLEAR;
+    target.store_op = SDL_GPU_STOREOP_STORE;
+    target.clear_color = SDL_FColor{0.094f, 0.094f, 0.125f, 1.0f};
+    SDL_GPURenderPass *pass = SDL_BeginGPURenderPass(cmd, &target, 1,
+                                                     nullptr);
+    if(pass != nullptr) {
+        ImGui_ImplSDLGPU3_RenderDrawData(ImGui::GetDrawData(), cmd, pass);
+        SDL_EndGPURenderPass(pass);
+    }
+    const auto submit_start = std::chrono::steady_clock::now();
+    SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    state.host_gpu_command_buffer = nullptr;
+    if(state.sdl_gpu_interface != nullptr &&
+       state.sdl_gpu_frame.lease_token != 0) {
+        state.sdl_gpu_interface->release_frame(
+            state.engine, state.sdl_gpu_frame.lease_token, fence);
+        state.sdl_gpu_frame = {};
+    } else if(fence != nullptr) {
+        SDL_WaitForGPUFences(state.gpu_device, true, &fence, 1);
+        SDL_ReleaseGPUFence(state.gpu_device, fence);
+    }
+    state.last_present_submit_us =
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - submit_start).count();
+}
+
+void SubmitSdlGpuOffscreen(HostState &state) {
+    SDL_GPUCommandBuffer *cmd = state.host_gpu_command_buffer != nullptr
+        ? state.host_gpu_command_buffer
+        : SDL_AcquireGPUCommandBuffer(state.gpu_device);
+    if(cmd == nullptr) return;
+    const auto submit_start = std::chrono::steady_clock::now();
+    SDL_GPUFence *fence = SDL_SubmitGPUCommandBufferAndAcquireFence(cmd);
+    state.host_gpu_command_buffer = nullptr;
+    if(state.sdl_gpu_interface != nullptr &&
+       state.sdl_gpu_frame.lease_token != 0) {
+        state.sdl_gpu_interface->release_frame(
+            state.engine, state.sdl_gpu_frame.lease_token, fence);
+        state.sdl_gpu_frame = {};
+    } else if(fence != nullptr) {
+        SDL_ReleaseGPUFence(state.gpu_device, fence);
+    }
+    state.last_present_submit_us =
+        std::chrono::duration<double, std::micro>(
+            std::chrono::steady_clock::now() - submit_start).count();
 }
 
 // Paints whichever panel the state machine needs (launcher vs overlay).
@@ -1197,16 +1660,24 @@ void PollFileDialog(SDL_Window *window) {
 // Engine lifecycle helpers (UI-driven start/stop/restart)
 // ---------------------------------------------------------------------------
 void StopEngine(HostState &state) {
+    if(state.host_gpu_command_buffer != nullptr) {
+        SDL_CancelGPUCommandBuffer(state.host_gpu_command_buffer);
+        state.host_gpu_command_buffer = nullptr;
+    }
     if(state.engine != nullptr) {
         engine_destroy(state.engine);
         state.engine = nullptr;
     }
+    state.sdl_gpu_interface = nullptr;
+    state.sdl_gpu_interface_v2 = nullptr;
+    state.sdl_gpu_frame = {};
     state.startup_complete = false;
     state.frame_ready = false;
     state.frame_pixels.clear();
     state.gpu_frame_texture = 0;
     state.surface_width = kDefaultSurfaceWidth;
     state.surface_height = kDefaultSurfaceHeight;
+    state.window_auto_sized = false;
     state.last_frame_serial = 0;
     state.no_frame_since_ms = 0;
     state.screenshot_path.clear();
@@ -1218,6 +1689,20 @@ bool StartEngine(HostState &state, const std::string &base_dir,
                      &extra_options) {
     if(state.engine != nullptr)
         StopEngine(state);
+
+    // The launcher may change presentation APIs between sessions. Recreate
+    // only host-owned resources while no engine or frame lease exists.
+    const bool wants_sdl_gpu =
+        g_ui_state.settings.render_backend == "sdl3_gpu";
+    if(wants_sdl_gpu != (state.gpu_device != nullptr)) {
+        ShutdownImGui();
+        DestroyPresentation(state);
+        if(!CreatePresentation(state) ||
+           !InitImGui(state, g_ui_state.settings.font_path)) {
+            g_ui_state.status_text = u8"宿主渲染器切换失败";
+            return false;
+        }
+    }
 
     engine_create_desc_t desc;
     memset(&desc, 0, sizeof(desc));
@@ -1234,14 +1719,57 @@ bool StartEngine(HostState &state, const std::string &base_dir,
     engine_option_t option;
     memset(&option, 0, sizeof(option));
     option.key_utf8 = ENGINE_OPTION_RENDERER;
+    const bool sdl3_gpu_backend =
+        g_ui_state.settings.render_backend == "sdl3_gpu";
     const bool gpu_backend =
         g_ui_state.settings.render_backend == "gpu_bridge" ||
-        g_ui_state.settings.render_backend == "sdl3_gpu";
-    option.value_utf8 =
-        gpu_backend ? ENGINE_RENDERER_GPU_BRIDGE : ENGINE_RENDERER_SOFTWARE;
+        sdl3_gpu_backend;
+    option.value_utf8 = sdl3_gpu_backend
+                            ? ENGINE_RENDERER_SDL3_GPU
+                            : (gpu_backend ? ENGINE_RENDERER_GPU_BRIDGE
+                                           : ENGINE_RENDERER_SOFTWARE);
     engine_set_option(state.engine, &option);
-    state.use_gpu_present = gpu_backend;
-    if(gpu_backend) {
+    // sdl3_gpu presents via CPU readback (SDL_GPU textures are not host
+    // presentable through the SDL_Renderer path).
+    state.use_gpu_present = gpu_backend && !sdl3_gpu_backend;
+    if(sdl3_gpu_backend) {
+        const void *raw_interface = nullptr;
+        const engine_result_t query_result = engine_query_interface(
+            state.engine, ENGINE_INTERFACE_RENDER_SDL_GPU_V1,
+            ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1, &raw_interface);
+        state.sdl_gpu_interface =
+            static_cast<const engine_render_sdl_gpu_v1_t*>(raw_interface);
+        const void *raw_interface_v2 = nullptr;
+        const bool disable_v2 = []() {
+            const char *value = std::getenv("AETHERKIRI_SDL_GPU_DISABLE_V2");
+            return value != nullptr && value[0] != '\0' &&
+                   strcmp(value, "0") != 0;
+        }();
+        if(!disable_v2 && engine_query_interface(
+               state.engine, ENGINE_INTERFACE_RENDER_SDL_GPU_V2,
+               ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2,
+               &raw_interface_v2) == ENGINE_RESULT_OK) {
+            state.sdl_gpu_interface_v2 =
+                static_cast<const engine_render_sdl_gpu_v2_t*>(
+                    raw_interface_v2);
+        }
+        if(query_result != ENGINE_RESULT_OK ||
+           state.sdl_gpu_interface == nullptr ||
+           state.sdl_gpu_interface->set_device(state.engine,
+                                                state.gpu_device) !=
+               ENGINE_RESULT_OK) {
+            fprintf(stderr, "[host] SDL_GPU render extension unavailable; "
+                            "falling back to software path\n");
+            state.sdl_gpu_interface = nullptr;
+            state.use_gpu_present = false;
+        } else {
+            fprintf(stderr, "[host] render backend: sdl3_gpu (in-engine "
+                            "SDL_GPU compositor, %s present)\n",
+                    state.sdl_gpu_interface_v2 != nullptr
+                        ? "v2 single-submit"
+                        : "v1 leased zero-copy");
+        }
+    } else if(gpu_backend) {
         // The engine's built-in SDL3 render backend creates its own
         // textures on the injected renderer; the host keeps presentation.
         if(engine_set_sdl_renderer(state.engine, state.renderer) !=
@@ -1320,6 +1848,10 @@ int main(int argc, char *argv[]) {
     std::string diagnostics_profile;
     uint32_t slow_frame_threshold_ms = 20;
     uint32_t benchmark_seconds = 0;
+    uint32_t benchmark_warmup_seconds = 2;
+    std::string present_mode = "auto";
+    bool gpu_validation_requested = false;
+    bool benchmark_offscreen = false;
     std::vector<std::pair<std::string, std::string>> extra_options;
     for(int i = 1; i < argc; ++i) {
         if((strcmp(argv[i], "--game") == 0 || strcmp(argv[i], "-g") == 0) &&
@@ -1347,6 +1879,22 @@ int main(int argc, char *argv[]) {
         } else if(strcmp(argv[i], "--benchmark") == 0 && i + 1 < argc) {
             benchmark_seconds = static_cast<uint32_t>(
                 std::max(0, atoi(argv[++i])));
+        } else if(strcmp(argv[i], "--benchmark-warmup") == 0 &&
+                  i + 1 < argc) {
+            benchmark_warmup_seconds = static_cast<uint32_t>(
+                std::max(0, atoi(argv[++i])));
+        } else if(strcmp(argv[i], "--present-mode") == 0 && i + 1 < argc) {
+            present_mode = argv[++i];
+            if(present_mode != "auto" && present_mode != "immediate" &&
+               present_mode != "mailbox" && present_mode != "vsync") {
+                fprintf(stderr, "invalid --present-mode '%s'\n",
+                        present_mode.c_str());
+                return 2;
+            }
+        } else if(strcmp(argv[i], "--gpu-validation") == 0) {
+            gpu_validation_requested = true;
+        } else if(strcmp(argv[i], "--benchmark-offscreen") == 0) {
+            benchmark_offscreen = true;
         } else if(strcmp(argv[i], "--option") == 0 && i + 1 < argc) {
             const std::string kv = argv[++i];
             const size_t eq = kv.find('=');
@@ -1382,10 +1930,16 @@ int main(int argc, char *argv[]) {
         } else if(strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
             fprintf(stderr,
                     "Usage: aetherkiri_ui [--game <path>] [--fps <n>]\n"
+                    "  [--render-backend software|gpu_bridge|sdl3_gpu]"
+                    "  default gpu_bridge\n"
                     "  [--screenshot <path>] [--screenshot-frames <n>]\n"
                     "  [--diagnostics [profile]]  structured event stream\n"
                     "  [--slow-frame-threshold-ms <n>]  default 20 (0=off)\n"
                     "  [--benchmark <seconds>]  timing summary then exit\n"
+                    "  [--benchmark-warmup <seconds>]  default 2\n"
+                    "  [--present-mode auto|immediate|mailbox|vsync]\n"
+                    "  [--gpu-validation]       include validation overhead\n"
+                    "  [--benchmark-offscreen]  submit without swapchain\n"
                     "  [--option key=value]       any engine option\n"
                     "  [--trace] [--plugin-trace] [--export-scripts]\n"
                     "  [--no-mock] [--console-log-file]\n"
@@ -1410,5 +1964,9 @@ int main(int argc, char *argv[]) {
 
     return RunHost(game_path, fps_limit, screenshot_path,
                    screenshot_after_frames, diagnostics_profile,
-                   slow_frame_threshold_ms, benchmark_seconds, extra_options);
+                   slow_frame_threshold_ms, benchmark_seconds,
+                   benchmark_warmup_seconds, present_mode,
+                   gpu_validation_requested || benchmark_seconds == 0,
+                   benchmark_offscreen,
+                   extra_options);
 }

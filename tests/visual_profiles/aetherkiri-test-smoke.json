@@ -1,0 +1,13 @@
+{
+  "schema": "aetherkiri.visual-profile.v1",
+  "version": 1,
+  "game_env": "AETHERKIRI_DEMO_PATH",
+  "timeout_seconds": 30,
+  "checkpoints": ["startup"],
+  "steps": [
+    {"action": "wait_startup", "timeout_ms": 10000},
+    {"action": "wait_frames", "frames": 10, "timeout_ms": 10000},
+    {"action": "wait_stable_frames", "frames": 3, "timeout_ms": 10000},
+    {"action": "checkpoint", "name": "startup", "timeout_ms": 5000}
+  ]
+}

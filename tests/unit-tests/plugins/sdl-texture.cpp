@@ -1,6 +1,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "sdl3/SdlRenderManager.h"
+#include "sdl3/SdlGpuRenderManager.h"
 #include "LayerBitmapIntf.h"
 #include "LayerIntf.h"
 
@@ -81,3 +82,31 @@ TEST_CASE("SDL texture updates reallocate when the pixel format changes") {
     CHECK(texture.GetPoint(1, 0) == 0xff060504u);
 }
 
+TEST_CASE("SDL GPU texture partial updates use block-relative source pixels") {
+    SdlGpuTexture2D texture(nullptr, 0, 5, 3, TVPTextureFormat::RGBA);
+    const std::array<std::uint8_t, 16> block = {
+        1, 2, 3, 255, 4, 5, 6, 255,
+        7, 8, 9, 255, 10, 11, 12, 255,
+    };
+
+    texture.Update(block.data(), TVPTextureFormat::RGBA, 8,
+                   tTVPRect(2, 1, 4, 3));
+
+    CHECK(texture.GetPoint(1, 1) == 0u);
+    CHECK(texture.GetPoint(2, 1) == 0xff030201u);
+    CHECK(texture.GetPoint(3, 1) == 0xff060504u);
+    CHECK(texture.GetPoint(2, 2) == 0xff090807u);
+    CHECK(texture.GetPoint(3, 2) == 0xff0c0b0au);
+}
+
+TEST_CASE("SDL GPU Gray updates preserve clipped block coordinates") {
+    SdlGpuTexture2D texture(nullptr, 0, 2, 2, TVPTextureFormat::Gray);
+    const std::array<std::uint8_t, 4> block = {1, 2, 3, 4};
+
+    texture.Update(block.data(), TVPTextureFormat::Gray, 2,
+                   tTVPRect(-1, -1, 1, 1));
+
+    CHECK(texture.GetPoint(0, 0) == 4u);
+    CHECK(texture.GetPoint(1, 0) == 0u);
+    CHECK(texture.GetPoint(0, 1) == 0u);
+}

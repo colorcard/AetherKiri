@@ -134,6 +134,8 @@ Useful environment variables:
 | `AETHERKIRI_DIAGNOSTICS` | Enables runtime diagnostics in release builds without showing the desktop UI log panel. |
 | `AETHERKIRI_UI_LOG` | Enables the desktop loading/runtime UI log panel. Keep it off in user-facing release builds unless diagnosing a problem. |
 | `AETHERKIRI_INPUT_TRACE` | Enables engine/layer input traces. |
+| `AETHERKIRI_LAYER_SNAPSHOT_JSONL` | Appends frame-selected layer-tree snapshots to this JSONL path (`-` writes to stderr). |
+| `AETHERKIRI_LAYER_SNAPSHOT_FRAMES` | Comma-separated diagnostic frame numbers, or `all`; used with `AETHERKIRI_LAYER_SNAPSHOT_JSONL`. |
 | `AETHERKIRI_PERF_LOG_INTERVAL` | Performance log interval in seconds. |
 | `AETHERKIRI_FRAME_SPIKE_MS` | Logs frames slower than this threshold. |
 | `AETHERKIRI_VERBOSE_RENDER_LOG` | Enables verbose render logging in the Godot shell. |

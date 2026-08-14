@@ -35,6 +35,7 @@ set(ENVIRON_SOURCE_FILES
     ${ENVIRON_PATH}/ConfigManager/LocaleConfigManager.cpp
     ${ENVIRON_PATH}/sdl/tvpsdl.cpp
     ${ENVIRON_PATH}/sdl/sdl_render_backend.cpp
+    ${ENVIRON_PATH}/sdl/sdl_gpu_backend.cpp
 
     # ui/ — all removed (Godot handles UI now).
     # Stub implementations are in stubs/ui_stubs.cpp

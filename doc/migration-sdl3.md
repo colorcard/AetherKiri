@@ -103,20 +103,58 @@ UI 壳 (aetherkiri_ui: ImGui Launcher/Overlay/诊断)   ── 可选
 - C ABI 增补：`engine_set_sdl_renderer`、`engine_flush_released_textures`、
   `engine_get_gpu_frame_texture`；移除 `engine_register_godot_gpu_bridge` 等回调表 API
 
-### 阶段 2: 渲染性能深化（后续，未启动）
+### 阶段 2: 渲染性能深化（进行中）
 
 原"SDL3 GPU 回调表"方案已废弃（D4 变更）。当前渲染：
 
 - **软件路径**：CPU 合成 → readback（保留，截图/诊断依赖）
 - **gpu_bridge**：引擎内嵌 SDL 纹理直写（ABGR8888 流式 + `SDL_LockTexture`），宿主
   `SDL_RenderTexture` 零拷贝直显（已落地）
+- **sdl3_gpu（2026-08-11 落地）**：SDL_GPU 呈现与实验 shader-pipeline 合成器。
+  普通 AlphaBlend 使用
+  KiriKiri 的 8-bit `/256` 算术，而固定功能 UNORM blend 是 `/255`；为保证 AE=0，
+  默认用一致的软件合成 authority，再单次上传给 SDL_GPU 呈现。Copy/Fill/Ps* 与
+  软件 AlphaBlend 的混合路径会产生同步长帧，仅由
+  `AETHERKIRI_SDL_GPU_ENABLE_MIXED_DRAWS=1` 实验启用。宿主注入
+  `SDL_GPUDevice`（`engine_set_sdl_gpu_device`）。
+
+默认选择（2026-08-11）：`aetherkiri_ui` 与独立引擎壳均默认 `gpu_bridge`。
+千恋万花的标题→流程图层交换在 software/gpu_bridge 正常，而 `sdl3_gpu` 仍会保留
+旧标题层；在定位 SDL_GPU 纹理/层交换的首个差异前，后者仅通过显式
+`--render-backend sdl3_gpu` 启用。
+
+关键结论（2026-08-11）：
+
+- **语义保真**：demo 逐像素 0.00% 差异（sdl3_gpu vs software），gpu_bridge 也 0%。
+  默认一致的软件合成 authority 维持该结果，同时仍使用 SDL_GPU 零 readback 呈现。
+- **swapchain 零拷贝 present（aetherkiri_engine 已落地）**：`engine_get_sdl_gpu_frame_texture`
+  发布合成帧的 SDL_GPUTexture，宿主 `SDL_BlitGPUTexture` 到 swapchain 直显（无 readback）。
+  截图通过 `engine_read_frame_rgba` 按需下载 GPU 纹理，不影响正常 present 热路径。
+  2026-08-11 修复 GPU 帧偏好与条件编译分支后，demo/software 截图 SHA-256 相同、
+  千恋万花 1920x1080 启动画面正确，日志确认 `source=sdl_gpu` 和 swapchain present。
+- **SDL3 升级 3.2.22 → 3.4.14**（vcpkg baseline 更新）：3.2.22 的 Vulkan backend 对
+  自定义 fragment shader 的 descriptor set 布局要求不匹配（fragment 资源必须 set 2、
+  fragment uniform set 3、vertex uniform set 1），导致离屏 render pass 无效。
+- **benchmark 基线（demo, 2026-08-11 重测）**：
+  - software：2483 fps（tick 0.13ms，readback 0.02ms，upload 0.06ms）
+  - sdl3_gpu（readback present）：2421 fps（tick 0.14ms）
+  - gpu_bridge（零拷贝 present）：6787 fps（tick 0.00ms，无 upload）
+  - **结论：性能瓶颈是 present readback/upload，不是合成**。sdl3_gpu 的 swapchain
+    present（已落地）应达到与 gpu_bridge 相当的水平（待 sdl_host benchmark 确认）。
 
 后续可深化项：
 
-- GPU 合成操作（blend/triangles/mask，当前返回 false 回退软件）——SDL TARGET 纹理
-  + `SDL_RenderGeometry` 实现非 PS 模式；PS 特效（SCREEN/MULTIPLY 等）需自定义管线
-- 软件路径 readback 最终移除（krkrz 式软件直写 SDL 纹理）
-- benchmark 对比基线：软件 1738fps / gpu_bridge 2325fps（引擎内嵌后重测）
+- **sdl_host 的 swapchain present**：aetherkiri_engine 已落地零拷贝 swapchain present；
+  sdl_host（ImGui 叠层）仍走 readback，需 ImGui 改 SDL_GPU 后端才能直显。同时用
+  sdl_host benchmark 量化 swapchain present 的 fps。
+- **`_d`（读目标）模式 GPU 化**：`DrawRectD` + `blend_d.frag`（scratch 复制 dst +
+  双 sampler）已实现为参考，但需全 GPU 合成管线（消除 GPU/CPU 目标内容分叉）才能
+  像素一致启用。当前 `_d` 回退软件（0% 一致）。
+- **triangles / mask GPU 路径**（`SDL_RenderGeometry` 等价的 SDL_GPU 管线）。
+- **SDL_GPU 退出清理（2026-08-11 完成）**：引擎销毁时统一释放仍存活的 GPU 纹理、
+  pipelines 和延迟队列并 detach device；宿主 unclaim swapchain 后再销毁 device。
+  demo、千恋万花和 sdl_host benchmark 退出均无 `VUID-vkDestroyDevice-device-05137`。
+- 软件路径 readback 最终移除（截图/诊断保留）。
 
 ### 阶段 3: 纹理导出 + UI 层接入（1-2 周）
 
@@ -214,3 +252,31 @@ out/linux/debug/apps/sdl_host/aetherkiri_sdl --game demos/aetherkiri-test/data -
 - bridge/engine_api/include/engine_options.h（选项 key）
 - cpp/core/visual/godot/GodotGpuBridge.h（GPU 回调契约）
 - apps/godot_app/scripts/main.gd（输入/按键语义参考）
+
+## 11. SDL_GPU UI 壳比例与内存修复（2026-08-11）
+
+- standalone 与 UI 壳共用等比 `PresentationTransform`：首个真实帧按桌面可用区
+  自动定窗，resize 使用 letterbox/pillarbox，输入通过同一 viewport 逆变换。
+- `SdlGpuTexture2D` 改用显式 CPU/GPU authority 状态；CPU fallback 前先 readback，
+  后续 GPU blend 前同步 source 与 destination，避免两份纹理内容分叉。
+- SDL_GPU upload/download transfer buffer 按最大容量复用；upload 串行提交，避免
+  `cycle=true` 在资源密集场景为单帧保留大量 Vulkan backing allocation。
+- Linux 内存统计改读 `/proc/self/statm` resident 字段，不再把 Vulkan 虚拟地址空间
+  当成 RSS。
+- 验证：demo software/sdl3_gpu PPM SHA-256 相同；千恋万花 UI 壳 10 秒基准
+  56.8 fps，最大 RSS 约 954 MiB（修复前约 12 GiB），静态运行 RSS 保持稳定。
+
+## 12. Fill、dirty upload 与区域 `_d` 实验（2026-08-11）
+
+- `FillARGB`/`FillColor` 使用子矩形 SDL_GPU quad；后者通过 RGB write mask
+  保留目标 alpha。`AETHERKIRI_SDL_GPU_DISABLE_FILL=1` 可做 A/B。
+- CPU texture 修改仍合并 dirty rect，但默认上传完整纹理；真实游戏证明部分 bitmap
+  writer 会在声明区域外更新或保留 scanline 指针，局部上传会产生水平带与旧 UI
+  碎片。`AETHERKIRI_SDL_GPU_ENABLE_DIRTY_UPLOAD=1` 仅用于继续调查该契约。
+- `AETHERKIRI_SDL_GPU_ENABLE_D_BLEND=1` 启用区域 scratch 的
+  `AlphaBlend_d`/`ConstColorAlphaBlend_d`。opacity 表使用 CPU 同源的 256x256
+  lookup texture，scratch 按精确尺寸池化，避免在途 command buffer 复用或提前释放。
+- 动态 workload 位于 `demos/aetherkiri-gpu-bench/data`；正式 A/B 用
+  `tools/benchmark_sdl_gpu_ab.sh`，只接受 Release 真实桌面结果。
+- 当前实验路径仍默认关闭：self-test 的启用/关闭截图尚有 617 个差异像素，集中在
+  半透明文字和少量抗锯齿边缘。任何 AE 非零都阻止默认开启。

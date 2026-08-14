@@ -1,0 +1,60 @@
+// Deterministic dynamic workload for SDL_GPU A/B benchmarks.
+var SW = 1920;
+var SH = 1080;
+var win = new Window();
+win.setInnerSize(SW, SH);
+
+var background = new Layer(win, null);
+win.add(background);
+background.setSize(SW, SH);
+background.type = ltOpaque;
+background.visible = true;
+background.colorRect(0, 0, SW, SH, 0x20242a, 255);
+
+var moving = [];
+var colors = [0xff3030, 0x30ff30, 0x3030ff, 0xffff30,
+              0xff30ff, 0x30ffff, 0xffffff, 0xff8020];
+for (var i = 0; i < 8; ++i) {
+    var layer = new Layer(win, background);
+    win.add(layer);
+    layer.setSize(320, 180);
+    layer.type = ltTransparent;
+    layer.opacity = 96 + i * 18;
+    layer.visible = true;
+    layer.colorRect(0, 0, 320, 180, colors[i], 255);
+    moving[i] = layer;
+}
+
+var dirty = new Layer(win, background);
+win.add(dirty);
+dirty.setSize(SW, 80);
+dirty.top = SH - 80;
+dirty.type = ltTransparent;
+dirty.visible = true;
+
+var seed = 0x13579bdf;
+var frame = 0;
+function nextRandom() {
+    seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+    return seed;
+}
+
+function benchmarkStep(tick) {
+    ++frame;
+    for (var i = 0; i < 8; ++i) {
+        var r = nextRandom();
+        moving[i].left = (r + frame * (i + 3)) % (SW - 320);
+        moving[i].top = ((r >> 7) + frame * (i + 5)) % (SH - 260);
+        // Exercise sub-rectangle Fill without repainting the whole texture.
+        moving[i].colorRect((frame * 7 + i * 19) % 280,
+                            (frame * 5 + i * 13) % 140,
+                            40, 40, colors[(frame + i) % 8], 128);
+    }
+    // Text is a deterministic CPU-side partial update followed by GPU use.
+    dirty.fillRect(0, 0, SW, 80, 0);
+    dirty.drawText(16, 12, "SDL_GPU dynamic benchmark frame " + frame,
+                   0xffffff, 255, true);
+}
+System.addContinuousHandler(benchmarkStep);
+
+win.visible = true;

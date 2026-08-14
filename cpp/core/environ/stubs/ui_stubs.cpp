@@ -34,12 +34,15 @@
 #include "tjsConfig.h"
 #include "WindowIntf.h"
 #include "WindowImpl.h"
+#include "LayerManager.h"
 #include "MenuItemIntf.h"
 #include "Platform.h"
 #include "TVPWindow.h"
 #include "Application.h"
 #include "RenderManager.h"
 #include "sdl3/SdlRenderManager.h"
+#include "sdl3/SdlGpuRenderManager.h"
+#include "sdl_gpu_backend.h"
 #include "StorageImpl.h"
 #if defined(KRKR_ENABLE_GPU_BRIDGE)
 #include "krkr_egl_context.h"
@@ -68,11 +71,34 @@ uint64_t g_host_gpu_texture = 0;
 uint32_t g_host_gpu_width = 0;
 uint32_t g_host_gpu_height = 0;
 uint64_t g_host_gpu_serial = 0;
+// SDL_GPU frame slot (sdl3_gpu backend): holds the composited frame's
+// SDL_GPUTexture handle for zero-copy swapchain present.
+uint64_t g_host_gpu_texture_v2 = 0;
+uint32_t g_host_gpu_v2_width = 0;
+uint32_t g_host_gpu_v2_height = 0;
+uint64_t g_host_gpu_v2_serial = 0;
 uint32_t g_host_surface_width = 1920;
 uint32_t g_host_surface_height = 1080;
 bool g_host_prefer_gpu_frame = true;
 tTJSNI_Window *g_host_window_owner = nullptr;
 std::vector<tTJSNI_Window *> g_host_window_owners;
+
+struct HostVisualCheckpoint {
+    uint64_t next_token = 1;
+    uint64_t pending_token = 0;
+    uint64_t completed_token = 0;
+    uint32_t status = 0;
+    uint64_t frame_serial = 0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t stride = 0;
+    std::vector<uint8_t> rgba;
+    std::string snapshot_json;
+};
+
+std::mutex g_visual_checkpoint_mutex;
+HostVisualCheckpoint g_visual_checkpoint;
+std::string g_visual_checkpoint_backend = "unknown";
 
 struct HostTextInputState {
     tTJSNI_Window *owner = nullptr;
@@ -573,51 +599,103 @@ void LogHostFinalFrameStats(const char *source, const uint8_t *rgba,
     }
 }
 
-bool StoreLatestCpuFrameFromTexture(iTVPTexture2D *tex) {
+bool CopyFrameFromTexture(iTVPTexture2D *tex, std::vector<uint8_t> &frame,
+                          uint32_t &width, uint32_t &height,
+                          uint32_t &stride) {
     if (!tex) return false;
     const tjs_uint tw = tex->GetWidth();
     const tjs_uint th = tex->GetHeight();
     if (tw == 0 || th == 0) return false;
 
-    const uint32_t dst_stride = static_cast<uint32_t>(tw * 4u);
-    std::vector<uint8_t> frame(static_cast<size_t>(dst_stride) * th);
+    stride = static_cast<uint32_t>(tw * 4u);
+    width = static_cast<uint32_t>(tw);
+    height = static_cast<uint32_t>(th);
+    frame.assign(static_cast<size_t>(stride) * th, 0);
     const tjs_int src_pitch = tex->GetPitch();
     const void *pixel_data = tex->GetPixelData();
     if (pixel_data) {
         const auto *src = static_cast<const uint8_t *>(pixel_data);
         for (tjs_uint y = 0; y < th; ++y) {
-            std::memcpy(frame.data() + static_cast<size_t>(y) * dst_stride,
+            std::memcpy(frame.data() + static_cast<size_t>(y) * stride,
                         src + static_cast<size_t>(y) * src_pitch,
-                        dst_stride);
+                        stride);
         }
     } else {
         for (tjs_uint y = 0; y < th; ++y) {
             const void *line = tex->GetScanLineForRead(y);
             if (line) {
-                std::memcpy(frame.data() + static_cast<size_t>(y) * dst_stride,
-                            line, dst_stride);
+                std::memcpy(frame.data() + static_cast<size_t>(y) * stride,
+                            line, stride);
             }
         }
     }
-    CompositeHostVideoOverlay(frame, static_cast<uint32_t>(tw),
-                              static_cast<uint32_t>(th), dst_stride);
+    CompositeHostVideoOverlay(frame, width, height, stride);
+    return true;
+}
+
+bool HasPendingVisualCheckpoint() {
+    std::lock_guard<std::mutex> lock(g_visual_checkpoint_mutex);
+    return g_visual_checkpoint.pending_token != 0;
+}
+
+void CompleteVisualCheckpoint(iTVPTexture2D *tex, uint64_t serial) {
+    if(!HasPendingVisualCheckpoint()) return;
+
+    std::vector<uint8_t> frame;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t stride = 0;
+    const bool copied = CopyFrameFromTexture(tex, frame, width, height, stride);
+    std::string snapshot;
+    std::string backend;
+    {
+        std::lock_guard<std::mutex> lock(g_visual_checkpoint_mutex);
+        backend = g_visual_checkpoint_backend;
+    }
+    const bool diagnosed = copied && TVPCaptureVisualDiagnosticsJson(
+        serial, width, height, backend, snapshot);
+
+    std::lock_guard<std::mutex> lock(g_visual_checkpoint_mutex);
+    if(g_visual_checkpoint.pending_token == 0) return;
+    g_visual_checkpoint.completed_token = g_visual_checkpoint.pending_token;
+    g_visual_checkpoint.pending_token = 0;
+    g_visual_checkpoint.frame_serial = serial;
+    g_visual_checkpoint.width = width;
+    g_visual_checkpoint.height = height;
+    g_visual_checkpoint.stride = stride;
+    g_visual_checkpoint.status = copied && diagnosed
+        ? 2u /* ENGINE_VISUAL_CHECKPOINT_READY */
+        : 3u /* ENGINE_VISUAL_CHECKPOINT_FAILED */;
+    g_visual_checkpoint.rgba.swap(frame);
+    g_visual_checkpoint.snapshot_json.swap(snapshot);
+}
+
+bool StoreLatestCpuFrameFromTexture(iTVPTexture2D *tex) {
+    std::vector<uint8_t> frame;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t stride = 0;
+    if(!CopyFrameFromTexture(tex, frame, width, height, stride)) return false;
 
     uint64_t serial = 0;
     {
         std::lock_guard<std::mutex> lock(g_host_frame_mutex);
         serial = g_host_frame_serial + 1;
         LogHostFinalFrameStats("cpu_store", frame.data(),
-                               static_cast<uint32_t>(tw),
-                               static_cast<uint32_t>(th), dst_stride, serial);
+                               width, height, stride, serial);
         g_host_frame_rgba.swap(frame);
-        g_host_frame_width = static_cast<uint32_t>(tw);
-        g_host_frame_height = static_cast<uint32_t>(th);
-        g_host_frame_stride = dst_stride;
+        g_host_frame_width = width;
+        g_host_frame_height = height;
+        g_host_frame_stride = stride;
         g_host_frame_serial = serial;
         g_host_gpu_texture = 0;
         g_host_gpu_width = 0;
         g_host_gpu_height = 0;
+        g_host_gpu_texture_v2 = 0;
+        g_host_gpu_v2_width = 0;
+        g_host_gpu_v2_height = 0;
     }
+    CompleteVisualCheckpoint(tex, serial);
     return true;
 }
 
@@ -637,7 +715,7 @@ void GetHostSurfaceSize(tjs_int fallback_w, tjs_int fallback_h,
     if (height <= 0) height = fallback_h;
 }
 
-void PublishHostGpuFrame(uint64_t texture, uint32_t width, uint32_t height) {
+uint64_t PublishHostGpuFrame(uint64_t texture, uint32_t width, uint32_t height) {
     std::lock_guard<std::mutex> lock(g_host_frame_mutex);
     g_host_gpu_texture = texture;
     g_host_gpu_width = width;
@@ -648,6 +726,49 @@ void PublishHostGpuFrame(uint64_t texture, uint32_t width, uint32_t height) {
     g_host_frame_height = height;
     g_host_frame_stride = width * 4u;
     g_host_frame_serial = g_host_gpu_serial;
+    g_host_gpu_texture_v2 = 0;
+    g_host_gpu_v2_width = 0;
+    g_host_gpu_v2_height = 0;
+    return g_host_gpu_serial;
+}
+
+// Publishes the composited frame as an SDL_GPUTexture handle (sdl3_gpu
+// backend). The host blits this into its swapchain for zero-copy present.
+uint64_t PublishHostGpuFrameSdl(uint64_t texture, uint32_t width, uint32_t height) {
+    std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+    g_host_gpu_texture_v2 = texture;
+    g_host_gpu_v2_width = width;
+    g_host_gpu_v2_height = height;
+    g_host_gpu_v2_serial += 1;
+    g_host_frame_rgba.clear();
+    g_host_frame_width = width;
+    g_host_frame_height = height;
+    g_host_frame_stride = width * 4u;
+    g_host_frame_serial = g_host_gpu_v2_serial;
+    g_host_gpu_texture = 0;
+    g_host_gpu_width = 0;
+    g_host_gpu_height = 0;
+    if (HostRenderTraceEnabled() && ShouldLogHostRenderTrace()) {
+        spdlog::info("host final frame: source=sdl_gpu serial={} size={}x{}",
+                     g_host_gpu_v2_serial, width, height);
+    }
+    return g_host_gpu_v2_serial;
+}
+
+extern "C" bool TVPHostGetLatestHostGpuFrameSdl(uint64_t *texture,
+                                                uint32_t *width,
+                                                uint32_t *height,
+                                                uint64_t *serial) {
+    std::lock_guard<std::mutex> lock(g_host_frame_mutex);
+    if (g_host_gpu_texture_v2 == 0 || g_host_gpu_v2_width == 0 ||
+        g_host_gpu_v2_height == 0) {
+        return false;
+    }
+    if (texture) *texture = g_host_gpu_texture_v2;
+    if (width) *width = g_host_gpu_v2_width;
+    if (height) *height = g_host_gpu_v2_height;
+    if (serial) *serial = g_host_gpu_v2_serial;
+    return true;
 }
 
 void ApplyDrawDeviceSurfaceRect(iTVPDrawDevice *dd, const tTVPRect &rect,
@@ -659,6 +780,72 @@ void ApplyDrawDeviceSurfaceRect(iTVPDrawDevice *dd, const tTVPRect &rect,
     dd->SetWindowSize(surface_w, surface_h);
 }
 
+}
+
+extern "C" bool TVPHostRequestVisualCheckpoint(uint64_t *out_token) {
+    if(out_token == nullptr) return false;
+    std::lock_guard<std::mutex> lock(g_visual_checkpoint_mutex);
+    if(g_visual_checkpoint.pending_token != 0) return false;
+    uint64_t token = g_visual_checkpoint.next_token++;
+    if(token == 0) token = g_visual_checkpoint.next_token++;
+    g_visual_checkpoint.pending_token = token;
+    g_visual_checkpoint.completed_token = 0;
+    g_visual_checkpoint.status = 1u; /* ENGINE_VISUAL_CHECKPOINT_PENDING */
+    g_visual_checkpoint.frame_serial = 0;
+    g_visual_checkpoint.width = 0;
+    g_visual_checkpoint.height = 0;
+    g_visual_checkpoint.stride = 0;
+    g_visual_checkpoint.rgba.clear();
+    g_visual_checkpoint.snapshot_json.clear();
+    *out_token = token;
+    return true;
+}
+
+extern "C" void TVPHostSetVisualCheckpointBackend(const char *backend) {
+    std::lock_guard<std::mutex> lock(g_visual_checkpoint_mutex);
+    g_visual_checkpoint_backend = backend != nullptr ? backend : "unknown";
+}
+
+extern "C" bool TVPHostGetVisualCheckpointInfo(
+    uint64_t token, uint32_t *status, uint64_t *frame_serial,
+    uint32_t *width, uint32_t *height, uint32_t *stride,
+    uint64_t *rgba_bytes, uint32_t *snapshot_json_bytes) {
+    std::lock_guard<std::mutex> lock(g_visual_checkpoint_mutex);
+    if(token == 0 || (token != g_visual_checkpoint.pending_token &&
+       token != g_visual_checkpoint.completed_token)) return false;
+    if(status) *status = token == g_visual_checkpoint.pending_token
+        ? 1u : g_visual_checkpoint.status;
+    if(frame_serial) *frame_serial = g_visual_checkpoint.frame_serial;
+    if(width) *width = g_visual_checkpoint.width;
+    if(height) *height = g_visual_checkpoint.height;
+    if(stride) *stride = g_visual_checkpoint.stride;
+    if(rgba_bytes) *rgba_bytes = g_visual_checkpoint.rgba.size();
+    if(snapshot_json_bytes) {
+        *snapshot_json_bytes = g_visual_checkpoint.snapshot_json.empty()
+            ? 0u
+            : static_cast<uint32_t>(g_visual_checkpoint.snapshot_json.size() + 1u);
+    }
+    return true;
+}
+
+extern "C" bool TVPHostCopyVisualCheckpoint(
+    uint64_t token, void *out_rgba, size_t rgba_size,
+    char *out_snapshot_json, uint32_t snapshot_json_size) {
+    std::lock_guard<std::mutex> lock(g_visual_checkpoint_mutex);
+    if(token == 0 || token != g_visual_checkpoint.completed_token ||
+       g_visual_checkpoint.status != 2u) return false;
+    if((out_rgba != nullptr && rgba_size < g_visual_checkpoint.rgba.size()) ||
+       (out_snapshot_json != nullptr && snapshot_json_size <
+           g_visual_checkpoint.snapshot_json.size() + 1u)) return false;
+    if(out_rgba != nullptr) {
+        std::memcpy(out_rgba, g_visual_checkpoint.rgba.data(),
+                    g_visual_checkpoint.rgba.size());
+    }
+    if(out_snapshot_json != nullptr) {
+        std::memcpy(out_snapshot_json, g_visual_checkpoint.snapshot_json.c_str(),
+                    g_visual_checkpoint.snapshot_json.size() + 1u);
+    }
+    return true;
 }
 
 // Crash-safe snapshot of the last host-visible RGBA frame. Never blocks:
@@ -752,6 +939,9 @@ extern "C" void TVPHostSetPreferGpuFrame(bool prefer_gpu_frame) {
         g_host_gpu_texture = 0;
         g_host_gpu_width = 0;
         g_host_gpu_height = 0;
+        g_host_gpu_texture_v2 = 0;
+        g_host_gpu_v2_width = 0;
+        g_host_gpu_v2_height = 0;
     }
 }
 
@@ -823,10 +1013,16 @@ extern "C" bool TVPHostGetLatestFrameDesc(uint32_t *width, uint32_t *height,
     std::lock_guard<std::mutex> lock(g_host_frame_mutex);
     if(g_host_frame_rgba.empty() || g_host_frame_width == 0 ||
        g_host_frame_height == 0 || g_host_frame_stride == 0) {
-        if(g_host_gpu_texture == 0 || g_host_gpu_width == 0 ||
-           g_host_gpu_height == 0) {
-            return false;
+        if(g_host_gpu_texture_v2 != 0 && g_host_gpu_v2_width != 0 &&
+           g_host_gpu_v2_height != 0) {
+            if(width) *width = g_host_gpu_v2_width;
+            if(height) *height = g_host_gpu_v2_height;
+            if(stride_bytes) *stride_bytes = g_host_gpu_v2_width * 4u;
+            if(serial) *serial = g_host_gpu_v2_serial;
+            return true;
         }
+        if(g_host_gpu_texture == 0 || g_host_gpu_width == 0 ||
+           g_host_gpu_height == 0) return false;
         if(width) *width = g_host_gpu_width;
         if(height) *height = g_host_gpu_height;
         if(stride_bytes) *stride_bytes = g_host_gpu_width * 4u;
@@ -847,9 +1043,26 @@ extern "C" bool TVPHostCopyLatestFrameRGBA(void *out_pixels,
                                             uint64_t *serial) {
     if(!out_pixels) return false;
     std::lock_guard<std::mutex> lock(g_host_frame_mutex);
-    if(g_host_frame_rgba.empty() || out_pixels_size < g_host_frame_rgba.size()) {
-        return false;
+    if(g_host_frame_rgba.empty()) {
+        if(g_host_gpu_texture_v2 == 0 || g_host_gpu_v2_width == 0 ||
+           g_host_gpu_v2_height == 0) return false;
+        const size_t required = static_cast<size_t>(g_host_gpu_v2_width) *
+                                g_host_gpu_v2_height * 4u;
+        if(out_pixels_size < required ||
+           !TVPReadSdlGpuTextureRgba(
+               reinterpret_cast<SDL_GPUTexture *>(static_cast<uintptr_t>(
+                   g_host_gpu_texture_v2)),
+               g_host_gpu_v2_width, g_host_gpu_v2_height, out_pixels,
+               out_pixels_size)) {
+            return false;
+        }
+        if(width) *width = g_host_gpu_v2_width;
+        if(height) *height = g_host_gpu_v2_height;
+        if(stride_bytes) *stride_bytes = g_host_gpu_v2_width * 4u;
+        if(serial) *serial = g_host_gpu_v2_serial;
+        return true;
     }
+    if(out_pixels_size < g_host_frame_rgba.size()) return false;
     std::memcpy(out_pixels, g_host_frame_rgba.data(), g_host_frame_rgba.size());
     if(width) *width = g_host_frame_width;
     if(height) *height = g_host_frame_height;
@@ -1023,11 +1236,41 @@ public:
     }
 
     void UpdateDrawBuffer(iTVPTexture2D *tex) override {
-#if !defined(KRKR_ENABLE_GPU_BRIDGE)
         if (!tex || !owner_) return;
         const tjs_uint tw = tex->GetWidth();
         const tjs_uint th = tex->GetHeight();
         if(tw == 0 || th == 0) return;
+
+        // The SDL_GPU compositor is independent of the legacy OpenGL bridge.
+        // Publish its native texture before entering either compile-time host
+        // path so BUILD_GPU_BRIDGE configurations behave identically.
+        if(g_host_prefer_gpu_frame && !HasHostVideoOverlayFrame()) {
+            if (auto *gpu_tex = dynamic_cast<SdlGpuTexture2D *>(tex);
+                gpu_tex != nullptr && TVPIsSdlGpuActive()) {
+                // Hybrid fallback operations may leave the final texture's
+                // CPU copy authoritative. Synchronize it before handing the
+                // native texture to the host; this is a GPU upload only when
+                // software composition actually changed the frame.
+                gpu_tex->UploadCpuToGpu();
+                if (gpu_tex->GpuTexture() != nullptr) {
+                    const uint64_t serial = PublishHostGpuFrameSdl(
+                        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(
+                            gpu_tex->GpuTexture())),
+                        static_cast<uint32_t>(tw), static_cast<uint32_t>(th));
+                    CompleteVisualCheckpoint(gpu_tex, serial);
+                    auto *dd = owner_->GetDrawDevice();
+                    if (!dd) return;
+                    tTVPRect dest(0, 0, static_cast<tjs_int>(tw),
+                                  static_cast<tjs_int>(th));
+                    ApplyDrawDeviceSurfaceRect(dd, dest, dest.get_width(),
+                                               dest.get_height());
+                    if (g_postDrawHook) g_postDrawHook();
+                    return;
+                }
+            }
+        }
+
+#if !defined(KRKR_ENABLE_GPU_BRIDGE)
 
         tjs_int surface_w = 0;
         tjs_int surface_h = 0;
@@ -1049,9 +1292,11 @@ public:
                     tw, th, surface_w, surface_h, output_tex->GetWidth(),
                     output_tex->GetHeight());
             }
-            PublishHostGpuFrame(output_tex->GetSdlTextureHandle(),
-                                static_cast<uint32_t>(output_tex->GetWidth()),
-                                static_cast<uint32_t>(output_tex->GetHeight()));
+            const uint64_t serial = PublishHostGpuFrame(
+                output_tex->GetSdlTextureHandle(),
+                static_cast<uint32_t>(output_tex->GetWidth()),
+                static_cast<uint32_t>(output_tex->GetHeight()));
+            CompleteVisualCheckpoint(output_tex, serial);
 
             auto* dd = owner_->GetDrawDevice();
             if (!dd) return;
@@ -1076,12 +1321,6 @@ public:
         // When an IOSurface is attached, this goes directly to the shared
         // IOSurface (zero-copy to Application host). Otherwise, falls back to
         // the EGL Pbuffer for glReadPixels-based retrieval.
-        if (!tex) return;
-
-        const tjs_uint tw = tex->GetWidth();
-        const tjs_uint th = tex->GetHeight();
-        if (tw == 0 || th == 0) return;
-
         tjs_int surface_w = 0;
         tjs_int surface_h = 0;
         GetHostSurfaceSize(static_cast<tjs_int>(tw), static_cast<tjs_int>(th),
@@ -1120,10 +1359,11 @@ public:
                         tw, th, surface_w, surface_h, output_tex->GetWidth(),
                         output_tex->GetHeight());
                 }
-                PublishHostGpuFrame(
+                const uint64_t serial = PublishHostGpuFrame(
                     output_tex->GetSdlTextureHandle(),
                     static_cast<uint32_t>(output_tex->GetWidth()),
                     static_cast<uint32_t>(output_tex->GetHeight()));
+                CompleteVisualCheckpoint(output_tex, serial);
             } else {
                 StoreLatestCpuFrameFromTexture(tex);
             }

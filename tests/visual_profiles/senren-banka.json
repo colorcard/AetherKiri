@@ -1,0 +1,66 @@
+{
+  "schema": "aetherkiri.visual-profile.v1",
+  "version": 1,
+  "game_env": "AETHERKIRI_SENREN_PATH",
+  "timeout_seconds": 180,
+  "checkpoints": ["logo", "title_end", "title_menu", "first_scene"],
+  "rois": {
+    "logo": [
+      {"name": "logo", "x": 560, "y": 240, "width": 800, "height": 600}
+    ],
+    "title_end": [
+      {"name": "title_background", "x": 0, "y": 0, "width": 1920, "height": 1080}
+    ],
+    "title_menu": [
+      {"name": "menu", "x": 0, "y": 250, "width": 500, "height": 750}
+    ],
+    "first_scene": [
+      {"name": "background", "x": 0, "y": 0, "width": 1920, "height": 700},
+      {"name": "character", "x": 480, "y": 80, "width": 960, "height": 800},
+      {"name": "message", "x": 120, "y": 760, "width": 1680, "height": 300}
+    ]
+  },
+  "steps": [
+    {"action": "wait_startup", "timeout_ms": 60000},
+    {"action": "forbid_log", "pattern": "Cannot open storage blandlogo1", "timeout_ms": 1000},
+    {"action": "forbid_log", "pattern": "blandlogo1 load failed", "timeout_ms": 1000},
+    {"action": "forbid_log", "pattern": "Member \"msgvisible\" does not exist", "timeout_ms": 1000},
+    {"action": "forbid_log", "pattern": "image decode failed", "timeout_ms": 1000},
+    {"action": "forbid_log", "pattern": "already registered", "timeout_ms": 1000},
+    {"action": "wait_ms", "duration_ms": 500, "timeout_ms": 2000},
+    {"action": "click", "x": 960, "y": 540, "timeout_ms": 1000},
+    {"action": "wait_ms", "duration_ms": 1000, "timeout_ms": 3000},
+    {"action": "wait_layer", "layer_name": "ev", "property": "visible", "value": 1, "timeout_ms": 5000},
+    {"action": "wait_ms", "duration_ms": 2000, "timeout_ms": 4000},
+    {"action": "wait_stable_frames", "frames": 5, "timeout_ms": 10000},
+    {"action": "checkpoint", "name": "logo", "timeout_ms": 10000},
+    {"action": "click", "x": 960, "y": 540, "timeout_ms": 1000},
+    {"action": "wait_ms", "duration_ms": 1000, "timeout_ms": 3000},
+    {"action": "click", "x": 960, "y": 540, "timeout_ms": 1000},
+    {"action": "wait_ms", "duration_ms": 1000, "timeout_ms": 3000},
+    {"action": "click", "x": 960, "y": 540, "timeout_ms": 1000},
+    {"action": "wait_ms", "duration_ms": 1000, "timeout_ms": 3000},
+    {"action": "click", "x": 960, "y": 540, "timeout_ms": 1000},
+    {"action": "wait_ms", "duration_ms": 1000, "timeout_ms": 3000},
+    {"action": "click", "x": 960, "y": 540, "timeout_ms": 1000},
+    {"action": "wait_ms", "duration_ms": 1000, "timeout_ms": 3000},
+    {"action": "wait_layer", "layer_name": "title_bg", "layer_path": "表-背景[0]/title_bg", "property": "visible", "value": 1, "timeout_ms": 10000},
+    {"action": "wait_stable_frames", "frames": 8, "timeout_ms": 15000},
+    {"action": "checkpoint", "name": "title_end", "timeout_ms": 10000},
+    {"action": "click", "x": 960, "y": 540, "timeout_ms": 1000},
+    {"action": "wait_ms", "duration_ms": 1000, "timeout_ms": 3000},
+    {"action": "wait_layer", "layer_name": "start", "property": "visible", "value": 1, "timeout_ms": 10000},
+    {"action": "wait_stable_frames", "frames": 8, "timeout_ms": 15000},
+    {"action": "checkpoint", "name": "title_menu", "timeout_ms": 10000},
+    {"action": "click", "x": 140, "y": 375, "timeout_ms": 1000},
+    {"action": "wait_ms", "duration_ms": 2000, "timeout_ms": 4000},
+    {"action": "key_until_layer", "key": 17, "layer_name": "芦花", "property": "visible", "value": 1, "timeout_ms": 15000},
+    {"action": "wait_layer", "layer_name": "表メッセージレイヤ0", "property": "visible", "value": 1, "timeout_ms": 10000},
+    {"action": "wait_layer", "layer_name": "BgmIndicatorBlack:back", "property": "visible", "value": 0, "timeout_ms": 10000},
+    {"action": "wait_layer", "layer_name": "MusicTitlePopupTip", "property": "visible", "value": 0, "timeout_ms": 10000},
+    {"action": "wait_layer", "layer_name": "TextVoiceProgress", "property": "visible", "value": 0, "timeout_ms": 10000},
+    {"action": "wait_stable_frames", "frames": 8, "timeout_ms": 20000},
+    {"action": "checkpoint", "name": "first_scene", "timeout_ms": 10000},
+    {"action": "performance_sample", "duration_ms": 10000, "timeout_ms": 12000}
+  ]
+}

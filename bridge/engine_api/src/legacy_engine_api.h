@@ -31,8 +31,15 @@ engine_result_t engine_legacy_set_option(engine_handle_t handle,
 engine_result_t engine_legacy_set_surface_size(engine_handle_t handle,
                                                uint32_t width,
                                                uint32_t height);
+engine_result_t engine_legacy_query_interface(engine_handle_t handle,
+                                              const char* name,
+                                              uint32_t version,
+                                              const void** out_interface);
 engine_result_t engine_legacy_set_sdl_renderer(engine_handle_t handle,
-                                               void* sdl_renderer_ptr);
+                                                void* sdl_renderer_ptr);
+engine_result_t engine_legacy_set_sdl_gpu_device(engine_handle_t handle,
+                                                 void* sdl_gpu_device_ptr);
+engine_result_t engine_legacy_submit_sdl_gpu_frame(engine_handle_t handle);
 engine_result_t engine_legacy_flush_released_textures(engine_handle_t handle);
 engine_result_t engine_legacy_get_frame_desc(
     engine_handle_t handle, engine_frame_desc_t* out_frame_desc);
@@ -62,6 +69,9 @@ engine_result_t engine_legacy_media_read_frame_rgba(
     engine_frame_desc_t* out_frame_desc);
 #if defined(ENGINE_API_USE_KRKR2_RUNTIME)
 engine_result_t engine_legacy_get_gpu_frame_texture(
+    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
+    uint32_t* out_height, uint64_t* out_frame_serial);
+engine_result_t engine_legacy_get_sdl_gpu_frame_texture(
     engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
     uint32_t* out_height, uint64_t* out_frame_serial);
 #endif

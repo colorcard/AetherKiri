@@ -380,6 +380,55 @@ TEST_CASE("D3DEmote GPU transaction hook pairs batches around drawAffine") {
               TJS_W("batchSource._window.motionD3DAdaptor.endCount")) == 5);
 }
 
+TEST_CASE("World layer clone hook copies shared message visibility state") {
+    ScriptEngineOwner engine;
+    engine->ExecScript(TJS_W(
+        "class CloneLayerWithState {\n"
+        "  var msgvisible = false;\n"
+        "  var ignore = false;\n"
+        "}\n"
+        "class EnvLayerObject {\n"
+        "  var msgvisible = true;\n"
+        "  var ignore = true;\n"
+        "  function createLayer(src=void) { return new CloneLayerWithState(); }\n"
+        "}\n"));
+
+    REQUIRE_NOTHROW(engine->ExecScript(TVPGetWorldLayerClonePatchScript()));
+    REQUIRE_NOTHROW(engine->ExecScript(TJS_W(
+        "var cloneOwner = new EnvLayerObject();\n"
+        "var cloneLayer = cloneOwner.createLayer();\n")));
+    CHECK(evaluateInteger(engine.operator->(),
+                          TJS_W("cloneLayer.msgvisible ? 1 : 0")) == 1);
+    CHECK(evaluateInteger(engine.operator->(),
+                          TJS_W("cloneLayer.ignore ? 1 : 0")) == 0);
+}
+
+TEST_CASE("World layer clone hook leaves objects without optional state untouched") {
+    ScriptEngineOwner engine;
+    engine->ExecScript(TJS_W(
+        "class CloneLayerWithoutState {\n"
+        "  var marker = 7;\n"
+        "}\n"
+        "class EnvLayerObject {\n"
+        "  function createLayer(src=void) { return new CloneLayerWithoutState(); }\n"
+        "}\n"));
+
+    REQUIRE_NOTHROW(engine->ExecScript(TVPGetWorldLayerClonePatchScript()));
+    REQUIRE_NOTHROW(engine->ExecScript(TJS_W(
+        "var cloneOwner = new EnvLayerObject();\n"
+        "var cloneLayer = cloneOwner.createLayer();\n")));
+    CHECK(evaluateInteger(engine.operator->(), TJS_W("cloneLayer.marker")) ==
+          7);
+    CHECK(evaluateInteger(
+              engine.operator->(),
+              TJS_W("typeof cloneLayer.msgvisible == \"undefined\" ? 1 : 0")) ==
+          1);
+    CHECK(evaluateInteger(
+              engine.operator->(),
+              TJS_W("typeof cloneLayer.ignore == \"undefined\" ? 1 : 0")) ==
+          1);
+}
+
 TEST_CASE("D3DEmote GPU transaction hook follows AffineSourceMotion redefinition") {
     ScriptEngineOwner engine;
     engine->ExecScript(TJS_W(

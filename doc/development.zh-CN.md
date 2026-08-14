@@ -130,6 +130,8 @@ Web 还需要：
 | `AETHERKIRI_DIAGNOSTICS` | 在 release 构建中开启运行期诊断，但不显示桌面 UI 日志框。 |
 | `AETHERKIRI_UI_LOG` | 开启桌面端 loading/runtime UI 日志框。面向用户的 release 构建默认保持关闭。 |
 | `AETHERKIRI_INPUT_TRACE` | 开启 engine/layer 输入 trace。 |
+| `AETHERKIRI_LAYER_SNAPSHOT_JSONL` | 将按帧选择的层树快照追加到此 JSONL 路径；设为 `-` 时写入 stderr。 |
+| `AETHERKIRI_LAYER_SNAPSHOT_FRAMES` | 逗号分隔的诊断帧号或 `all`，与 `AETHERKIRI_LAYER_SNAPSHOT_JSONL` 配合使用。 |
 | `AETHERKIRI_PERF_LOG_INTERVAL` | 性能日志输出间隔，单位秒。 |
 | `AETHERKIRI_FRAME_SPIKE_MS` | 超过该阈值的慢帧会被记录。 |
 | `AETHERKIRI_VERBOSE_RENDER_LOG` | 开启 Godot shell 侧 verbose render log。 |

@@ -65,6 +65,8 @@ void krkr_GetSurfaceDimensions(uint32_t*, uint32_t*);
 #include "environ/combase.h"
 #include "environ/Platform.h"
 #include "environ/sdl/sdl_render_backend.h"
+#include "environ/sdl/sdl_gpu_backend.h"
+#include "visual/sdl3/SdlGpuRenderManager.h"
 #include "environ/EngineBootstrap.h"
 #include "environ/EngineLoop.h"
 #include "environ/MainScene.h"
@@ -81,6 +83,7 @@ void krkr_GetSurfaceDimensions(uint32_t*, uint32_t*);
 #include "visual/ogl/angle_backend.h"
 #include "visual/impl/WindowImpl.h"
 #include "visual/WindowIntf.h"
+#include "visual/LayerManager.h"
 #include "visual/RenderManager.h"
 #include "visual/sdl3/SdlRenderManager.h"
 #include "visual/sdl3/SdlRenderManager.h"
@@ -130,13 +133,26 @@ extern "C" bool TVPHostCopyLatestFrameRGBA(void* out_pixels,
                                             uint32_t* height,
                                             uint32_t* stride_bytes,
                                             uint64_t* serial);
+extern "C" bool TVPHostRequestVisualCheckpoint(uint64_t* out_token);
+extern "C" bool TVPHostGetVisualCheckpointInfo(
+    uint64_t token, uint32_t* status, uint64_t* frame_serial,
+    uint32_t* width, uint32_t* height, uint32_t* stride,
+    uint64_t* rgba_bytes, uint32_t* snapshot_json_bytes);
+extern "C" bool TVPHostCopyVisualCheckpoint(
+    uint64_t token, void* out_rgba, size_t rgba_size,
+    char* out_snapshot_json, uint32_t snapshot_json_size);
 extern "C" bool TVPHostGetLatestHostGpuFrame(uint64_t* texture,
                                                uint32_t* width,
                                                uint32_t* height,
                                                uint64_t* serial);
+extern "C" bool TVPHostGetLatestHostGpuFrameSdl(uint64_t* texture,
+                                                uint32_t* width,
+                                                uint32_t* height,
+                                                uint64_t* serial);
 extern "C" void TVPHostActivateMainWindow();
 extern "C" void TVPHostSetSurfaceSize(uint32_t width, uint32_t height);
 extern "C" void TVPHostSetPreferGpuFrame(bool prefer_gpu_frame);
+extern "C" void TVPHostSetVisualCheckpointBackend(const char* backend);
 extern "C" void TVPHostGetTextInputState(uint32_t* ime_active,
                                            int32_t* ime_mode,
                                            uint32_t* attention_point_valid,
@@ -156,6 +172,9 @@ struct engine_handle_s {
   std::thread::id owner_thread;
   bool runtime_owner = false;
   uint64_t tick_count = 0;
+  uint64_t next_sdl_gpu_lease = 1;
+  std::unordered_set<uint64_t> sdl_gpu_leases;
+  std::vector<SDL_GPUFence*> sdl_gpu_completion_fences;
 
   // Frame state — readback buffer and tracking
   struct FrameState {
@@ -229,6 +248,9 @@ struct engine_handle_s {
     std::deque<std::string> events;
   } diagnostics;
 };
+
+extern "C" void PollSdlGpuCompletionFences(engine_handle_s* impl,
+                                             bool wait_all);
 
 class StandaloneMediaPlayer final : public KRMovie::TVPMoviePlayer {
  public:
@@ -788,6 +810,11 @@ bool EnvFlagEnabled(const char* name) {
 bool ShouldUseHostGpuFrameForRenderer(const std::string& renderer) {
   if (renderer == ENGINE_RENDERER_DEBUG_CPU) {
     return false;
+  }
+  if (renderer == ENGINE_RENDERER_SDL3_GPU) {
+    // SDL_GPU hosts consume the compositor's native frame texture directly.
+    // Explicit readback remains available for screenshots and diagnostics.
+    return true;
   }
 #if defined(__APPLE__) && TARGET_OS_IPHONE
   return !EnvFlagEnabled("AETHERKIRI_IOS_DISABLE_GODOT_GPU_FASTPATH");
@@ -1579,14 +1606,20 @@ bool CopyHostFrameLocked(engine_handle_s* impl) {
 bool CaptureHostGpuFrameLocked(engine_handle_s* impl) {
   if (impl == nullptr ||
       (impl->render.renderer != ENGINE_RENDERER_GODOT_NATIVE &&
-       impl->render.renderer != ENGINE_RENDERER_GPU_BRIDGE)) {
+       impl->render.renderer != ENGINE_RENDERER_GPU_BRIDGE &&
+       impl->render.renderer != ENGINE_RENDERER_SDL3_GPU)) {
     return false;
   }
   uint64_t texture = 0;
   uint32_t width = 0;
   uint32_t height = 0;
   uint64_t serial = 0;
-  if (!TVPHostGetLatestHostGpuFrame(&texture, &width, &height, &serial) ||
+  const bool is_sdl_gpu =
+      impl->render.renderer == ENGINE_RENDERER_SDL3_GPU;
+  const bool got_frame = is_sdl_gpu
+      ? TVPHostGetLatestHostGpuFrameSdl(&texture, &width, &height, &serial)
+      : TVPHostGetLatestHostGpuFrame(&texture, &width, &height, &serial);
+  if (!got_frame ||
       texture == 0 || width == 0 || height == 0) {
     return false;
   }
@@ -2308,6 +2341,19 @@ engine_result_t engine_destroy(engine_handle_t handle) {
     TVPSystemUninitCalled = false;
     TVPEngineApi_SetGlobalException("");
     g_runtime_started_once = false;
+
+    // Release every engine-owned SDL_GPU resource while the injected device
+    // is still alive. Some texture objects outlive a game session, so merely
+    // flushing the deferred-release queue is insufficient.
+    TVPSubmitSdlGpuFrameAndWait();
+    PollSdlGpuCompletionFences(impl, true);
+    impl->sdl_gpu_leases.clear();
+    TVPReleaseAllSdlGpuTextures();
+    TVPReleaseSdlGpuPipelines();
+    TVPFlushReleasedSdlGpuTextures();
+    TVPFlushReleasedSdlTextures();
+    TVPHostSetPreferGpuFrame(false);
+    TVPSetSdlGpuDevice(nullptr);
 
     // Reset the bootstrap state so the next engine_create runs the full
     // runtime initialization (graphics backend, render manager registry,
@@ -3177,6 +3223,9 @@ engine_result_t engine_set_option(engine_handle_t handle,
     const char *renderer = ENGINE_RENDERER_GODOT_NATIVE;
     if (value == ENGINE_RENDER_BACKEND_GPU_BRIDGE || value == ENGINE_RENDERER_GPU_BRIDGE) {
       renderer = ENGINE_RENDERER_GPU_BRIDGE;
+    } else if (value == ENGINE_RENDER_BACKEND_SDL3_GPU ||
+               value == ENGINE_RENDERER_SDL3_GPU) {
+      renderer = ENGINE_RENDERER_SDL3_GPU;
     } else if (value == ENGINE_RENDER_BACKEND_DEBUG_CPU || value == ENGINE_RENDERER_DEBUG_CPU ||
                value == ENGINE_RENDERER_SOFTWARE) {
       renderer = ENGINE_RENDERER_DEBUG_CPU;
@@ -3187,6 +3236,9 @@ engine_result_t engine_set_option(engine_handle_t handle,
                    "restart current game session to apply");
     }
     impl->render.renderer = renderer;
+    TVPHostSetVisualCheckpointBackend(
+        value == ENGINE_RENDERER_SOFTWARE ? ENGINE_RENDERER_SOFTWARE
+                                          : renderer);
     const bool prefer_gpu = ShouldUseHostGpuFrameForRenderer(impl->render.renderer);
     TVPHostSetPreferGpuFrame(prefer_gpu);
     TVPSetSDLRenderManagerGpuFastPathEnabled(prefer_gpu);
@@ -3447,6 +3499,50 @@ engine_result_t engine_set_sdl_renderer(engine_handle_t handle,
   return ENGINE_RESULT_OK;
 }
 
+engine_result_t engine_set_sdl_gpu_device(engine_handle_t handle,
+                                          void* sdl_gpu_device_ptr) {
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  result = ValidateHandleThreadLocked(impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  // The engine's SDL_GPU compositor (sdl3_gpu backend) records per-frame
+  // commands on the injected device; the host keeps presentation. Pass
+  // nullptr to detach.
+  TVPSetSdlGpuDevice(static_cast<SDL_GPUDevice*>(sdl_gpu_device_ptr));
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t engine_submit_sdl_gpu_frame(engine_handle_t handle) {
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  result = ValidateHandleThreadLocked(impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  TVPSubmitSdlGpuFrame();
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
 engine_result_t engine_flush_released_textures(engine_handle_t handle) {
   std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
   engine_handle_s* impl = nullptr;
@@ -3465,6 +3561,7 @@ engine_result_t engine_flush_released_textures(engine_handle_t handle) {
   // after its present so a frame still being presented is never destroyed
   // mid-frame.
   TVPFlushReleasedSdlTextures();
+  PollSdlGpuCompletionFences(impl, false);
   ClearHandleErrorLocked(impl);
   SetThreadError(nullptr);
   return ENGINE_RESULT_OK;
@@ -3501,7 +3598,16 @@ engine_result_t engine_get_frame_desc(engine_handle_t handle,
   }
 
   if (!impl->frame.ready) {
-    CopyHostFrameLocked(impl);
+    uint32_t width = 0, height = 0, stride = 0;
+    uint64_t serial = 0;
+    if(TVPHostGetLatestFrameDesc(&width, &height, &stride, &serial) &&
+       width > 0 && height > 0 && stride > 0) {
+      impl->frame.width = width;
+      impl->frame.height = height;
+      impl->frame.stride_bytes = stride;
+      impl->frame.serial = serial;
+      impl->frame.ready = true;
+    }
   }
 
   FrameReadbackLayout layout;
@@ -3887,12 +3993,450 @@ static engine_result_t EngineGetGpuFrameTextureImpl(
   return ENGINE_RESULT_OK;
 }
 
+static engine_result_t EngineGetSdlGpuFrameTextureImpl(
+    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
+    uint32_t* out_height, uint64_t* out_frame_serial,
+    const char* api_name) {
+  if (out_texture_id == nullptr || out_width == nullptr ||
+      out_height == nullptr || out_frame_serial == nullptr) {
+    return SetThreadErrorAndReturn(
+        ENGINE_RESULT_INVALID_ARGUMENT,
+        "out_texture_id/out_width/out_height/out_frame_serial must be non-null");
+  }
+  *out_texture_id = 0;
+  *out_width = 0;
+  *out_height = 0;
+  *out_frame_serial = 0;
+
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  result = ValidateHandleThreadLocked(impl);
+  if (result != ENGINE_RESULT_OK) {
+    return result;
+  }
+
+  if (impl->state != ToStateValue(EngineState::kOpened) &&
+      impl->state != ToStateValue(EngineState::kPaused)) {
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INVALID_STATE,
+        "engine_open_game must succeed before calling the SDL GPU frame API");
+  }
+
+  uint64_t texture = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  uint64_t serial = 0;
+  if (!TVPHostGetLatestHostGpuFrameSdl(&texture, &width, &height, &serial) ||
+      texture == 0 || width == 0 || height == 0) {
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_NOT_SUPPORTED,
+        "current frame is not backed by an SDL_GPU texture");
+  }
+
+  *out_texture_id = texture;
+  *out_width = width;
+  *out_height = height;
+  *out_frame_serial = serial;
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
 engine_result_t engine_get_gpu_frame_texture(
     engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
     uint32_t* out_height, uint64_t* out_frame_serial) {
   return EngineGetGpuFrameTextureImpl(handle, out_texture_id, out_width,
                                       out_height, out_frame_serial,
                                       "engine_get_gpu_frame_texture");
+}
+
+engine_result_t engine_get_sdl_gpu_frame_texture(
+    engine_handle_t handle, uint64_t* out_texture_id, uint32_t* out_width,
+    uint32_t* out_height, uint64_t* out_frame_serial) {
+  return EngineGetSdlGpuFrameTextureImpl(
+      handle, out_texture_id, out_width, out_height, out_frame_serial,
+      "engine_get_sdl_gpu_frame_texture");
+}
+
+void PollSdlGpuCompletionFences(engine_handle_s* impl, bool wait_all) {
+  SDL_GPUDevice* device = TVPGetSdlGpuDevice();
+  if (device == nullptr) {
+    impl->sdl_gpu_completion_fences.clear();
+    return;
+  }
+  auto& fences = impl->sdl_gpu_completion_fences;
+  for (auto it = fences.begin(); it != fences.end();) {
+    SDL_GPUFence* fence = *it;
+    if (wait_all) {
+      SDL_WaitForGPUFences(device, true, &fence, 1);
+    }
+    if (wait_all || SDL_QueryGPUFence(device, fence)) {
+      SDL_ReleaseGPUFence(device, fence);
+      it = fences.erase(it);
+    } else {
+      ++it;
+    }
+  }
+  if (fences.empty()) {
+    TVPFlushReleasedSdlGpuTextures();
+    TVPFlushBorrowedSdlGpuTransferBuffers();
+  }
+}
+
+engine_result_t SdlGpuV1SetDevice(engine_handle_t handle, void* device) {
+  if (device == nullptr) {
+    std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+    engine_handle_s* impl = nullptr;
+    auto result = ValidateHandleLocked(handle, &impl);
+    if (result != ENGINE_RESULT_OK) return result;
+    std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+    if (!impl->sdl_gpu_leases.empty()) {
+      return SetHandleErrorAndReturnLocked(
+          impl, ENGINE_RESULT_INVALID_STATE,
+          "cannot detach SDL_GPU device while frame leases are outstanding");
+    }
+    PollSdlGpuCompletionFences(impl, true);
+  }
+  return engine_set_sdl_gpu_device(handle, device);
+}
+
+engine_result_t SdlGpuV1AcquireFrame(
+    engine_handle_t handle, engine_sdl_gpu_frame_v1_t* out_frame) {
+  if (out_frame == nullptr ||
+      out_frame->struct_size < sizeof(engine_sdl_gpu_frame_v1_t)) {
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "SDL_GPU frame descriptor is too small");
+  }
+  engine_submit_sdl_gpu_frame(handle);
+  uint64_t texture = 0, serial = 0;
+  uint32_t width = 0, height = 0;
+  auto result = engine_get_sdl_gpu_frame_texture(
+      handle, &texture, &width, &height, &serial);
+  if (result != ENGINE_RESULT_OK) return result;
+
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  PollSdlGpuCompletionFences(impl, false);
+  const uint64_t token = impl->next_sdl_gpu_lease++;
+  impl->sdl_gpu_leases.insert(token);
+  memset(out_frame, 0, sizeof(*out_frame));
+  out_frame->struct_size = sizeof(*out_frame);
+  out_frame->width = width;
+  out_frame->height = height;
+  out_frame->format = SDL_GPU_TEXTUREFORMAT_R8G8B8A8_UNORM;
+  out_frame->frame_serial = serial;
+  out_frame->texture = reinterpret_cast<void*>(static_cast<uintptr_t>(texture));
+  out_frame->lease_token = token;
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t SdlGpuV1ReleaseFrame(engine_handle_t handle,
+                                    uint64_t lease_token,
+                                    void* completion_fence) {
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  if (lease_token == 0 || impl->sdl_gpu_leases.erase(lease_token) != 1) {
+    return SetHandleErrorAndReturnLocked(impl, ENGINE_RESULT_INVALID_ARGUMENT,
+                                         "SDL_GPU frame lease is invalid");
+  }
+  if (completion_fence != nullptr) {
+    impl->sdl_gpu_completion_fences.push_back(
+        static_cast<SDL_GPUFence*>(completion_fence));
+  } else if (impl->sdl_gpu_leases.empty()) {
+    TVPFlushReleasedSdlGpuTextures();
+  }
+  // SDL retains submitted transfer resources until command completion; drop
+  // the engine's references now so the borrowed-frame upload pool stays
+  // bounded even while multiple fences are in flight.
+  TVPFlushBorrowedSdlGpuTransferBuffers();
+  PollSdlGpuCompletionFences(impl, false);
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t SdlGpuV1GetStats(engine_handle_t handle,
+                                engine_sdl_gpu_stats_v1_t* out_stats) {
+  constexpr size_t kStatsV1Minimum =
+      offsetof(engine_sdl_gpu_stats_v1_t, fill_argb_gpu_calls);
+  if(out_stats == nullptr || out_stats->struct_size < kStatsV1Minimum)
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "SDL_GPU stats descriptor is too small");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  const auto stats = TVPGetSdlGpuBenchmarkStats();
+  const uint32_t caller_size = out_stats->struct_size;
+  memset(out_stats, 0, std::min<size_t>(caller_size, sizeof(*out_stats)));
+  out_stats->struct_size = sizeof(*out_stats);
+#define COPY_STAT(name) do { \
+  if(caller_size >= offsetof(engine_sdl_gpu_stats_v1_t, name) + \
+                    sizeof(out_stats->name)) out_stats->name = stats.name; \
+} while(false)
+  COPY_STAT(command_buffers_acquired);
+  COPY_STAT(command_buffers_submitted);
+  COPY_STAT(render_passes);
+  COPY_STAT(copy_passes);
+  COPY_STAT(wait_idle_calls);
+  COPY_STAT(upload_calls);
+  COPY_STAT(upload_bytes);
+  COPY_STAT(full_upload_calls);
+  COPY_STAT(full_upload_bytes);
+  COPY_STAT(dirty_upload_calls);
+  COPY_STAT(dirty_upload_bytes);
+  COPY_STAT(readback_calls);
+  COPY_STAT(readback_bytes);
+  COPY_STAT(gpu_draw_calls);
+  COPY_STAT(software_fallback_calls);
+  COPY_STAT(fill_argb_gpu_calls);
+  COPY_STAT(fill_color_gpu_calls);
+  COPY_STAT(alpha_blend_d_gpu_calls);
+  COPY_STAT(const_color_alpha_blend_d_gpu_calls);
+  COPY_STAT(authority_barrier_calls);
+  COPY_STAT(authority_barrier_bytes);
+#undef COPY_STAT
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t SdlGpuV1ResetStats(engine_handle_t handle) {
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  TVPResetSdlGpuBenchmarkStats();
+  return ENGINE_RESULT_OK;
+}
+
+static const engine_render_sdl_gpu_v1_t kSdlGpuV1 = {
+    sizeof(engine_render_sdl_gpu_v1_t),
+    ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1,
+    SdlGpuV1SetDevice,
+    SdlGpuV1AcquireFrame,
+    SdlGpuV1ReleaseFrame,
+    SdlGpuV1GetStats,
+    SdlGpuV1ResetStats,
+    {}, {}};
+
+engine_result_t SdlGpuV2BeginFrame(engine_handle_t handle,
+                                  void* command_buffer) {
+  if(command_buffer == nullptr)
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "SDL_GPU command buffer is null");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  if(!TVPBeginSdlGpuBorrowedFrame(
+         static_cast<SDL_GPUCommandBuffer*>(command_buffer)))
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INVALID_STATE,
+        "could not begin borrowed SDL_GPU frame");
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t SdlGpuV2EndFrame(engine_handle_t handle,
+                                engine_sdl_gpu_frame_v1_t* out_frame) {
+  if(!TVPEndSdlGpuBorrowedFrame())
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_STATE,
+                                   "no borrowed SDL_GPU frame is active");
+  return SdlGpuV1AcquireFrame(handle, out_frame);
+}
+
+static const engine_render_sdl_gpu_v2_t kSdlGpuV2 = {
+    sizeof(engine_render_sdl_gpu_v2_t),
+    ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2,
+    SdlGpuV1SetDevice,
+    SdlGpuV2BeginFrame,
+    SdlGpuV2EndFrame,
+    SdlGpuV1ReleaseFrame,
+    SdlGpuV1GetStats,
+    SdlGpuV1ResetStats,
+    {}, {}};
+
+engine_result_t VisualDiagnosticsV1GetSnapshotJson(
+    engine_handle_t handle, char* out_buffer, uint32_t buffer_size,
+    uint32_t* out_required_bytes) {
+  if(out_required_bytes == nullptr)
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "out_required_bytes is null");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  std::string json;
+  const std::string diagnostics_backend =
+      impl->render.renderer == ENGINE_RENDERER_DEBUG_CPU
+          ? ENGINE_RENDERER_SOFTWARE : impl->render.renderer;
+  if(!TVPCaptureVisualDiagnosticsJson(impl->frame.serial,
+                                      impl->frame.surface_width,
+                                      impl->frame.surface_height,
+                                      diagnostics_backend, json)) {
+    *out_required_bytes = 0;
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INVALID_STATE,
+        "no completed visual frame is available");
+  }
+  if(json.size() >= UINT32_MAX)
+    return SetHandleErrorAndReturnLocked(impl, ENGINE_RESULT_INTERNAL_ERROR,
+                                         "visual snapshot is too large");
+  *out_required_bytes = static_cast<uint32_t>(json.size() + 1);
+  if(out_buffer == nullptr && buffer_size == 0) {
+    ClearHandleErrorLocked(impl);
+    return ENGINE_RESULT_OK;
+  }
+  if(out_buffer == nullptr || buffer_size < *out_required_bytes)
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INVALID_ARGUMENT,
+        "visual snapshot output buffer is too small");
+  std::memcpy(out_buffer, json.c_str(), json.size() + 1);
+  ClearHandleErrorLocked(impl);
+  return ENGINE_RESULT_OK;
+}
+
+static const engine_visual_diagnostics_v1_t kVisualDiagnosticsV1 = {
+    sizeof(engine_visual_diagnostics_v1_t),
+    ENGINE_VISUAL_DIAGNOSTICS_INTERFACE_VERSION_1,
+    VisualDiagnosticsV1GetSnapshotJson,
+    {}, {}};
+
+engine_result_t VisualCheckpointV1Request(engine_handle_t handle,
+                                          uint64_t* out_token) {
+  if(out_token == nullptr)
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "out_token is null");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  result = ValidateHandleThreadLocked(impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  if(impl->state != ToStateValue(EngineState::kOpened))
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INVALID_STATE, "engine is not in opened state");
+  if(!TVPHostRequestVisualCheckpoint(out_token))
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INVALID_STATE,
+        "a visual checkpoint request is already pending");
+  if(TVPMainWindow != nullptr) TVPMainWindow->RequestUpdate();
+  if(auto* scene = TVPMainScene::GetInstance(); scene != nullptr)
+    scene->scheduleUpdate();
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t VisualCheckpointV1Get(
+    engine_handle_t handle, uint64_t token,
+    engine_visual_checkpoint_info_v1_t* out_info,
+    void* out_rgba, size_t rgba_size,
+    char* out_snapshot_json, uint32_t snapshot_json_size) {
+  if(token == 0 || out_info == nullptr ||
+     out_info->struct_size < sizeof(engine_visual_checkpoint_info_v1_t))
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "visual checkpoint query is invalid");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  uint32_t status = 0;
+  uint64_t serial = 0;
+  uint32_t width = 0, height = 0, stride = 0, json_bytes = 0;
+  uint64_t rgba_bytes = 0;
+  if(!TVPHostGetVisualCheckpointInfo(token, &status, &serial, &width,
+                                     &height, &stride, &rgba_bytes,
+                                     &json_bytes))
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INVALID_ARGUMENT,
+        "visual checkpoint token is unknown or expired");
+  std::memset(out_info, 0, sizeof(*out_info));
+  out_info->struct_size = sizeof(*out_info);
+  out_info->status = status;
+  out_info->token = token;
+  out_info->frame_serial = serial;
+  out_info->width = width;
+  out_info->height = height;
+  out_info->stride_bytes = stride;
+  out_info->pixel_format = ENGINE_PIXEL_FORMAT_RGBA8888;
+  out_info->rgba_bytes = rgba_bytes;
+  out_info->snapshot_json_bytes = json_bytes;
+  if(status == ENGINE_VISUAL_CHECKPOINT_READY &&
+     ((out_rgba != nullptr && rgba_size < rgba_bytes) ||
+      (out_snapshot_json != nullptr && snapshot_json_size < json_bytes)))
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INVALID_ARGUMENT,
+        "visual checkpoint output buffer is too small");
+  if(status == ENGINE_VISUAL_CHECKPOINT_READY &&
+     (out_rgba != nullptr || out_snapshot_json != nullptr) &&
+     !TVPHostCopyVisualCheckpoint(token, out_rgba, rgba_size,
+                                  out_snapshot_json, snapshot_json_size))
+    return SetHandleErrorAndReturnLocked(
+        impl, ENGINE_RESULT_INTERNAL_ERROR,
+        "visual checkpoint copy failed");
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+static const engine_visual_checkpoint_v1_t kVisualCheckpointV1 = {
+    sizeof(engine_visual_checkpoint_v1_t),
+    ENGINE_VISUAL_CHECKPOINT_INTERFACE_VERSION_1,
+    VisualCheckpointV1Request,
+    VisualCheckpointV1Get,
+    {}, {}};
+
+engine_result_t engine_query_interface(engine_handle_t handle,
+                                       const char* name, uint32_t version,
+                                       const void** out_interface) {
+  if (name == nullptr || out_interface == nullptr) {
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "interface name or output is null");
+  }
+  *out_interface = nullptr;
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if (result != ENGINE_RESULT_OK) return result;
+  const bool wants_v1 =
+      strcmp(name, ENGINE_INTERFACE_RENDER_SDL_GPU_V1) == 0 &&
+      version == ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_1;
+  const bool wants_v2 =
+      strcmp(name, ENGINE_INTERFACE_RENDER_SDL_GPU_V2) == 0 &&
+      version == ENGINE_RENDER_SDL_GPU_INTERFACE_VERSION_2;
+  const bool wants_visual =
+      strcmp(name, ENGINE_INTERFACE_VISUAL_DIAGNOSTICS_V1) == 0 &&
+      version == ENGINE_VISUAL_DIAGNOSTICS_INTERFACE_VERSION_1;
+  const bool wants_checkpoint =
+      strcmp(name, ENGINE_INTERFACE_VISUAL_CHECKPOINT_V1) == 0 &&
+      version == ENGINE_VISUAL_CHECKPOINT_INTERFACE_VERSION_1;
+  if(!wants_v1 && !wants_v2 && !wants_visual && !wants_checkpoint) {
+    return SetHandleErrorAndReturnLocked(impl, ENGINE_RESULT_NOT_SUPPORTED,
+                                         "requested interface is unsupported");
+  }
+  *out_interface = wants_visual
+      ? static_cast<const void*>(&kVisualDiagnosticsV1)
+      : (wants_checkpoint ? static_cast<const void*>(&kVisualCheckpointV1)
+      : (wants_v2 ? static_cast<const void*>(&kSdlGpuV2)
+                  : static_cast<const void*>(&kSdlGpuV1)));
+  ClearHandleErrorLocked(impl);
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
 }
 
 engine_result_t engine_get_host_native_window(engine_handle_t handle,
@@ -4787,6 +5331,10 @@ struct engine_handle_s {
   uint32_t surface_width = 1280;
   uint32_t surface_height = 720;
   uint64_t frame_serial = 0;
+  uint64_t checkpoint_next_token = 1;
+  uint64_t checkpoint_pending_token = 0;
+  uint64_t checkpoint_completed_token = 0;
+  uint64_t checkpoint_frame_serial = 0;
   uint32_t startup_state = ENGINE_STARTUP_STATE_IDLE;
   std::deque<std::string> startup_logs;
   bool plugin_tracing_enabled = false;
@@ -5075,6 +5623,24 @@ engine_result_t engine_drain_startup_logs(engine_handle_t handle,
   return ENGINE_RESULT_OK;
 }
 
+engine_result_t engine_drain_runtime_logs(engine_handle_t handle,
+                                          char* out_buffer,
+                                          uint32_t buffer_size,
+                                          uint32_t* out_bytes_written) {
+  if(out_buffer == nullptr || buffer_size == 0 || out_bytes_written == nullptr)
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "runtime log output is invalid");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  out_buffer[0] = '\0';
+  *out_bytes_written = 0;
+  impl->last_error.clear();
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
 engine_result_t engine_tick(engine_handle_t handle, uint32_t delta_ms) {
   (void)delta_ms;
 
@@ -5096,6 +5662,11 @@ engine_result_t engine_tick(engine_handle_t handle, uint32_t delta_ms) {
   }
 
   impl->frame_serial += 1;
+  if(impl->checkpoint_pending_token != 0) {
+    impl->checkpoint_completed_token = impl->checkpoint_pending_token;
+    impl->checkpoint_pending_token = 0;
+    impl->checkpoint_frame_serial = impl->frame_serial;
+  }
   impl->last_error.clear();
   SetThreadError(nullptr);
   return ENGINE_RESULT_OK;
@@ -5208,6 +5779,171 @@ engine_result_t engine_set_surface_size(engine_handle_t handle,
 
   impl->surface_width = width;
   impl->surface_height = height;
+  impl->last_error.clear();
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t StubVisualDiagnosticsGetSnapshotJson(
+    engine_handle_t handle, char* out_buffer, uint32_t buffer_size,
+    uint32_t* out_required_bytes) {
+  if(out_required_bytes == nullptr)
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "out_required_bytes is null");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  if(impl->state != ToStateValue(EngineState::kOpened) &&
+     impl->state != ToStateValue(EngineState::kPaused)) {
+    *out_required_bytes = 0;
+    SetHandleErrorLocked(impl, "no completed visual frame is available");
+    return ENGINE_RESULT_INVALID_STATE;
+  }
+  std::ostringstream json;
+  json << "{\"schema\":\"engine.visual_diagnostics.v1\""
+       << ",\"frame_serial\":" << impl->frame_serial
+       << ",\"surface\":{\"width\":" << impl->surface_width
+       << ",\"height\":" << impl->surface_height
+       << "},\"backend\":\"stub\",\"layers\":[]}";
+  const std::string value = json.str();
+  *out_required_bytes = static_cast<uint32_t>(value.size() + 1);
+  if(out_buffer == nullptr && buffer_size == 0) return ENGINE_RESULT_OK;
+  if(out_buffer == nullptr || buffer_size < *out_required_bytes) {
+    SetHandleErrorLocked(impl, "visual snapshot output buffer is too small");
+    return ENGINE_RESULT_INVALID_ARGUMENT;
+  }
+  std::memcpy(out_buffer, value.c_str(), value.size() + 1);
+  impl->last_error.clear();
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+static const engine_visual_diagnostics_v1_t kStubVisualDiagnosticsV1 = {
+    sizeof(engine_visual_diagnostics_v1_t),
+    ENGINE_VISUAL_DIAGNOSTICS_INTERFACE_VERSION_1,
+    StubVisualDiagnosticsGetSnapshotJson,
+    {}, {}};
+
+engine_result_t StubVisualCheckpointRequest(engine_handle_t handle,
+                                            uint64_t* out_token) {
+  if(out_token == nullptr)
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "out_token is null");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  if(impl->state != ToStateValue(EngineState::kOpened)) {
+    SetHandleErrorLocked(impl, "engine is not in opened state");
+    return ENGINE_RESULT_INVALID_STATE;
+  }
+  if(impl->checkpoint_pending_token != 0) {
+    SetHandleErrorLocked(impl, "a visual checkpoint request is already pending");
+    return ENGINE_RESULT_INVALID_STATE;
+  }
+  *out_token = impl->checkpoint_next_token++;
+  impl->checkpoint_pending_token = *out_token;
+  impl->checkpoint_completed_token = 0;
+  impl->checkpoint_frame_serial = 0;
+  impl->last_error.clear();
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+engine_result_t StubVisualCheckpointGet(
+    engine_handle_t handle, uint64_t token,
+    engine_visual_checkpoint_info_v1_t* out_info,
+    void* out_rgba, size_t rgba_size,
+    char* out_snapshot_json, uint32_t snapshot_json_size) {
+  if(token == 0 || out_info == nullptr ||
+     out_info->struct_size < sizeof(engine_visual_checkpoint_info_v1_t))
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "visual checkpoint query is invalid");
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  std::lock_guard<std::recursive_mutex> guard(impl->mutex);
+  const bool pending = token == impl->checkpoint_pending_token;
+  const bool ready = token == impl->checkpoint_completed_token;
+  if(!pending && !ready) {
+    SetHandleErrorLocked(impl, "visual checkpoint token is unknown or expired");
+    return ENGINE_RESULT_INVALID_ARGUMENT;
+  }
+  std::ostringstream json;
+  if(ready) {
+    json << "{\"schema\":\"engine.visual_diagnostics.v1\""
+         << ",\"frame_serial\":" << impl->checkpoint_frame_serial
+         << ",\"surface\":{\"width\":" << impl->surface_width
+         << ",\"height\":" << impl->surface_height
+         << "},\"backend\":\"stub\",\"layers\":[]}";
+  }
+  const uint64_t rgba_bytes = ready
+      ? static_cast<uint64_t>(impl->surface_width) * impl->surface_height * 4u
+      : 0;
+  const uint32_t json_bytes = ready
+      ? static_cast<uint32_t>(json.str().size() + 1u) : 0;
+  std::memset(out_info, 0, sizeof(*out_info));
+  out_info->struct_size = sizeof(*out_info);
+  out_info->status = pending ? ENGINE_VISUAL_CHECKPOINT_PENDING
+                             : ENGINE_VISUAL_CHECKPOINT_READY;
+  out_info->token = token;
+  out_info->frame_serial = ready ? impl->checkpoint_frame_serial : 0;
+  out_info->width = ready ? impl->surface_width : 0;
+  out_info->height = ready ? impl->surface_height : 0;
+  out_info->stride_bytes = ready ? impl->surface_width * 4u : 0;
+  out_info->pixel_format = ENGINE_PIXEL_FORMAT_RGBA8888;
+  out_info->rgba_bytes = rgba_bytes;
+  out_info->snapshot_json_bytes = json_bytes;
+  if(ready && ((out_rgba != nullptr && rgba_size < rgba_bytes) ||
+               (out_snapshot_json != nullptr &&
+                snapshot_json_size < json_bytes))) {
+    SetHandleErrorLocked(impl, "visual checkpoint output buffer is too small");
+    return ENGINE_RESULT_INVALID_ARGUMENT;
+  }
+  if(ready && out_rgba != nullptr)
+    std::memset(out_rgba, 0, static_cast<size_t>(rgba_bytes));
+  if(ready && out_snapshot_json != nullptr)
+    std::memcpy(out_snapshot_json, json.str().c_str(), json_bytes);
+  impl->last_error.clear();
+  SetThreadError(nullptr);
+  return ENGINE_RESULT_OK;
+}
+
+static const engine_visual_checkpoint_v1_t kStubVisualCheckpointV1 = {
+    sizeof(engine_visual_checkpoint_v1_t),
+    ENGINE_VISUAL_CHECKPOINT_INTERFACE_VERSION_1,
+    StubVisualCheckpointRequest,
+    StubVisualCheckpointGet,
+    {}, {}};
+
+engine_result_t engine_query_interface(engine_handle_t handle,
+                                       const char* name, uint32_t version,
+                                       const void** out_interface) {
+  if(name == nullptr || out_interface == nullptr)
+    return SetThreadErrorAndReturn(ENGINE_RESULT_INVALID_ARGUMENT,
+                                   "interface name or output is null");
+  *out_interface = nullptr;
+  std::lock_guard<std::recursive_mutex> registry_guard(g_registry_mutex);
+  engine_handle_s* impl = nullptr;
+  auto result = ValidateHandleLocked(handle, &impl);
+  if(result != ENGINE_RESULT_OK) return result;
+  const bool wants_visual =
+      std::strcmp(name, ENGINE_INTERFACE_VISUAL_DIAGNOSTICS_V1) == 0 &&
+      version == ENGINE_VISUAL_DIAGNOSTICS_INTERFACE_VERSION_1;
+  const bool wants_checkpoint =
+      std::strcmp(name, ENGINE_INTERFACE_VISUAL_CHECKPOINT_V1) == 0 &&
+      version == ENGINE_VISUAL_CHECKPOINT_INTERFACE_VERSION_1;
+  if(!wants_visual && !wants_checkpoint) {
+    SetHandleErrorLocked(impl, "requested interface is unsupported");
+    return ENGINE_RESULT_NOT_SUPPORTED;
+  }
+  *out_interface = wants_visual
+      ? static_cast<const void*>(&kStubVisualDiagnosticsV1)
+      : static_cast<const void*>(&kStubVisualCheckpointV1);
   impl->last_error.clear();
   SetThreadError(nullptr);
   return ENGINE_RESULT_OK;

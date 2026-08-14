@@ -1,5 +1,6 @@
 #include "host_input.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 
@@ -85,6 +86,30 @@ int DecodeUtf8Codepoint(const char *text, uint32_t *out_codepoint) {
 
 }  // namespace
 
+bool PresentationTransform::Contains(float x, float y) const {
+    return width > 0.0f && height > 0.0f && x >= offset_x && y >= offset_y &&
+        x < offset_x + width && y < offset_y + height;
+}
+
+PresentationTransform CalculatePresentationTransform(
+    uint32_t surface_width, uint32_t surface_height, float output_width,
+    float output_height) {
+    PresentationTransform result;
+    result.surface_width = surface_width;
+    result.surface_height = surface_height;
+    if(surface_width == 0 || surface_height == 0 || output_width <= 0.0f ||
+       output_height <= 0.0f) {
+        return result;
+    }
+    result.scale = std::min(output_width / static_cast<float>(surface_width),
+                            output_height / static_cast<float>(surface_height));
+    result.width = static_cast<float>(surface_width) * result.scale;
+    result.height = static_cast<float>(surface_height) * result.scale;
+    result.offset_x = (output_width - result.width) * 0.5f;
+    result.offset_y = (output_height - result.height) * 0.5f;
+    return result;
+}
+
 int SdlKeyToTvpVk(SDL_Keycode key) {
     switch(key) {
         case SDLK_BACKSPACE:
@@ -162,17 +187,28 @@ int SdlModifiersToTvp(SDL_Keymod mod, bool repeat) {
 }
 
 void ForwardSdlEventToEngine(engine_handle_t engine, const SDL_Event *event,
-                             float surface_scale_x, float surface_scale_y) {
+                             const PresentationTransform &transform) {
     if(engine == nullptr)
         return;
 
+    const auto map_x = [&](float x) {
+        return (x - transform.offset_x) /
+            std::max(transform.scale, 0.000001f);
+    };
+    const auto map_y = [&](float y) {
+        return (y - transform.offset_y) /
+            std::max(transform.scale, 0.000001f);
+    };
+
     switch(event->type) {
         case SDL_EVENT_MOUSE_MOTION: {
+            if(!transform.Contains(event->motion.x, event->motion.y))
+                break;
             auto event_out = MakeInputEvent(kPointerMove);
-            event_out.x = event->motion.x * surface_scale_x;
-            event_out.y = event->motion.y * surface_scale_y;
-            event_out.delta_x = event->motion.xrel * surface_scale_x;
-            event_out.delta_y = event->motion.yrel * surface_scale_y;
+            event_out.x = map_x(event->motion.x);
+            event_out.y = map_y(event->motion.y);
+            event_out.delta_x = event->motion.xrel / transform.scale;
+            event_out.delta_y = event->motion.yrel / transform.scale;
             event_out.pointer_id = 0;
             event_out.modifiers = PointerModifiersFromButtons(
                 event->motion.state);
@@ -181,12 +217,14 @@ void ForwardSdlEventToEngine(engine_handle_t engine, const SDL_Event *event,
         }
         case SDL_EVENT_MOUSE_BUTTON_DOWN:
         case SDL_EVENT_MOUSE_BUTTON_UP: {
+            if(!transform.Contains(event->button.x, event->button.y))
+                break;
             const bool pressed =
                 event->type == SDL_EVENT_MOUSE_BUTTON_DOWN;
             auto event_out = MakeInputEvent(pressed ? kPointerDown
                                                     : kPointerUp);
-            event_out.x = event->button.x * surface_scale_x;
-            event_out.y = event->button.y * surface_scale_y;
+            event_out.x = map_x(event->button.x);
+            event_out.y = map_y(event->button.y);
             event_out.pointer_id = 0;
             event_out.button = MapMouseButton(event->button.button);
             int win_w = 0, win_h = 0;
@@ -194,21 +232,25 @@ void ForwardSdlEventToEngine(engine_handle_t engine, const SDL_Event *event,
                               &win_w, &win_h);
             fprintf(stderr,
                     "[input] %s win=(%.1f,%.1f) winsize=%dx%d "
-                    "engine=(%.1f,%.1f) button=%d scale=(%.3f,%.3f)\n",
+                    "engine=(%.1f,%.1f) button=%d viewport=(%.1f,%.1f %.1fx%.1f)\n",
                     pressed ? "down" : "up", event->button.x, event->button.y,
                     win_w, win_h, event_out.x, event_out.y, event_out.button,
-                    surface_scale_x, surface_scale_y);
+                    transform.offset_x, transform.offset_y, transform.width,
+                    transform.height);
             engine_send_input(engine, &event_out);
             break;
         }
         case SDL_EVENT_MOUSE_WHEEL: {
+            if(!transform.Contains(event->wheel.mouse_x,
+                                   event->wheel.mouse_y))
+                break;
             // SDL3: wheel up -> +y. Engine/Godot expects up -> -delta_y.
             float wheel_y = event->wheel.y;
             if(event->wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
                 wheel_y = -wheel_y;
             auto event_out = MakeInputEvent(kPointerScroll);
-            event_out.x = event->wheel.mouse_x * surface_scale_x;
-            event_out.y = event->wheel.mouse_y * surface_scale_y;
+            event_out.x = map_x(event->wheel.mouse_x);
+            event_out.y = map_y(event->wheel.mouse_y);
             event_out.delta_y = -wheel_y;
             event_out.pointer_id = 0;
             engine_send_input(engine, &event_out);

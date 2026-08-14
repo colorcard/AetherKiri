@@ -72,6 +72,20 @@ AetherKiri：Godot 宿主 + C ABI + C++17 KiriKiri2 引擎核心。
   （`engine_flush_released_textures`，宿主 present 后调）。注意：新 C ABI 函数
   必须同时接 **dispatch 层**（engine_api_dispatch.cpp Route 转发）——导出
   handle 是 dispatch 包装，直接调 legacy 层实现会收到无效 handle。
+- **sdl3_gpu 后端（阶段 2，已落地）**：`--render-backend sdl3_gpu` 用 SDL_GPU
+  （command-buffer API）呈现并保留 shader-pipeline 合成器。默认整帧软件合成后
+  单次上传，避免 Copy/Fill GPU 与精确 AlphaBlend CPU 交替产生同步长帧；
+  `AETHERKIRI_SDL_GPU_ENABLE_MIXED_DRAWS=1` 仅用于实验 GPU Copy/Fill/Ps*
+  （`cpp/core/visual/sdl3/SdlGpuRenderManager.*` + `sdl_gpu_backend.*`），
+  逐帧 command buffer；`_d`（读目标）、triangles、mask 均走软件保证像素一致
+  （demo 0.00% diff）。宿主注入 `engine_set_sdl_gpu_device`；aetherkiri_engine 已
+  落地 swapchain 零拷贝 present（`engine_get_sdl_gpu_frame_texture` +
+  `SDL_BlitGPUTexture`）。**踩坑**：(1) SDL_GPU 自定义 shader 的 descriptor set
+  布局是硬约束——vertex uniform 用 set 1、fragment sampler 用 set 2、fragment
+  uniform 用 set 3（否则离屏 render pass 静默无效）；(2) 同一 command buffer 里
+  copy pass 与 render pass 不能同时开着（先 `TVPEnsureSdlGpuRenderPassReady`）；
+  (3) `_d`（读目标）blend 需 shader 读 dst，固定 blend state 表达不了，且 GPU/CPU
+  目标内容会分叉——当前回退软件最稳。
 - **Linux engine_api 链接是手工维护的**（`bridge/engine_api/CMakeLists.txt`：
   显式 `--whole-archive` + 子插件显式链接）——CMake 的 LINK_LIBRARY_OVERRIDE +
   RESCAN 组合会重复包装 krkr2plugin（历史 bug）。**勿改回 override 方案**。

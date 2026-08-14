@@ -47,6 +47,7 @@ set(VISUAL_SOURCE_FILES
     ${VISUAL_PATH}/ogl/PVRTDecompress.cpp
 
     ${VISUAL_PATH}/sdl3/SdlRenderManager.cpp
+    ${VISUAL_PATH}/sdl3/SdlGpuRenderManager.cpp
 
     ${VISUAL_PATH}/impl/BasicDrawDevice.cpp
     ${VISUAL_PATH}/impl/BitmapBitsAlloc.cpp
@@ -83,6 +84,17 @@ target_link_libraries(${PROJECT_NAME} PUBLIC tjs2 PRIVATE core_base_module core_
 # manager creates/paints its own SDL textures on the host-injected renderer.
 find_package(SDL3 CONFIG REQUIRED)
 target_link_libraries(${PROJECT_NAME} PRIVATE SDL3::SDL3)
+
+# Shader headers are checked, not regenerated, during normal builds so a
+# compiler-version change cannot silently alter committed GPU programs.
+find_program(AETHERKIRI_GLSLANG_VALIDATOR glslangValidator)
+if(AETHERKIRI_GLSLANG_VALIDATOR AND UNIX)
+    add_custom_target(check_sdl_gpu_shaders ALL
+        COMMAND ${CMAKE_SOURCE_DIR}/tools/generate_sdl_gpu_shaders.sh --check
+        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+        COMMENT "Checking committed SDL_GPU SPIR-V headers")
+    add_dependencies(${PROJECT_NAME} check_sdl_gpu_shaders)
+endif()
 
 target_link_libraries(${PROJECT_NAME} PRIVATE libbpg)
 
