@@ -58,7 +58,8 @@ def source_audit(root: Path) -> dict[str, tuple[int, int]]:
     return audit
 
 
-def resource_fingerprint(root: Path) -> tuple[str, list[dict]]:
+def resource_fingerprint(root: Path, allow_plain_files: bool = False
+                         ) -> tuple[str, list[dict]]:
     archives = []
     wanted = {"data", "patch", "data1080", "patch_data1080",
               "bgimage1080", "fgimage1080"}
@@ -74,6 +75,17 @@ def resource_fingerprint(root: Path) -> tuple[str, list[dict]]:
                 digest.update(chunk)
         archives.append({"name": path.name, "size": path.stat().st_size,
                          "sha256": digest.hexdigest()})
+    if not archives and allow_plain_files:
+        writable = {"savedata", "save", "cache", "logs", "log"}
+        for path in sorted(root.rglob("*"), key=lambda item: item.as_posix()):
+            relative = path.relative_to(root)
+            if not path.is_file() or relative.parts[0].lower() in writable or \
+                    path.suffix.lower() in {".log", ".tmp"}:
+                continue
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            archives.append({"name": relative.as_posix(),
+                             "size": path.stat().st_size,
+                             "sha256": digest})
     if not archives:
         raise CompatError("no rendering-related XP3 archives found")
     packed = json.dumps(archives, sort_keys=True, separators=(",", ":")).encode()
@@ -408,7 +420,8 @@ def main() -> int:
     if not source.is_dir() or not source.is_absolute():
         raise CompatError("game path must be an absolute directory")
     ensure_ignored(COMPAT)
-    fingerprint, archives = resource_fingerprint(source)
+    synthetic = bool(profile.get("synthetic", False))
+    fingerprint, archives = resource_fingerprint(source, synthetic)
     audit_before = source_audit(source)
     session = time.strftime("%Y%m%d-%H%M%S")
     run_root = COMPAT / "runs" / args.profile / fingerprint / session
@@ -431,7 +444,7 @@ def main() -> int:
     runs = [run_backend(scenario_path, shadow, backend, configuration, run_root,
                         int(profile.get("timeout_seconds", 180)), args.quick)
             for configuration in configurations for backend in backends]
-    fingerprint_after, _ = resource_fingerprint(source)
+    fingerprint_after, _ = resource_fingerprint(source, synthetic)
     if source_audit(source) != audit_before or fingerprint_after != fingerprint:
         raise CompatError("source game directory changed during compatibility run")
     checkpoints = profile.get("checkpoints", [])

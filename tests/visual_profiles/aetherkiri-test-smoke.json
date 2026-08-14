@@ -1,6 +1,7 @@
 {
   "schema": "aetherkiri.visual-profile.v1",
   "version": 1,
+  "synthetic": true,
   "game_env": "AETHERKIRI_DEMO_PATH",
   "timeout_seconds": 30,
   "checkpoints": ["startup"],

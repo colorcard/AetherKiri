@@ -107,6 +107,24 @@ class VisualCompatTests(unittest.TestCase):
             second, _ = visual_compat.resource_fingerprint(root)
             self.assertNotEqual(first, second)
 
+    def test_synthetic_fingerprint_uses_plain_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "startup.tjs"
+            source.write_text("first", encoding="utf-8")
+            first, resources = visual_compat.resource_fingerprint(root, True)
+            self.assertEqual(resources[0]["name"], "startup.tjs")
+            source.write_text("second", encoding="utf-8")
+            second, _ = visual_compat.resource_fingerprint(root, True)
+            self.assertNotEqual(first, second)
+
+    def test_plain_files_require_synthetic_opt_in(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "startup.tjs").write_text("test", encoding="utf-8")
+            with self.assertRaises(visual_compat.CompatError):
+                visual_compat.resource_fingerprint(root)
+
     def test_source_audit_detects_source_write(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
